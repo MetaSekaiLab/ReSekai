@@ -1,0 +1,24 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!-- 第三方的 Il2CppDumper 就地编译：它没有可空注解，也不按本仓库的警告策略编写，所以单独成项目把编译设置隔离在这里。 -->
+  <PropertyGroup>
+    <AssemblyName>ReSekai.Decompiler.Input</AssemblyName>
+    <Nullable>disable</Nullable>
+    <ImplicitUsings>disable</ImplicitUsings>
+    <TreatWarningsAsErrors>false</TreatWarningsAsErrors>
+    <NoWarn>$(NoWarn);CS0168;CS0219;CS0414;CS0649;CS8632;SYSLIB0001</NoWarn>
+    <EnableDefaultCompileItems>false</EnableDefaultCompileItems>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Mono.Cecil" Version="0.11.4" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <Compile Include="*.cs" />
+    <Compile Include="../../third_party/Il2CppDumper/Il2CppDumper/**/*.cs"
+             Exclude="../../third_party/Il2CppDumper/Il2CppDumper/Program.cs;../../third_party/Il2CppDumper/Il2CppDumper/Resource1.Designer.cs;../../third_party/Il2CppDumper/Il2CppDumper/obj/**;../../third_party/Il2CppDumper/Il2CppDumper/bin/**" />
+    <EmbeddedResource Include="../../third_party/Il2CppDumper/Il2CppDumper/Libraries/Il2CppDummyDll.dll" LogicalName="Il2CppDummyDll" />
+  </ItemGroup>
+
+</Project>

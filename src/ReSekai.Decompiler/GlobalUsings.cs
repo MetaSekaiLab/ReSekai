@@ -1,0 +1,9 @@
+global using ReSekai.Decompiler.Diagnostics;
+global using ReSekai.Decompiler.Facts.Derived;
+global using ReSekai.Decompiler.Machine.Algebra;
+global using ReSekai.Decompiler.Machine.Storage;
+global using ReSekai.Decompiler.Managed;
+global using ReSekai.Decompiler.Managed.Analysis;
+global using ReSekai.Decompiler.Model;
+global using ReSekai.Decompiler.Options;
+global using ReSekai.Decompiler.Output;

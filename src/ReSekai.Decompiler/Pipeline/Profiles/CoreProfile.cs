@@ -1,0 +1,83 @@
+using ReSekai.Decompiler.Facts;
+using ReSekai.Decompiler.Input;
+using static ReSekai.Decompiler.Pipeline.RecoveryReport;
+
+namespace ReSekai.Decompiler.Pipeline;
+
+internal static class CoreProfile
+{
+    /// <summary>跳过恢复，骨架的占位体原样写出。没有方法体可以挑选，所以源码总按工程布局导出整个范围。</summary>
+    private static RecoveryRunResult Stubs(RecoveryRequest request, RunManifest manifest, ProgramFacts facts, SelectionStage.Selection selection, Action<string> Log)
+    {
+        var skeleton = new Skeleton(facts.Model);
+        Directory.CreateDirectory(request.Output);
+        var assemblies = Path.Combine(request.Output, "assemblies");
+        manifest.Step("publication", () => { skeleton.Write(assemblies); return 0; });
+        ReportStage.WriteUnselected(request.Output, selection);
+        var files = manifest.Step("decompile", () => DecompileStage.Write(request with { SourceLayout = "project" }, facts, assemblies, [], [], [], selection.Methods, Log));
+        var report = $"只导出桩：范围内方法 {selection.Targets.Length}，全部是占位体，没有恢复方法体；C# {files} 个类型文件\n";
+        File.WriteAllText(Path.Combine(request.Output, "holes.txt"), report);
+        var outcome = new RecoveryRunResult(request.Output, report, selection.Targets.Length, 0, 0, 0);
+        manifest.Complete(outcome);
+        return outcome;
+    }
+
+    internal static RecoveryRunResult Run(RecoveryRequest request, Action<string>? progress)
+    {
+        void Log(string message) => progress?.Invoke(message);
+        var manifest = new RunManifest(request);
+        var facts = manifest.Step("facts", () => FactsBuilder.Build(request.Binary, request.Metadata, Log, options: request.Options, jobs: request.Jobs));
+        var types = new ManagedTypes(facts.Model, facts.Layouts);
+        var selection = manifest.Step("selection", () => SelectionStage.Select(request, facts, Log));
+        if (request.StubsOnly) return Stubs(request, manifest, facts, selection, Log);
+        var guard = request.KeepGoing ? new MethodGuard(() => new(facts, types), TimeSpan.FromSeconds(request.MethodTimeoutSeconds), Log) : null;
+        var batch = manifest.Step("recovery", () => RecoveryStage.RecoverMethods(selection.Targets, facts, types, request.Jobs, Log, guard));
+        var targets = batch.Targets;
+        var summaries = guard is null ? new MethodSummaryService(batch.Recovery) : new MethodSummaryService(batch.Recovery, guard);
+        for (var i = 0; i < targets.Length; i++) summaries.Seed(selection.Targets[i], targets[i]);
+        var dependencies = new List<MethodRecoveryResult>();
+        manifest.Step("dependencies", () =>
+        {
+            DependencyClosure.Complete(targets, dependencies, targets.ToDictionary(r => r.Method.Method), summaries);
+            return dependencies.Count;
+        });
+        var results = targets.Concat(dependencies).ToArray();
+        var dependencyMethods = dependencies.Select(r => r.Method.Method).ToHashSet();
+        var skeleton = new Skeleton(facts.Model);
+        skeleton.ApplyDeclarations(results);
+        var emitter = new BodyEmitter(skeleton, types, diagnostics: request.Options.Diagnostics);
+        var bodies = results.Where(r => r.Body is not null).Select(r => r.Body!);
+        var problems = request.KeepGoing ? emitter.CheckEach(bodies, EmissionPolicy.Recovered) : emitter.Check(bodies, EmissionPolicy.Recovered);
+        DependencyClosure.Validate(results, problems);
+        var published = PublishStage.Run(results, dependencyMethods, emitter, problems, request.KeepGoing);
+        var marked = request.KeepGoing ? PublishStage.MarkUnrecovered(results, published, emitter) : 0;
+        var emitted = published.Emitted;
+        var partialEmitted = published.PartialEmitted;
+        var emitProblems = published.Problems;
+        var output = request.Output;
+        Directory.CreateDirectory(output);
+        var assemblies = Path.Combine(output, "assemblies");
+        manifest.Step("publication", () => { skeleton.Write(assemblies); return emitted.Count; });
+        ReportStage.WritePublications(output, results, skeleton);
+        var bytes = results.Select(r => r.Entry).Distinct().ToDictionary(e => e, e => e == 0 ? 0 : checked((long)facts.Code.At(e)!.Size));
+        ReportStage.WriteRecovery(output, results, bytes, dependencyMethods, emitProblems, partialEmitted,
+            _ => "native-recovery", _ => null);
+        ReportStage.WriteTraces(output, targets);
+        ReportStage.WriteEmitted(output, emitted, skeleton, dependencyMethods);
+        var sourceProblems = SourceSuitability.Check(emitted.Select(r => r.Body!).Concat(partialEmitted.Select(r => r.Partial!)));
+        ReportStage.WriteSourceProblems(output, sourceProblems);
+        ReportStage.WriteUnselected(output, selection);
+        var selectedSet = targets.ToHashSet();
+        var report = Report(targets, emitted.Where(selectedSet.Contains).ToList(), emitProblems.Where(p => selectedSet.Contains(p.Key)).ToDictionary(),
+            targets.Select(r => r.Entry).Distinct().ToDictionary(e => e, e => bytes[e]));
+        var files = manifest.Step("decompile", () => DecompileStage.Write(request, facts, assemblies, emitted, partialEmitted, results, selection.Methods, Log));
+        report.AppendLine($"core：依赖 {dependencies.Count}，部分体 {partialEmitted.Count}，C# {files} 个类型文件");
+        report.AppendLine($"源码形式限制 {sourceProblems.Count}（独立于 CIL 写出，不代表源码编译结果）");
+        if (guard is not null) report.AppendLine($"--keep-going：标记 Unrecovered 的方法 {marked}，恢复崩溃 {guard.Crashes}，超时 {guard.Timeouts}");
+        File.WriteAllText(Path.Combine(output, "holes.txt"), report.ToString());
+        var outcome = new RecoveryRunResult(output, report.ToString(), targets.Length, emitted.Count(selectedSet.Contains),
+            emitProblems.Count(p => selectedSet.Contains(p.Key)), partialEmitted.Count);
+        manifest.Complete(outcome);
+        return outcome;
+    }
+}

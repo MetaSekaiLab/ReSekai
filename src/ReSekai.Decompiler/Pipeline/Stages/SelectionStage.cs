@@ -1,0 +1,49 @@
+using ReSekai.Decompiler.Facts;
+using ReSekai.Decompiler.Recovery;
+using static ReSekai.Decompiler.Pipeline.RecoveryReport;
+
+namespace ReSekai.Decompiler.Pipeline;
+
+internal static class SelectionStage
+{
+    internal sealed record Selection(RecoveryTarget[] Targets, MethodDef[] Methods,
+        Dictionary<MethodDef, ulong[]> NativeEntries, MethodDef[] Unselected);
+
+    internal static Selection Select(RecoveryRequest request, ProgramFacts facts, Action<string> Log)
+    {
+        var namespaces = request.Namespaces;
+        var assembliesFilter = request.Assemblies;
+        var types = request.TypeNames();
+        var all = request.All || assembliesFilter is not null;
+        var list = request.Methods;
+        var limit = request.Limit;
+        RecoveryTarget[] selected;
+        if (list is null)
+        {
+            bool Included(MethodDef m) => (all || (types is not null ? types.Contains(Top(m.Owner).FullName) : InNamespaces(m.Owner, namespaces)))
+                && (assembliesFilter is null || assembliesFilter.Contains(m.Owner.Assembly, StringComparer.Ordinal));
+            var entries = new MethodEntries(facts, new ManagedTypes(facts.Model, facts.Layouts));
+            selected = entries.Definitions.Where(e => Included(e.Instance.Method) && facts.Code.RegionOf(e.Address) == CodeRegion.Managed)
+                .Select(e => new RecoveryTarget(e.Instance, e.Address)).Take(limit).ToArray();
+            Log($"恢复 {selected.Length} 个方法（{(all ? assembliesFilter is null ? "全程序方法定义" : string.Join(", ", assembliesFilter) : types is not null ? request.Types : string.Join(", ", namespaces))}）");
+        }
+        else
+        {
+            selected = File.ReadLines(list).Where(l => l.Length > 0 && !l.StartsWith('#')).Select(l => l.Split('\t'))
+                .Select(f => RecoveryTarget.Find(facts, Convert.ToUInt64(f[0], 16), f[1])).ToArray();
+            Log($"恢复 {selected.Length} 个方法（{list}）");
+        }
+        if (selected.GroupBy(t => t.Instance.Method).Any(g => g.Count() > 1))
+            throw new InvalidDataException("同一方法定义只能选择一个原生入口，不能以多个实例体覆盖同一 CIL 方法");
+        var methods = selected.Select(t => t.Instance.Method).ToArray();
+        var selectedDefinitions = methods.ToHashSet();
+        var selectedTypes = methods.Select(m => Top(m.Owner)).ToHashSet();
+        var nativeEntries = facts.Model.Code.SelectMany(p => p.Value.Select(o => (Method: o.Method.Method, Entry: p.Key)))
+            .Where(p => selectedTypes.Contains(Top(p.Method.Owner))).GroupBy(p => p.Method)
+            .ToDictionary(g => g.Key, g => g.Select(p => p.Entry).Distinct().Order().ToArray());
+        var unselected = facts.Model.Methods.Where(m => selectedTypes.Contains(Top(m.Owner)) && !selectedDefinitions.Contains(m))
+            .OrderBy(m => m.Index).ToArray();
+
+        return new(selected, methods, nativeEntries, unselected);
+    }
+}

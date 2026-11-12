@@ -1,0 +1,4 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup><OutputType>Exe</OutputType><AssemblyName>ReSekai.Tests</AssemblyName></PropertyGroup>
+  <ItemGroup><ProjectReference Include="../src/ReSekai/ReSekai.csproj" /></ItemGroup>
+</Project>

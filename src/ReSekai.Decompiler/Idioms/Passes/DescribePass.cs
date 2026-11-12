@@ -1,0 +1,12 @@
+using ReSekai.Decompiler.Ir;
+
+namespace ReSekai.Decompiler.Idioms;
+
+internal static class DescribePass
+{
+    internal static string Describe(Call call)
+    {
+        var text = call.ToString();
+        return text.Length > 300 ? text[..300] : text;
+    }
+}

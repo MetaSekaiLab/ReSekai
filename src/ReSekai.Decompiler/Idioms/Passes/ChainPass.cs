@@ -1,0 +1,25 @@
+using ReSekai.Decompiler.Machine.Flow;
+
+namespace ReSekai.Decompiler.Idioms;
+
+internal static class ChainPass
+{
+    /// <summary>从 start 出发的单前驱、单后继直链，直到 merge；不是直链返回 null。</summary>
+    internal static List<Block>? Chain(Block start, Block merge)
+    {
+        var chain = new List<Block>();
+        var visited = new HashSet<Block>();
+        for (var b = start; b != merge;)
+        {
+            if (b.Predecessors.Count != 1 || b.IsLandingPad || !visited.Add(b))
+                return null;
+            var next = b.NormalSuccessors.ToArray();
+            if (next.Length != 1)
+                return null;
+            chain.Add(b);
+            b = next[0];
+        }
+
+        return chain;
+    }
+}

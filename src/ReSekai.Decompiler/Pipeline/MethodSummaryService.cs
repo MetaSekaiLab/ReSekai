@@ -1,0 +1,101 @@
+using ReSekai.Decompiler.Calls;
+using ReSekai.Decompiler.Recovery;
+
+namespace ReSekai.Decompiler.Pipeline;
+
+/// <summary>会话拥有恢复器和摘要缓存；源码变换只读摘要，不启动恢复。</summary>
+public sealed class MethodSummaryService : IMethodResults
+{
+    private readonly Dictionary<MethodRequest, MethodRecoveryResult> summaries = [];
+    private readonly Func<MethodRequest, MethodRecoveryResult> recover;
+    public int Count => summaries.Count;
+    public int DiscoveryRounds { get; private set; }
+    public int AnalysisRuns { get; private set; }
+
+    public MethodSummaryService(MethodDecompiler recovery) : this(request => request.Mode switch
+    {
+        RecoveryMode.Definition => recovery.Recover(request.Method, request.Entry),
+        RecoveryMode.Instance => recovery.RecoverInstance(request.Method, request.Entry),
+        RecoveryMode.Shared => recovery.RecoverShared(request.Method, request.Entry),
+        _ => throw new ArgumentOutOfRangeException(nameof(request)),
+    }) => definitionRecovery = recovery.RecoverDefinition;
+
+    public MethodRecoveryResult RecoverDefinition(MethodDef method)
+    {
+        if (definitions.TryGetValue(method, out var known)) return known;
+        if (definitionRecovery is null) throw new InvalidOperationException("摘要服务没有定义恢复入口");
+        return definitions[method] = definitionRecovery(method);
+    }
+
+    private readonly Func<MethodDef, MethodRecoveryResult>? definitionRecovery;
+    private readonly Dictionary<MethodDef, MethodRecoveryResult> definitions = [];
+
+    internal MethodSummaryService(Func<MethodRequest, MethodRecoveryResult> recover) => this.recover = recover;
+
+    /// <summary>依赖方法的恢复同样受保护：失败的依赖没有方法体，用到它的方法按依赖缺失处理。</summary>
+    internal MethodSummaryService(MethodDecompiler recovery, MethodGuard guard) : this(request =>
+    {
+        var result = guard.Run(request.Method, request.Entry, ref recovery, worker => request.Mode switch
+        {
+            RecoveryMode.Definition => worker.Recover(request.Method, request.Entry),
+            RecoveryMode.Instance => worker.RecoverInstance(request.Method, request.Entry),
+            RecoveryMode.Shared => worker.RecoverShared(request.Method, request.Entry),
+            _ => throw new ArgumentOutOfRangeException(nameof(request)),
+        });
+        return result;
+    }) => definitionRecovery = method => guard.Run(MethodRef.Open(method), method.Address, ref recovery, worker => worker.RecoverDefinition(method));
+
+    public void Seed(RecoveryTarget target, MethodRecoveryResult result) => summaries.TryAdd(
+        new(target.Instance, target.Entry, target.Shared ? RecoveryMode.Shared : RecoveryMode.Definition), result);
+
+    public MethodRecoveryResult Recover(MethodRef method, ulong entry) => Get(new(method, entry));
+    public MethodRecoveryResult RecoverInstance(MethodRef method, ulong entry) => Get(new(method, entry, RecoveryMode.Instance));
+
+    private MethodRecoveryResult Get(MethodRequest request)
+    {
+        if (summaries.TryGetValue(request, out var known)) return known;
+        var result = recover(request);
+        summaries.Add(request, result);
+        return result;
+    }
+
+    public T Complete<T>(Func<IMethodSummaries, T> analyze) => Complete([0], (_, catalog) => analyze(catalog))[0];
+
+    /// <summary>只重放读取了缺失摘要的方法；已完成结果与摘要失败结果均可复用。</summary>
+    public Dictionary<TKey, T> Complete<TKey, T>(IReadOnlyList<TKey> items, Func<TKey, IMethodSummaries, T> analyze) where TKey : notnull
+    {
+        var results = new Dictionary<TKey, T>();
+        var dirty = items.ToArray();
+        while (dirty.Length != 0)
+        {
+            var blocked = new List<TKey>();
+            var pending = new HashSet<MethodRequest>();
+            foreach (var item in dirty)
+            {
+                var reader = new Reader(summaries);
+                results[item] = analyze(item, reader);
+                AnalysisRuns++;
+                if (reader.Missing.Count == 0) continue;
+                blocked.Add(item);
+                pending.UnionWith(reader.Missing);
+            }
+            if (pending.Count == 0) break;
+            DiscoveryRounds++;
+            foreach (var request in pending.OrderBy(r => r.Method.Method.Index).ThenBy(r => r.Entry).ThenBy(r => r.Mode).ToArray())
+                Get(request);
+            dirty = blocked.ToArray();
+        }
+        return results;
+    }
+
+    private sealed class Reader(IReadOnlyDictionary<MethodRequest, MethodRecoveryResult> summaries) : IMethodSummaries
+    {
+        public HashSet<MethodRequest> Missing { get; } = [];
+        public MethodRecoveryResult? Find(MethodRequest request)
+        {
+            if (summaries.TryGetValue(request, out var result)) return result;
+            Missing.Add(request);
+            return null;
+        }
+    }
+}

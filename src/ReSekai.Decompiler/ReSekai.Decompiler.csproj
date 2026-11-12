@@ -1,0 +1,20 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <RootNamespace>ReSekai.Decompiler</RootNamespace>
+    <AssemblyName>ReSekai.Decompiler</AssemblyName>
+    <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="../ReSekai.Decompiler.Input/ReSekai.Decompiler.Input.csproj" />
+    <PackageReference Include="ICSharpCode.Decompiler" Version="11.1.0.9782" />
+    <PackageReference Include="Mono.Cecil" Version="0.11.4" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <InternalsVisibleTo Include="ReSekai.Decompiler.Tests" />
+    <InternalsVisibleTo Include="ReSekai.Tests" />
+  </ItemGroup>
+
+</Project>

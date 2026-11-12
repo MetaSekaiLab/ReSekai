@@ -1,0 +1,6 @@
+<Solution>
+  <Project Path="src/ReSekai/ReSekai.csproj" />
+  <Project Path="src/ReSekai.Decompiler/ReSekai.Decompiler.csproj" />
+  <Project Path="src/ReSekai.Decompiler.Input/ReSekai.Decompiler.Input.csproj" />
+  <Project Path="tests/ReSekai.Tests.csproj" />
+</Solution>

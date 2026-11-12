@@ -1,0 +1,145 @@
+using System.Reflection;
+using ReSekai.Decompiler.Ir;
+
+namespace ReSekai.Decompiler.Facts;
+
+/// <summary>经指针实参对被指内存的访问。</summary>
+[Flags]
+public enum MemoryAccess : byte { None = 0, Read = 1, Write = 2, ReadWrite = Read | Write }
+
+/// <summary>托管值跨调用边界的方式。</summary>
+public enum Transfer : byte
+{
+    /// <summary>值本身位于 Pieces（寄存器或栈槽）中。</summary>
+    Value,
+    /// <summary>Pieces[0] 是值副本的地址（大结构体、完全共享的类型参数）；被调用者只读这份副本。</summary>
+    Copy,
+    /// <summary>Pieces[0] 是调用者存储的地址（ref/out/in 参数、值类型的 this）。</summary>
+    Reference,
+    /// <summary>Pieces[0] 是结果缓冲区的地址；被调用者写入返回值。</summary>
+    ResultBuffer,
+}
+
+/// <summary>
+/// 一个 IL 值在机器上的位置。Index：-1 为 this，0.. 为参数，<see cref="MachineSignature.ReturnIndex"/> 为返回值。
+/// Pieces 的 Register 为寄存器，或相对调用时 SP（被调用者入口 SP）的栈槽 <see cref="Storage.Slot"/>；
+/// Piece.Offset 是该片在值中的字节偏移。Size 为值（或被指内存）的字节数，未知为 -1。
+/// </summary>
+public sealed record MachineValue(int Index, TypeRef Type, Transfer Transfer, AbiPiece[] Pieces, int Size, MemoryAccess Access)
+{
+    /// <summary>经指针传递时指针所在的位置。</summary>
+    public AbiPiece? Pointer => Transfer == Transfer.Value ? null : Pieces[0];
+}
+
+/// <summary>托管方法的完整机器签名：寄存器与栈上的实参、返回值、隐藏的 MethodInfo，以及经指针实参的内存效果。</summary>
+public sealed record MachineSignature(MachineValue[] Arguments, MachineValue? Return, AbiPiece? MethodInfo, int StackSize)
+{
+    public const int ReturnIndex = int.MaxValue;
+    /// <summary>隐藏的 MethodInfo 实参在内存效果中的值编号。</summary>
+    public const int MethodInfoIndex = int.MinValue;
+
+    public MachineValue? This => Arguments.FirstOrDefault(a => a.Index == -1);
+
+    /// <summary>调用读取或写出被指内存的全部值（含结果缓冲区）。</summary>
+    public IEnumerable<MachineValue> Indirections => Return is { Transfer: Transfer.ResultBuffer } ret
+        ? Arguments.Where(a => a.Transfer != Transfer.Value).Append(ret) : Arguments.Where(a => a.Transfer != Transfer.Value);
+}
+
+public sealed partial class ManagedAbi
+{
+    /// <summary>已拆包的 invoker：引用按值，值参数按地址，非 void 返回值写入最后一个存储。</summary>
+    public MachineSignature Invoker(MethodRef method)
+    {
+        var arguments = new List<MachineValue>();
+        AbiPiece Piece(int index) => new(Storage.Gpr(index), 64, 0);
+        if (!method.Method.IsStatic)
+        {
+            var type = method.DeclaringType;
+            var reference = ManagedTypes.IsReferenceType(type);
+            arguments.Add(new(-1, reference ? type : new ByRefRef(type), reference ? Transfer.Value : Transfer.Reference,
+                [Piece(0)], reference ? 8 : SharedValue(type) ? -1 : Size(type), reference ? MemoryAccess.None : MemoryAccess.ReadWrite));
+        }
+        for (var index = 0; index < method.Method.Parameters.Count; index++)
+        {
+            var type = method.Concrete(method.Method.Parameters[index].Type);
+            var piece = Piece(arguments.Count);
+            if (type is ByRefRef || ManagedTypes.IsReferenceType(type))
+                arguments.Add(Direct(index, type, [piece], method.Method.Parameters[index].Attributes));
+            else arguments.Add(new(index, type, Transfer.Copy, [piece], SharedValue(type) ? -1 : Size(type), MemoryAccess.Read));
+        }
+        var info = Piece(arguments.Count);
+        var returned = method.Concrete(method.Method.ReturnType);
+        var result = ManagedTypes.IsVoid(returned) ? null : new MachineValue(MachineSignature.ReturnIndex, returned,
+            Transfer.ResultBuffer, [Piece(arguments.Count + 1)], SharedValue(returned) ? -1 : Size(returned), MemoryAccess.Write);
+        return new(arguments.ToArray(), result, info, 0);
+    }
+
+    /// <summary>受约束的 invoker：实参形式与 invoker 相同，接收者是约束类型的位置（值类型的存储，或存放引用的位置）。</summary>
+    public MachineSignature ConstrainedInvoker(TypeRef constraint, MethodRef method)
+    {
+        var invoker = Invoker(method);
+        return invoker with
+        {
+            Arguments = invoker.Arguments.Select(a => a.Index != -1 ? a : new MachineValue(-1, new ByRefRef(constraint), Transfer.Reference, a.Pieces,
+                SharedValue(constraint) ? -1 : Size(constraint), MemoryAccess.ReadWrite)).ToArray(),
+        };
+    }
+
+    /// <summary>受约束调用的直接形式：方法的机器签名，接收者换成约束类型的位置。</summary>
+    public MachineSignature? ConstrainedMachine(TypeRef constraint, MethodRef method) => Machine(method, out _) is { } signature
+        ? signature with
+        {
+            Arguments = signature.Arguments.Select(a => a.Index != -1 ? a : new MachineValue(-1, new ByRefRef(constraint), Transfer.Reference, a.Pieces,
+                SharedValue(constraint) ? -1 : Size(constraint), MemoryAccess.ReadWrite)).ToArray(),
+        }
+        : null;
+
+    /// <summary>方法的机器签名；无法分类时返回 null 并给出原因。</summary>
+    public MachineSignature? Machine(MethodRef method, out string? problem)
+    {
+        if (Classify(method, out problem) is not { } signature) return null;
+        var stack = StackArguments(signature);
+        var arguments = new List<MachineValue>();
+        if (signature.This is { } self)
+            arguments.Add(self.Type is ByRefRef byRef
+                ? new(-1, self.Type, Transfer.Reference, self.Pieces, SharedValue(byRef.Element) ? -1 : Size(byRef.Element), MemoryAccess.ReadWrite)
+                : new(-1, self.Type, Transfer.Value, self.Pieces, 8, MemoryAccess.None));
+        for (var i = 0; i < signature.Parameters.Length; i++)
+        {
+            var value = signature.Parameters[i];
+            var attributes = method.Method.Parameters[i].Attributes;
+            if (value.Passing == Passing.Stack)
+            {
+                var slot = stack.Parameters.Single(p => p.Index == i);
+                if (slot.Indirect)
+                    arguments.Add(new(i, value.Type, Transfer.Copy, [new AbiPiece(Storage.Slot(slot.Offset), 64, 0)], Size(value.Type), MemoryAccess.Read));
+                else
+                    arguments.Add(Direct(i, value.Type, StackPieces(slot) is { Length: > 0 } pieces ? pieces : [new AbiPiece(Storage.Slot(slot.Offset), slot.Size * 8, 0)], attributes));
+                continue;
+            }
+            arguments.Add(value.Passing switch
+            {
+                Passing.Indirect => new(i, value.Type, Transfer.Copy, value.Pieces, Size(value.Type), MemoryAccess.Read),
+                Passing.Shared => new(i, value.Type, Transfer.Copy, value.Pieces, -1, MemoryAccess.Read),
+                _ => Direct(i, value.Type, value.Pieces, attributes),
+            });
+        }
+        MachineValue? result = signature.Return switch
+        {
+            null => null,
+            { Passing: Passing.Indirect } r => new(MachineSignature.ReturnIndex, r.Type, Transfer.ResultBuffer, r.Pieces, SharedValue(r.Type) ? -1 : Size(r.Type), MemoryAccess.Write),
+            var r => new(MachineSignature.ReturnIndex, r.Type, Transfer.Value, r.Pieces, Size(r.Type), MemoryAccess.None),
+        };
+        var methodInfo = signature.MethodInfo ?? (stack.MethodInfoOffset is { } offset ? new AbiPiece(Storage.Slot(offset), 64, 0) : null);
+        return new MachineSignature(arguments.ToArray(), result, methodInfo, stack.Size);
+    }
+
+    /// <summary>按值传递的实参；ref/out/in 参数是调用者存储的地址，按参数特性确定读写方向。</summary>
+    private MachineValue Direct(int index, TypeRef type, AbiPiece[] pieces, ParameterAttributes attributes)
+    {
+        if (type is not ByRefRef byRef) return new(index, type, Transfer.Value, pieces, Size(type), MemoryAccess.None);
+        var direction = attributes & (ParameterAttributes.In | ParameterAttributes.Out);
+        var access = direction == ParameterAttributes.Out ? MemoryAccess.Write : direction == ParameterAttributes.In ? MemoryAccess.Read : MemoryAccess.ReadWrite;
+        return new(index, type, Transfer.Reference, pieces, SharedValue(byRef.Element) ? -1 : Size(byRef.Element), access);
+    }
+}

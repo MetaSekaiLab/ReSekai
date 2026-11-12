@@ -1,0 +1,15 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <AssemblyName>resekai</AssemblyName>
+  </PropertyGroup>
+  <ItemGroup>
+    <InternalsVisibleTo Include="ReSekai.Tests" />
+    <ProjectReference Include="../ReSekai.Decompiler/ReSekai.Decompiler.csproj" />
+    <EmbeddedResource Include="../../data/*.gz" LogicalName="%(Filename)%(Extension)" />
+    <PackageReference Include="AssetRipper.TextureDecoder" Version="2.6.3" />
+    <PackageReference Include="AssetRipper.Conversions.UnityCrunch" Version="1.0.3" />
+    <PackageReference Include="Fmod5Sharp" Version="3.1.0" />
+    <PackageReference Include="Microsoft.Bcl.Memory" Version="10.0.12" />
+  </ItemGroup>
+</Project>

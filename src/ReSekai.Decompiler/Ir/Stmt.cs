@@ -1,0 +1,243 @@
+
+namespace ReSekai.Decompiler.Ir;
+
+/// <summary>SSA 变量：某个存储单元的一个版本。Version 0 表示函数入口值。</summary>
+public sealed record Variable(Storage Storage, int Version)
+{
+    public int Width => Storage.Width;
+    public override string ToString() => Version == 0 ? $"in_{Storage}" : $"{Storage}_{Version}";
+}
+
+/// <summary>
+/// 语句。每条机器指令提升为若干语句；Address 记录来源指令，便于回溯证据。
+/// </summary>
+public abstract record Stmt(ulong Address);
+
+/// <summary>写存储单元。Value 窄于存储单元时高位清零（ARM64 W/S/D 写、x64 32 位写、VEX 标量写）；
+/// 需要保留高位的写入（x64 8/16 位写、SSE 标量写）由提升器显式构造 Insert 表达式。</summary>
+public sealed record Assign(ulong Address, Storage Target, Expr Value) : Stmt(Address)
+{
+    public override string ToString() => $"{Target} = {Value}";
+}
+
+/// <summary>SSA 形式的定义。</summary>
+public sealed record Define(ulong Address, Variable Target, Expr Value) : Stmt(Address)
+{
+    public override string ToString() => $"{Target} = {Value}";
+}
+
+public sealed record Phi(ulong Address, Variable Target, Variable[] Sources) : Stmt(Address)
+{
+    public override string ToString() => $"{Target} = phi({string.Join(", ", Sources.Select(s => s.ToString()))})";
+}
+
+public sealed record Store(ulong Address, Expr Target, Expr Value) : Stmt(Address)
+{
+    public override string ToString() => $"[{Target}]:{Value.Width} = {Value}";
+}
+
+public enum CallKind : byte { Direct, Indirect, Tail, TailIndirect }
+
+/// <summary>
+/// 调用经指针对局部内存单元的一次访问：宽 ValueWidth 位的值 Value（托管调用为机器签名中的序号，运行时操作为实参位置）的
+/// [ValueBit, ValueBit+Width) 位对应单元 Cell 的 [CellBit, CellBit+Width) 位。
+/// 读取的单元出现在 Arguments/Sources 中，写入的单元出现在 Results/Defines 中。
+/// </summary>
+public sealed record CellAccess(Storage Cell, int Value, int ValueWidth, int ValueBit, int CellBit, int Width, bool Write);
+
+/// <summary>运行时操作：L2 惯用法归一后，调用（或一段固定指令序列）所表达的托管语义。</summary>
+public enum OpKind : byte
+{
+    /// <summary>保证类型完成初始化（InitializedTypeInfo / ClassInlines::InitFromCodegen），结果为参数本身。</summary>
+    InitClass,
+    /// <summary>运行类构造函数（il2cpp_runtime_class_init，cctor 守卫已并入）。</summary>
+    RunClassConstructor,
+    /// <summary>初始化泛型方法的 RGCTX（结果为参数本身）。</summary>
+    InitMethodRgctx,
+    NewObject, NewArray, Box, Unbox, IsInst, IsAssignableFrom,
+    /// <summary>按数组的实际元素类型检查对象；Arguments 为（对象, 数组），返回原对象或 null。</summary>
+    IsInstArrayElement,
+    /// <summary>内联的类继承检查（IsInstClass 快速路径）：参数为对象的 Il2CppClass*，结果为 1 表示是 Operand 类型或其子类。</summary>
+    TypeCheck,
+    /// <summary>条件成立时抛出 Operand 指名的异常（判空、越界之外的检查）。</summary>
+    ThrowIf,
+    /// <summary>判空：参数为空时抛出 NullReferenceException。</summary>
+    NullCheck,
+    /// <summary>越界：Arguments 为（索引, 长度）或无法拆分时的条件。</summary>
+    BoundsCheck,
+    /// <summary>抛出参数中的托管异常对象（il2cpp_raise_exception）。</summary>
+    Throw,
+    /// <summary>直接构造并抛出 Operand 指名的异常（无参数 helper）。</summary>
+    ThrowNew,
+    /// <summary>构造 Operand 指名的异常对象并返回（GetException 类 helper）。</summary>
+    NewException,
+    Rethrow,
+    /// <summary>托管引用写入后的写屏障；对应的 Store 紧邻其前。</summary>
+    WriteBarrier,
+    MemoryBarrier,
+    /// <summary>接口方法查找：Arguments 为（对象, 接口类, 槽位），结果为 VirtualInvokeData*。</summary>
+    InterfaceInvokeData,
+    /// <summary>经 vtable 槽位的虚调用；Operand 为槽位号。</summary>
+    CallVirtual,
+    /// <summary>泛型虚方法解析：Arguments 为（vtable[method->slot].method, 泛型方法实例），结果为目标 MethodInfo*；Operand 为方法。</summary>
+    ResolveGenericVirtual,
+    /// <summary>经泛型虚方法解析结果（MethodInfo.virtualMethodPointer）的调用；Operand 为方法。</summary>
+    CallGenericVirtual,
+    /// <summary>经接口查找结果的调用；Operand 为（接口类型, 槽位）。</summary>
+    CallInterface,
+    /// <summary>经 Delegate.invoke_impl 的调用。</summary>
+    CallDelegate,
+    /// <summary>经 MethodInfo.methodPointer 的调用。</summary>
+    CallMethodPointer,
+    /// <summary>C++ 异常机制（catch 开始/结束、继续展开、终止）。</summary>
+    BeginCatch, EndCatch, ResumeUnwind, Terminate,
+    /// <summary>FieldInfo 给出的字段地址（共享泛型代码中偏移只在运行时可知）。</summary>
+    FieldAddress,
+    /// <summary>按元素类的 element_size 计算的数组元素地址。</summary>
+    ArrayElementAddress,
+    /// <summary>il2cpp_* 导出 API；Operand 为导出名。</summary>
+    Export,
+    /// <summary>libc 等外部函数（memcpy、数学函数等）；Operand 为符号名。</summary>
+    Import,
+    /// <summary>逐点证明的 allocate(8)/wrapper+0/__cxa_throw；唯一参数为托管异常对象。</summary>
+    ThrowManaged,
+    /// <summary>引用原子比较交换：位置、新值、比较值 → 旧引用。</summary>
+    CompareExchangeReference,
+    /// <summary>按元数据类型复制/清零共享泛型存储；参数为托管地址，Operand 为类型。</summary>
+    CopyGenericValue, ClearGenericValue,
+    /// <summary>MethodInfo.invoker_method 的已拆包调用，Operand 为方法；最后一个参数为返回存储。</summary>
+    InvokeGeneric,
+    /// <summary>经分派查找得到 MethodInfo 的 invoker 调用（接口槽、泛型虚方法）；实参形式同 InvokeGeneric，是对接收者的 callvirt。</summary>
+    InvokeVirtualGeneric,
+    /// <summary>IL 的 unbox.any：Operand 为类型，参数为对象；结果是值所在位置的地址。</summary>
+    UnboxGenericValue,
+    /// <summary>IL 的 constrained. callvirt：Operand 为 (约束类型, 方法)；实参形式同 InvokeGeneric，接收者是约束类型的位置。</summary>
+    InvokeConstrainedGeneric,
+    /// <summary>两个标量栈出参已显式化的外部调用；Operand 为符号名，Defines 按出参顺序保存结果。</summary>
+    ImportOutPair,
+    /// <summary>经过判空与越界检查的字节数组读取；参数为数组与 32 位下标。</summary>
+    ReadByteArray,
+    GenericHasValue,
+    /// <summary>
+    /// IL 的 constrained. callvirt 的直接形式：约束类型在生成代码时已确定，直接调用实现方法，MethodInfo 位传约束解析项。
+    /// Operand 同 <see cref="InvokeConstrainedGeneric"/>；实参按方法的机器签名，接收者是约束类型的位置。
+    /// </summary>
+    CallConstrained,
+    /// <summary>Assembly.GetExecutingAssembly()：调用方所在程序集的反射对象。</summary>
+    ExecutingAssembly,
+}
+
+/// <summary>调用所表达的运行时操作。Operand：类型（TypeRef）、异常名、槽位号等，见 <see cref="OpKind"/>。</summary>
+public sealed record RuntimeOp(OpKind Kind, object? Operand)
+{
+    public override string ToString() => Operand is null ? Kind.ToString() : $"{Kind}<{Operand}>";
+}
+
+/// <summary>调用点的逻辑身份；路径复制产生新身份，保留原身份作为来源。</summary>
+public sealed class CallSite(CallSite? origin = null)
+{
+    public CallSite? Origin { get; } = origin;
+}
+
+/// <summary>
+/// 调用。Arguments/Results 在提升时为空，由 ABI 阶段根据被调用者签名填入；
+/// 提升阶段只描述控制转移本身。
+/// </summary>
+public sealed record Call(ulong Address, CallKind Kind, Expr Target) : Stmt(Address)
+{
+    public CallSite Site { get; init; } = new();
+    /// <summary>同一次调用的改写保留 Site；复制到另一控制路径时使用独立身份。</summary>
+    public Call Duplicate() => this with { Site = new(Site) };
+    public Expr[] Arguments { get; init; } = [];
+    /// <summary>Arguments 尾部各项读自的存储单元；L2 运行时操作可省略原始实参的存储身份。</summary>
+    public Storage[] Sources { get; init; } = [];
+    /// <summary>返回值写入的存储单元（ABI 阶段确定）。</summary>
+    public Storage[] Results { get; init; } = [];
+    /// <summary>SSA 之后 Results 对应的变量（一一对应）。</summary>
+    public Variable[] Defines { get; init; } = [];
+    /// <summary>L2 识别出的运行时操作；null 表示普通调用。</summary>
+    public RuntimeOp? Op { get; init; }
+    /// <summary>调用时的 SP；栈实参与被调用者的入口帧都相对它定位。提升时读取 SP，SSA 后为版本或帧地址。</summary>
+    public Expr? StackPointer { get; init; }
+    /// <summary>对已提升局部内存单元的访问。</summary>
+    public CellAccess[] Memory { get; init; } = [];
+    /// <summary>虚调用、接口调用与委托调用经分派解析出的托管方法（委托调用为 Invoke）。</summary>
+    public Model.MethodRef? Resolved { get; init; }
+    /// <summary>原生辅助函数与托管方法体等价；写出后按方法体透明执行。</summary>
+    public bool Inlined { get; init; }
+    /// <summary>原生控制流证明此调用没有正常返回路径。</summary>
+    public bool DoesNotReturn { get; init; }
+    /// <summary>CallDelegate 的委托对象根；原生 x0 是 method_code，不能用作托管接收者。</summary>
+    public Expr? DelegateReceiver { get; init; }
+    /// <summary>条件抛出归一后 Address 是分支位置；这里保留真正的原生抛出调用点，供语句级 LSDA 查询。
+    /// 只记录来源，不改变生产 CFG 或猜测已删除的异常 phi。</summary>
+    public ulong? NativeExceptionSite { get; init; }
+
+    /// <summary>不含内存提升追加单元的原始实参数量。</summary>
+    public int OriginalArgumentCount => Arguments.Length - Sources.Count(s => s.Bank == Bank.Local);
+
+    /// <summary>存储单元对应的实参位置；无存储身份的运行时实参位于已登记来源之前。</summary>
+    public int ArgumentIndex(Storage source) => Array.IndexOf(Sources, source) is var index and >= 0
+        ? Arguments.Length - Sources.Length + index : -1;
+
+    /// <summary>按读自的存储单元索引的实参。</summary>
+    public Dictionary<Storage, Expr> ArgumentsBySource()
+    {
+        var map = new Dictionary<Storage, Expr>();
+        for (var i = 0; i < Sources.Length; i++) map[Sources[i]] = Arguments[Arguments.Length - Sources.Length + i];
+        return map;
+    }
+
+    public override string ToString() =>
+        $"{(Defines.Length > 0 ? string.Join(", ", Defines.Select(d => d?.ToString() ?? "_")) + " = " : Results.Length == 0 ? "" : string.Join(", ", Results) + " = ")}" +
+        $"{(Op is null ? Kind.ToString().ToLowerInvariant() + " " + Target : $"op {Op}")}({string.Join(", ", Arguments.Select(a => a.ToString()))})";
+}
+
+public sealed record Jump(ulong Address, ulong Target) : Stmt(Address)
+{
+    public override string ToString() => $"goto 0x{Target:x}";
+}
+
+public sealed record Branch(ulong Address, Expr Condition, ulong Target, ulong Fallthrough) : Stmt(Address)
+{
+    public override string ToString() => $"if {Condition} goto 0x{Target:x} else 0x{Fallthrough:x}";
+}
+
+/// <summary>寄存器间接跳转（跳转表等），目标集合由后续分析恢复。</summary>
+public sealed record IndirectJump(ulong Address, Expr Target) : Stmt(Address)
+{
+    public ulong[] Targets { get; init; } = [];
+    public override string ToString() => $"goto *{Target}";
+}
+
+/// <summary>聚合返回值的一段；Offset 是段在返回值中的字节偏移。</summary>
+public sealed record ReturnPiece(int Offset, Expr Value);
+
+public sealed record Return(ulong Address) : Stmt(Address)
+{
+    public Expr? Value { get; init; }
+    public ReturnPiece[] Pieces { get; init; } = [];
+    /// <summary>间接返回时，调用方在函数入口提供的结果缓冲区。</summary>
+    public Expr? Buffer { get; init; }
+    public override string ToString() => Buffer is not null ? $"return buffer {Buffer}"
+        : Pieces.Length > 0 ? $"return {{{string.Join(", ", Pieces.Select(p => $"+{p.Offset}: {p.Value}"))}}}"
+        : Value is null ? "return" : $"return {Value}";
+}
+
+/// <summary>不返回的陷入（brk/ud2/int3）。</summary>
+public sealed record Trap(ulong Address, string Kind) : Stmt(Address)
+{
+    public override string ToString() => $"trap {Kind}";
+}
+
+/// <summary>提升失败的指令。保留原文，令输出总是存在且可追溯；写入集合未知，后续分析必须视为屏障。</summary>
+public sealed record Opaque(ulong Address, string Text) : Stmt(Address)
+{
+    public override string ToString() => $"opaque \"{Text}\"";
+}
+
+/// <summary>对语义无影响但值得保留的指令（屏障、预取、hint）。</summary>
+public sealed record Nop(ulong Address, string Text) : Stmt(Address)
+{
+    public override string ToString() => $"nop {Text}";
+}

@@ -1,0 +1,55 @@
+using ReSekai;
+using ReSekai.Decompiler.Input;
+
+if (args is ["shaders", var shaderApk, var shaderOutput]) return ResourceChecks.Shaders(shaderApk, shaderOutput);
+if (args is ["textures", var textureApk, var textureOutput]) return ResourceChecks.Textures(textureApk, textureOutput);
+if (args is ["controllers", var controllerApk, var controllerOutput]) return ResourceChecks.Controllers(controllerApk, controllerOutput);
+if (args is ["animations", var animationApk, var metadata, var animationResources, var animationOutput]) return AnimationChecks.Run(animationApk, metadata, animationResources, animationOutput);
+if (args is ["serial-sources", var stubAssemblies, var sourceOutput]) return SerialSourceChecks.Run(stubAssemblies, sourceOutput);
+
+static void Assert(bool condition, string reason) { if (!condition) throw new Exception(reason); }
+static void Reject(Action action)
+{
+    try { action(); } catch (Exception error) when (error is InvalidDataException or ArgumentException or IOException) { return; }
+    throw new Exception("应拒绝无效输入");
+}
+AnimationChecks.Basic();
+SerialSourceChecks.Timeout();
+Reject(() => Output.Under(Environment.CurrentDirectory, "../escape"));
+Reject(() => new Binary([1, 2, 3]).U32());
+Assert(Output.Guid("资源/按钮") == Output.Guid("资源/按钮") && Output.Guid("资源/按钮") != Output.Guid("资源/面板"), "稳定 GUID");
+var reader = new Binary([0, 1, 0, 0, 0, 0, 0, 0], offset: 1);
+Value.Read(new Schema("UInt8", "flag", 1, 0x4000), reader);
+Assert(reader.Position == 4, "必须按文件位置对齐");
+Assert(Output.Safe("CON.txt") == "_CON.txt", "Windows 保留名");
+Console.WriteLine("基础检查通过");
+if (args.Length == 0) return 0;
+using Apk apk = new(args[0]);
+string input = args[1];
+var model = ModelBuilder.Load(Path.Join(input, "libil2cpp.so"), Path.Join(input, "global-metadata.dat")).Model;
+Output output = new(Path.Join(Environment.CurrentDirectory, "reader.local.result"));
+Packages packages = new();
+Project project = new(output, new(model, packages, output), new(model), packages);
+Resources resources = new(apk, args.Length > 2 ? args[2] : null);
+int total = 0, failed = 0;
+foreach (var unit in resources.Units)
+{
+    var files = resources.Open(unit);
+    project.Scan(files);
+    foreach (var file in files)
+    foreach (var item in file.Objects)
+    {
+        total++;
+        try { project.Read(file, item); }
+        catch (Exception error)
+        {
+            failed++;
+            output.Note("读取", $"{file.Name}/{item.Id}", error.Message, true);
+            if (failed <= 20) Console.WriteLine($"{file.Name}/{item.Id} 类 {file.Types[item.Type].ClassId}: {error.Message}");
+        }
+    }
+    Console.WriteLine($"{unit.Name}: 读取 {total}，失败 {failed}");
+}
+output.Report("read");
+Assert(failed == 0, $"读取失败 {failed}/{total}");
+return 0;
