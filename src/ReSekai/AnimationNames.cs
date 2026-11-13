@@ -29,6 +29,7 @@ sealed class AnimationNames(ScriptLayout layouts, Dictionary<ObjectId, ScriptNam
     readonly HashSet<string> files = [], vocabulary = new(StringComparer.Ordinal);
     readonly HashSet<uint> wanted = [];
     readonly Dictionary<string, Names> guesses = new(StringComparer.Ordinal);
+    AnimationPathRules? pathRules;
     (string Name, byte[] Bytes)[] words = [];
     static readonly uint[] crcTable = Enumerable.Range(0, 256).Select(i =>
     {
@@ -36,18 +37,42 @@ sealed class AnimationNames(ScriptLayout layouts, Dictionary<ObjectId, ScriptNam
         for (int bit = 0; bit < 8; bit++) crc = (crc >> 1) ^ ((crc & 1) != 0 ? 0xedb88320u : 0);
         return crc;
     }).ToArray();
+    static readonly Lazy<Dictionary<string, Dictionary<uint, string>>> savedPaths = new(ReadSavedPaths);
+    internal static IReadOnlyDictionary<uint, string>? SavedPathsFor(string clip) => savedPaths.Value.GetValueOrDefault(clip);
     static uint Append(uint crc, ReadOnlySpan<byte> text)
     {
         foreach (byte b in text) crc = crcTable[(crc ^ b) & 255] ^ (crc >> 8);
         return crc;
     }
-    public static uint Hash(string text) => ~Append(uint.MaxValue, Encoding.UTF8.GetBytes(text));
+    public static uint Hash(ReadOnlySpan<char> text)
+    {
+        int size = Encoding.UTF8.GetByteCount(text);
+        Span<byte> bytes = size <= 512 ? stackalloc byte[size] : new byte[size];
+        Encoding.UTF8.GetBytes(text, bytes);
+        return ~Append(uint.MaxValue, bytes);
+    }
+
+    static Dictionary<string, Dictionary<uint, string>> ReadSavedPaths()
+    {
+        using var reader = new StreamReader(typeof(AnimationNames).Assembly.GetManifestResourceStream("animation-paths.tsv")!);
+        Dictionary<string, Dictionary<uint, string>> result = new(StringComparer.Ordinal);
+        while (reader.ReadLine() is { } line)
+        {
+            if (line.Length == 0 || line[0] == '#') continue;
+            int separator = line.IndexOf('\t');
+            string clip = line[..separator], path = line[(separator + 1)..];
+            if (!result.TryGetValue(clip, out var paths)) result.Add(clip, paths = []);
+            paths.Add(Hash(path), path);
+        }
+        return result;
+    }
 
     public void Scan(IEnumerable<AssetFile> batch)
     {
         foreach (var file in batch)
         {
             if (!files.Add(file.Name)) continue;
+            var scriptPaths = file.Types.Select(type => type.ClassId == 114 && type.Schema is { } schema && HasScriptPaths(schema)).ToArray();
             foreach (var item in file.Objects)
             {
                 int cls = file.Types[item.Type].ClassId;
@@ -56,7 +81,8 @@ sealed class AnimationNames(ScriptLayout layouts, Dictionary<ObjectId, ScriptNam
                     var header = Value.Read(Schemas.Classes[114].Player!, file.Open(item));
                     scriptTrees.TryAdd(file.Reference(header["m_Script"]), tree);
                 }
-                if (cls is not (1 or 4 or 224 or 21 or 43 or 48 or 49 or 74 or 90)) continue;
+                if (cls is not (1 or 4 or 224 or 21 or 43 or 48 or 49 or 74 or 90 or 91 or 319 or 114)
+                    || cls == 114 && !scriptPaths[item.Type]) continue;
                 ObjectId id = new(file.Name, item.Id);
                 try
                 {
@@ -78,10 +104,24 @@ sealed class AnimationNames(ScriptLayout layouts, Dictionary<ObjectId, ScriptNam
                             break;
                         case 74:
                             foreach (var binding in value["m_ClipBindingConstant"]["genericBindings"].Items) wanted.Add((uint)binding["path"].Number);
+                            foreach (var group in value.Items.Where(v => v.Schema.Name.EndsWith("Curves", StringComparison.Ordinal)))
+                            foreach (var curve in group.Items)
+                                if ((curve.Find("path") ?? curve.Find("m_Path"))?.Text is { Length: > 0 } path)
+                                    paths.Add(Hash(path), path, file.Name);
                             break;
-                        case 90:
+                        case 90 or 91:
                             foreach (var pair in value["m_TOS"].Items)
                                 if (Hash(pair.Items[1].Text) == (uint)pair.Items[0].Number) paths.Add((uint)pair.Items[0].Number, pair.Items[1].Text, file.Name);
+                            break;
+                        case 319:
+                            foreach (var element in value["m_Elements"].Items)
+                            {
+                                string path = element["m_Path"].Text;
+                                paths.Add(Hash(path), path, file.Name);
+                            }
+                            break;
+                        case 114:
+                            ScanScriptPaths(value, file.Name);
                             break;
                         case 43:
                             foreach (var channel in value["m_Shapes"]["channels"].Items) shapes.Add((uint)channel["nameHash"].Number, channel["name"].Text, file.Name);
@@ -101,6 +141,21 @@ sealed class AnimationNames(ScriptLayout layouts, Dictionary<ObjectId, ScriptNam
                 }
             }
         }
+    }
+
+    static bool HasScriptPaths(Schema schema, bool pathField = false)
+    {
+        pathField |= schema.Name.Contains("path", StringComparison.OrdinalIgnoreCase);
+        if (schema.Type == "string") return pathField;
+        return schema.Children.Any(child => HasScriptPaths(child, pathField));
+    }
+
+    void ScanScriptPaths(Value value, string source, bool pathField = false)
+    {
+        pathField |= value.Schema.Name.Contains("path", StringComparison.OrdinalIgnoreCase);
+        if (pathField && value.Schema.Type == "string" && value.Text.Contains('/') && !value.Text.Contains('\\'))
+            paths.Add(Hash(value.Text), value.Text, source);
+        foreach (var child in value.Items) ScanScriptPaths(child, source, pathField);
     }
     void Material(string name, string source)
     {
@@ -129,6 +184,7 @@ sealed class AnimationNames(ScriptLayout layouts, Dictionary<ObjectId, ScriptNam
     public void Prepare()
     {
         paths.Add(0, "", "");
+        var observed = paths.Entries.Values.SelectMany(p => p.Keys).ToHashSet(StringComparer.Ordinal);
         foreach (var pair in transforms)
         {
             List<string> chain = [];
@@ -140,9 +196,11 @@ sealed class AnimationNames(ScriptLayout layouts, Dictionary<ObjectId, ScriptNam
                 chain.Add(name);
             }
             string path = "";
-            for (int length = 0; length < chain.Count - 1; length++)
+            // A whole prefab can sit under the scene's animation root.
+            for (int length = 0; length < chain.Count; length++)
             {
                 path = length == 0 ? chain[0] : chain[length] + "/" + path;
+                observed.Add(path);
                 uint hash = Hash(path);
                 if (wanted.Contains(hash)) paths.Add(hash, path, pair.Key.File);
             }
@@ -150,6 +208,7 @@ sealed class AnimationNames(ScriptLayout layouts, Dictionary<ObjectId, ScriptNam
         words = vocabulary.Where(n => n.Length > 0).SelectMany(n => new[] { n, n + "(Clone)" }).Distinct(StringComparer.Ordinal)
             .Order(StringComparer.Ordinal).Select(n => (n, Encoding.UTF8.GetBytes(n))).ToArray();
         transforms.Clear(); objects.Clear(); vocabulary.Clear();
+        pathRules = new(observed, wanted.Where(hash => !paths.Entries.ContainsKey(hash)).ToHashSet());
     }
 
     public Resolver For(AssetFile file, Value clip, Action<string, bool> issue) => new(this, file, clip, issue);
@@ -160,15 +219,20 @@ sealed class AnimationNames(ScriptLayout layouts, Dictionary<ObjectId, ScriptNam
         readonly Action<string, bool> issue;
         readonly HashSet<string> sources, reported = [];
         readonly Dictionary<uint, string> resolved = [];
+        readonly IReadOnlyDictionary<uint, string>? saved;
+        readonly Dictionary<uint, string>? rules;
         readonly string[] prefixes;
         public Resolver(AnimationNames owner, AssetFile file, Value clip, Action<string, bool> issue)
         {
             this.owner = owner; this.file = file; this.issue = issue;
+            saved = SavedPathsFor(clip["m_Name"].Text);
             sources = [file.Name, .. file.Externals];
-            var known = clip["m_ClipBindingConstant"]["genericBindings"].Items.Select(b => (uint)b["path"].Number).Distinct()
-                .SelectMany(h => owner.paths.Find(h, sources)).ToArray();
+            var hashes = clip["m_ClipBindingConstant"]["genericBindings"].Items.Select(b => (uint)b["path"].Number).Distinct().ToArray();
+            var known = hashes.Select(h => owner.paths.Find(h, sources)).ToArray();
+            rules = owner.pathRules?.For(hashes.Where(h => !owner.paths.Entries.ContainsKey(h) && saved?.ContainsKey(h) != true),
+                known.Where(p => p.Length == 1).Select(p => p[0]));
             HashSet<string> candidates = [""];
-            foreach (string path in known)
+            foreach (string path in known.SelectMany(p => p))
                 for (int at = path.Length; at > 0; at = path.LastIndexOf('/', at - 1)) candidates.Add(path[..at] + "/");
             prefixes = candidates.OrderBy(p => p.Length).ThenBy(p => p, StringComparer.Ordinal).Take(64).ToArray();
         }
@@ -184,6 +248,10 @@ sealed class AnimationNames(ScriptLayout layouts, Dictionary<ObjectId, ScriptNam
         {
             if (resolved.TryGetValue(hash, out string? cached)) return cached;
             string? path = Select(owner.paths, hash, "路径");
+            if (path is null && !owner.paths.Entries.ContainsKey(hash) && saved?.TryGetValue(hash, out path) == true)
+                Note($"路径来自补全表：0x{hash:X8} → {path}", false);
+            if (path is null && rules?.TryGetValue(hash, out path) == true)
+                Note($"路径为规则推断：0x{hash:X8} → {path}", false);
             if (path is null && !owner.paths.Entries.ContainsKey(hash))
             {
                 HashSet<string> matches = new(StringComparer.Ordinal);

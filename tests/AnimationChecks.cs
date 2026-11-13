@@ -34,6 +34,43 @@ static class AnimationChecks
         var pointers = Animation.Decode(Clip(.5f, bytes.ToArray(), 1, [], true))[0].Channels[0];
         Require(pointers.Count == 2 && pointers[0].Time == 0 && pointers[0].Number == 2 && pointers[1].Number == 3);
         Require(AnimationNames.Hash("Parameters/ParamBrowRX") == 0x71f42c84 && AnimationNames.Hash("") == 0 && Animation.MuscleName(199) == "RightHandTDOF.z" && Animation.MuscleName(200) is null);
+
+        uint first = AnimationNames.Hash("Root/Score/Label");
+        uint second = AnimationNames.Hash("Root/Score/Icon");
+        uint offset = AnimationNames.Hash("Root/EX_Joint/Tip");
+        uint numbered = AnimationNames.Hash("Root/Light_02");
+        AnimationPathRules rules = new(
+            ["Root/Old/Score/Label", "Root/Old/Score/Icon", "Root/Joint_offset/EX_Joint/Tip", "Root/Light_01", "Root/Light_03"],
+            [first, second, offset, numbered]);
+        Require(rules.For([first]).Count == 0);
+        var recovered = rules.For([first, second, offset, numbered]);
+        Require(recovered[first] == "Root/Score/Label" && recovered[second] == "Root/Score/Icon"
+            && recovered[offset] == "Root/EX_Joint/Tip" && recovered[numbered] == "Root/Light_02");
+        uint beam7 = AnimationNames.Hash("Root/Beam_07/Light");
+        uint beam8 = AnimationNames.Hash("Root/Beam_08/Light");
+        AnimationPathRules series = new(["Root/Beam_06/Light"], [beam7, beam8]);
+        Require(series.For([beam7]).Count == 0 && series.For([beam8]).Count == 0);
+        var linked = series.For([beam7, beam8]);
+        Require(linked[beam7] == "Root/Beam_07/Light" && linked[beam8] == "Root/Beam_08/Light");
+        string[] knownBeams = ["Root/Beam_01/Light", "Root/Beam_02/Light", "Root/Beam_03/Light", "Root/Beam_04/Light"];
+        string[] laterBeams = ["Root/Beam_05/Light", "Root/Beam_06/Light", "Root/Beam_07/Light", "Root/Beam_08/Light"];
+        uint[] beamHashes = laterBeams.Select(path => AnimationNames.Hash(path)).ToArray();
+        AnimationPathRules extension = new([], []);
+        var expanded = extension.For(beamHashes, knownBeams);
+        Require(beamHashes.Select(h => expanded[h]).SequenceEqual(laterBeams));
+        Require(extension.For([beamHashes[^1]], knownBeams).Count == 0);
+        uint[] tail = knownBeams.Skip(1).Select(path => AnimationNames.Hash(path)).ToArray();
+        Require(extension.For(tail, [knownBeams[0]]).Count == 3);
+        Require(extension.For(tail[..2], [knownBeams[0]]).Count == 0);
+        uint arm10 = AnimationNames.Hash("Parameters/PARAM_ARM_L_10");
+        AnimationPathRules parameters = new(["Parameters/PARAM_ARM_L_7"], [arm10]);
+        Require(parameters.For([arm10], ["Root/Hips"]).Count == 0);
+        Require(parameters.For([arm10], ["Parameters/PARAM_ARM_L_7"])[arm10] == "Parameters/PARAM_ARM_L_10");
+        string[] linkedLights = ["Root/Base_01/Light_01/Flare", "Root/Base_02/Light_02/Flare", "Root/Base_03/Light_03/Flare"];
+        string[] nextLights = ["Root/Base_04/Light_04/Flare", "Root/Base_05/Light_05/Flare"];
+        uint[] lightHashes = nextLights.Select(path => AnimationNames.Hash(path)).ToArray();
+        Require(lightHashes.Select(h => extension.For(lightHashes, linkedLights)[h]).SequenceEqual(nextLights));
+        Require(extension.For(lightHashes, linkedLights[..2]).Count == 0);
     }
 
     public static int Run(string input, string metadata, string bundles, string directory)
