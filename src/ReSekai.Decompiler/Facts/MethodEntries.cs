@@ -37,9 +37,13 @@ public sealed class MethodEntries
 
     public IEnumerable<NativeMethodEntry> Definitions => definitions.Values.OrderBy(e => e.Instance.Method.Index);
 
+    // 保留引用共享入口的优先级。类型参数没有 struct 约束时，优先使用保留类型参数自身 ABI 的完全共享入口。
     internal static NativeMethodEntry SelectDefinition(IEnumerable<NativeMethodEntry> candidates) => candidates
         .OrderBy(e => e.Instance.TypeArguments.Concat(e.Instance.MethodArguments)
             .Any(a => !ManagedTypes.IsReferenceType(a) || FieldLayouts.IsFullyShared(a)))
+        .ThenBy(e => e.Instance.Method.Owner.GenericParameters.Concat(e.Instance.Method.GenericParameters)
+            .Any(p => (p.Attributes & System.Reflection.GenericParameterAttributes.NotNullableValueTypeConstraint) != 0)
+            || e.Instance.TypeArguments.Concat(e.Instance.MethodArguments).Any(a => !FieldLayouts.IsFullyShared(a) && !ManagedTypes.IsReferenceType(a)))
         .ThenBy(e => e.Address).ThenBy(e => NativeBindings.Key(e.Instance), StringComparer.Ordinal).First();
 
     /// <summary>方法实例的原生入口；没有时为 0。</summary>

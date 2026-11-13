@@ -8,6 +8,7 @@ namespace ReSekai.Decompiler.Idioms;
 /// <summary>成功的类布局初始化不会失效；只消除被先前初始化支配的重复操作和标志位判断。</summary>
 internal static class ClassInitializationFacts
 {
+    internal const string DeferredConstructor = "beforefieldinit 类型的显式初始化";
     private sealed record Point(Block Block, int Index, Stmt Statement);
 
     /// <summary>
@@ -24,7 +25,11 @@ internal static class ClassInitializationFacts
                     // 块止于这个调用时事实层证明它不返回，它是块的终结。
                     && (i + 1 < block.Statements.Count || block.NormalSuccessors.Any()))
                 {
-                    block.Statements[i] = new Nop(call.Address, "beforefieldinit 类型的显式初始化");
+                    // 块末尾的调用是异常边的来源；交回运行时初始化后，该原生抛出点也不存在了。
+                    if (block.Handler is not null && block.Statements.Skip(i + 1).All(s => s is Nop or Jump)
+                        && !block.Statements.Take(i).Any(s => s is Call))
+                        MachineFunction.RemoveEdgeAt(block, block.Successors.Count - 1);
+                    block.Statements[i] = new Nop(call.Address, DeferredConstructor);
                     changed = true;
                 }
         return changed;

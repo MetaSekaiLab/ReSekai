@@ -205,6 +205,9 @@ internal sealed class TypeUseAnalysis(MethodAnalysis analysis, TypeOracle oracle
                 else if (Untyped(read.Address, read.Width) && oracle.BufferElement(read.Address) is { } buffered) oracle.PointerElementField(read.Address, buffered, read.Width);
                 Read(read, user);
                 break;
+            case PhiSym phi when oracle.PinnedArray(phi) is var (pinnedArray, pinnedType):
+                Use(pinnedArray, pinnedType, user);
+                break;
             case PhiSym phi:
                 if (oracle.ProjectedField(phi) is var (whole, type, _, _)) { Use(whole, type, user); break; }
                 if (oracle.ProjectedScalar(phi) is var (scalar, scalarType, _)) { Use(scalar, scalarType, user); break; }

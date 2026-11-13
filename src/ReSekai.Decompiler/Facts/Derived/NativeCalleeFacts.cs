@@ -48,10 +48,13 @@ internal sealed class NativeCalleeFacts(ProgramFacts facts, bool recoverUnusedIn
                     var delegates = recoverUnusedInputs ? DelegateCallNormalizer.InputReads(facts, lifted.Function) : [];
                     var interfaceTails = InterfaceTailProof.Find(lifted.Function, call => call is { Kind: CallKind.Direct or CallKind.Tail, Target: Const target } && facts.Code.RegionOf(target.Value) != CodeRegion.Managed && facts.Helpers.At(target.Value)?.Kind == HelperKind.InterfaceLookup);
                     // 委托尾跳转沿用完整布局与 Invoke ABI 证明；原始字段读取仍参与入口依赖分析。
-                    reads = ReSekai.Decompiler.Machine.Lifting.NativeInputs.Reads(lifted,
-                        recoverUnusedInputs ? (call, input) => delegates.TryGetValue(call, out var used) ? !used.Contains(input)
-                            : call is { Op: null, Kind: CallKind.Direct or CallKind.Tail, Target: Const target } && UnusedInput(target.Value, input) : null,
-                        call => delegates.ContainsKey(call) || interfaceTails.Contains(call));
+                    bool Unused(Call call, Storage input) => delegates.TryGetValue(call, out var used) ? !used.Contains(input)
+                        : call is { Op: null, Kind: CallKind.Direct or CallKind.Tail, Target: Const target } && UnusedInput(target.Value, input);
+                    bool KnownTail(Call call) => delegates.ContainsKey(call) || interfaceTails.Contains(call);
+                    reads = ReSekai.Decompiler.Machine.Lifting.NativeInputs.Reads(lifted, recoverUnusedInputs ? Unused : null, KnownTail);
+                    if (reads is null && recoverUnusedInputs && lifted.Function.UnresolvedIndirectJumps > 0
+                        && ManagedTails(entry) is { Count: > 0 } managedTails)
+                        reads = ReSekai.Decompiler.Machine.Lifting.NativeInputs.Reads(lifted, Unused, call => KnownTail(call) || managedTails.Contains(call.Address));
                 }
             }
             nativeInputs[entry] = reads;
@@ -60,4 +63,24 @@ internal sealed class NativeCalleeFacts(ProgramFacts facts, bool recoverUnusedIn
     }
 
     internal CallingConvention Convention => inputLifter.Machine.Convention;
+
+    private HashSet<ulong> ManagedTails(ulong entry)
+    {
+        // 用归一后的图验证尾跳转，入口读取仍按未化简的 SSA 计算。
+        var lifted = inputLifter.Lift(entry, simplify: true);
+        if (!lifted.Succeeded) return [];
+        var state = new IdiomState(new IdiomRewriter(facts) { RecordFilter = _ => false }, lifted.Function);
+        state.Run();
+        if (state.Result.Errors.Count > 0) return [];
+        return state.All.OfType<Call>().Where(call => call.Kind == CallKind.TailIndirect && (call.Op switch
+        {
+            { Kind: OpKind.CallGenericVirtual, Operand: MethodRef method } =>
+                abi.Classify(method, out _)?.MethodInfo?.Register is { } register && call.ArgumentIndex(register) is >= 0 and var index
+                && state.defs.Expand(call.Target) is Load { Width: 64 } pointer
+                && SplitPass.Split(pointer.Address) == (state.defs.Expand(call.Arguments[index]), (ulong)RuntimeLayout.MethodVirtualPointer),
+            { Kind: OpKind.CallInterface, Operand: ValueTuple<object?, int> { Item1: DefinitionRef type, Item2: var slot } } =>
+                Recovery.Calls.DispatchResolution.Slot(type, slot, interfaceOnly: true) is not null,
+            _ => false,
+        })).Select(call => call.Address).ToHashSet();
+    }
 }

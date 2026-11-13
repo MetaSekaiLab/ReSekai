@@ -177,6 +177,29 @@ internal sealed class Joint(Interpreter interpreter, Func<MethodRef, Program?> t
             switch (a.Kind, b.Kind)
             {
                 case (StopKind.Event, StopKind.Event):
+                    // 复核两份局部值上的同一个调用时，让被调方法的实际读写决定两者是否等价。
+                    if (mode == JointMode.Validation && a.Event is { Kind: EventKind.Call, Virtual: false, Receiver: { Kind: TermKind.Address } receiverA,
+                            Identity: MethodRef { Method.Owner.IsValueType: true } valueMethod } valueA
+                        && b.Event is { Kind: EventKind.Call, Virtual: false, Receiver: { Kind: TermKind.Address } receiverB, Identity: MethodRef otherMethod } valueB
+                        && !ReferenceEquals(receiverA, receiverB) && valueMethod.Equals(otherMethod)
+                        && receiverA.Location.Root == RootKind.Cell && receiverB.Location.Root == RootKind.Cell
+                        && interpreter.Private(path.A, receiverA.Location) && interpreter.Private(path.B, receiverB.Location)
+                        && path.A.Frames.Count <= UnfoldDepth && path.B.Frames.Count <= UnfoldDepth && templates(valueMethod) is { } valueBody)
+                    {
+                        interpreter.Unfold(path.A, valueBody, valueA, null);
+                        interpreter.Unfold(path.B, valueBody, valueB, null);
+                        continue;
+                    }
+                    // 内联的值类型构造写入新建存储。复核时展开双方，避免把构造误当成使其他字段读取失效的调用。
+                    if (mode == JointMode.Validation
+                        && a.Event is { Kind: EventKind.Construct, Identity: MethodRef { Method.Owner.IsValueType: true } } left
+                        && b.Event is { Kind: EventKind.Construct } right && SameIdentity(left, right)
+                        && Unfoldable(path.A, left) is { } leftTemplate && Unfoldable(path.B, right) is { } rightTemplate)
+                    {
+                        interpreter.BeginConstruct(path.A, leftTemplate, left);
+                        interpreter.BeginConstruct(path.B, rightTemplate, right);
+                        continue;
+                    }
                     if (Match(path, a.Event!, b.Event!) is { } mismatch)
                     {
                         if (TryUnfold(path, a.Event!, b.Event!)) continue;
@@ -513,6 +536,9 @@ internal sealed class Joint(Interpreter interpreter, Func<MethodRef, Program?> t
             }
             return null;
         }
+        // 相同顺序的写入在任意别名关系下产生相同的堆；无需分别求出每个位置的最终内容。
+        if (a.Length == b.Length && a.Zip(b).All(pair => ReferenceEquals(pair.First.Location, pair.Second.Location)
+            && ReferenceEquals(Solver.Fold(path.Phi, pair.First.Value), Solver.Fold(path.Phi, pair.Second.Value)))) return null;
         foreach (var location in a.Select(w => w.Location).Concat(b.Select(w => w.Location)).Distinct(ReferenceEqualityComparer.Instance).Cast<Term>())
         {
             var like = a.Concat(b).First(w => ReferenceEquals(w.Location, location)).Value;

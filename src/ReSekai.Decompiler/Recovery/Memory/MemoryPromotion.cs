@@ -72,7 +72,8 @@ internal sealed class MemoryPromotion
         ManagedAbi abi, ICallModel calls, Storage stackPointer)
     {
         var promotion = new MemoryPromotion(function, signature, shapes, abi);
-        promotion.TrimUnusedCallStacks();
+        promotion.TrimUnusedCallInputs();
+        promotion.BindStackAddresses();
         if (Machine.Storage.FrameForwarding.Run(function, new CallMemoryEffects(shapes, abi, settled: true))) Propagate.Run(function, Dominators.Compute(function));
         var layout = promotion.Partition();
         if (layout.Cells.Count == 0) return layout;
@@ -89,17 +90,73 @@ internal sealed class MemoryPromotion
         return layout;
     }
 
-    /// <summary>完整签名只读取寄存器时，调用不依赖保存的 SP；移除记录后清理失去用途的地址计算。</summary>
-    private void TrimUnusedCallStacks()
+    private void BindStackAddresses()
     {
+        if (!function.Blocks.SelectMany(b => b.Statements).OfType<Call>().Any(c => shapes(c).Signature?.Indirections.Any(a => a.Pieces[0].Register.Bank == Bank.Stack) == true)) return;
+        var frame = new Machine.Storage.FrameModel(function, new CallMemoryEffects(shapes, abi));
+        var bound = new Dictionary<Store, (Block Block, HashSet<CallSite> Sites)>(ReferenceEqualityComparer.Instance);
+        foreach (var block in function.Blocks)
+            for (var i = 0; i < block.Statements.Count; i++)
+            {
+                if (block.Statements[i] is not Call { StackPointer: FrameAddress sp } call || shapes(call).Signature is not { } callee) continue;
+                var stackIndirections = callee.Indirections.Where(a => a.Transfer is Transfer.Reference or Transfer.Copy
+                    && a.Pieces[0].Register.Bank == Bank.Stack && call.ArgumentIndex(a.Pieces[0].Register) < 0);
+                var arguments = new List<(Storage Register, Expr Address)>();
+                foreach (var value in stackIndirections)
+                {
+                    var piece = value.Pieces[0];
+                    var at = sp.Offset + piece.Register.Index;
+                    if (!frame.Escaped(at, 8) && frame.Reach(block, i, at, 8) is { Complete: true } reach
+                        && reach.Stores.All(s => s.Value.Width == 64 && frame.Slot(s.Target) == at)
+                        && reach.Stores.Select(s => s.Value).Distinct().ToArray() is [var address]
+                        && (address is FrameAddress || value.Transfer == Transfer.Reference && address is
+                            (Use { Width: 64 } or Binary { Op: BinOp.Add, Width: 64, Left: Use { Width: 64 }, Right: Const })))
+                    {
+                        arguments.Add((piece.Register, address));
+                        foreach (var store in reach.Stores)
+                        {
+                            if (!bound.TryGetValue(store, out var used))
+                                bound[store] = used = (function.Blocks.Single(b => b.Statements.Any(s => ReferenceEquals(s, store))), []);
+                            used.Sites.Add(call.Site);
+                        }
+                    }
+                }
+                if (arguments.Count > 0)
+                    block.Statements[i] = call with { Arguments = [.. call.Arguments, .. arguments.Select(a => a.Address)],
+                        Sources = [.. call.Sources, .. arguments.Select(a => a.Register)] };
+            }
+        var removable = bound.Where(p => frame.UnobservedAfter(p.Value.Block, p.Key, call => p.Value.Sites.Contains(call.Site))).ToArray();
+        foreach (var (store, use) in removable) use.Block.Statements.Remove(store);
+    }
+
+    /// <summary>只保留签名会读取的栈指针和按值传递的小结构体寄存器位。</summary>
+    private void TrimUnusedCallInputs()
+    {
+        var inserts = function.Blocks.SelectMany(b => b.Statements).OfType<Define>()
+            .Where(d => d.Value is Insert { Low: 0, Value: Use or Const }).ToDictionary(d => d.Target, d => (Insert)d.Value);
         var changed = false;
         foreach (var block in function.Blocks)
             for (var i = 0; i < block.Statements.Count; i++)
-                if (block.Statements[i] is Call { StackPointer: not null } call && shapes(call).Signature is { } callee
-                    && callee.MethodInfo?.Register.Bank != Bank.Stack
-                    && callee.Arguments.Concat(callee.Indirections).SelectMany(a => a.Pieces).All(p => p.Register.Bank != Bank.Stack))
+                if (block.Statements[i] is Call call && shapes(call).Signature is { } callee)
                 {
-                    block.Statements[i] = call with { StackPointer = null };
+                    var updated = call;
+                    if (call.StackPointer is not null && callee.MethodInfo?.Register.Bank != Bank.Stack
+                        && callee.Arguments.Concat(callee.Indirections).SelectMany(a => a.Pieces).All(p => p.Register.Bank != Bank.Stack))
+                        updated = updated with { StackPointer = null };
+                    Expr[]? arguments = null;
+                    if (inserts.Count != 0)
+                        foreach (var piece in callee.Arguments.Where(a => a.Transfer == Transfer.Value && abi.Kind(a.Type) == ValueKind.Struct)
+                            .SelectMany(a => a.Pieces).Where(p => p.Register.Bank == Bank.Gpr && p.Width < 64))
+                        {
+                            var position = call.ArgumentIndex(piece.Register);
+                            if (position < 0 || call.Arguments[position] is not Use use || !inserts.TryGetValue(use.Variable, out var insert)
+                                || piece.Width > insert.Value.Width || use.Width <= piece.Width) continue;
+                            var value = Fold.Convert(ConvKind.Truncate, insert.Value, piece.Width);
+                            (arguments ??= call.Arguments.ToArray())[position] = Fold.Convert(ConvKind.ZeroExtend, value, use.Width);
+                        }
+                    if (arguments is not null) updated = updated with { Arguments = arguments };
+                    if (ReferenceEquals(updated, call)) continue;
+                    block.Statements[i] = updated;
                     changed = true;
                 }
         if (changed) Propagate.RemoveDead(function);
@@ -228,6 +285,7 @@ internal sealed class MemoryPromotion
                 break;
         }
     }
+
 
     /// <summary>机器签名读取的输入寄存器：实参、隐藏的 MethodInfo 与结果缓冲区指针。</summary>
     private static HashSet<Storage> InputRegisters(MachineSignature signature)

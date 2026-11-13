@@ -186,7 +186,12 @@ public sealed class CfgBuilder
         return Build(entry, range, tableCounts);
     }
 
-    public MachineFunction Build(ulong entry, CodeFunction range, IReadOnlyDictionary<ulong, int>? tableCounts = null) => new Exploration(this, entry, range, tableCounts).Run();
+    public MachineFunction Build(ulong entry, CodeFunction range, IReadOnlyDictionary<ulong, int>? tableCounts = null)
+    {
+        var rejectedTables = new HashSet<ulong>();
+        while (true)
+            if (new Exploration(this, entry, range, tableCounts, rejectedTables).Run() is { } function) return function;
+    }
 
     private sealed class Insn(ulong address, int size, List<Stmt> statements)
     {
@@ -200,12 +205,12 @@ public sealed class CfgBuilder
         public ulong Next => Address + (ulong)Size;
     }
 
-    private sealed class Exploration(CfgBuilder owner, ulong entry, CodeFunction range, IReadOnlyDictionary<ulong, int>? knownCounts)
+    private sealed class Exploration(CfgBuilder owner, ulong entry, CodeFunction range, IReadOnlyDictionary<ulong, int>? knownCounts,
+        HashSet<ulong> rejectedTables)
     {
         private readonly Dictionary<ulong, Insn> insns = new();
         private readonly HashSet<ulong> leaders = [];
         private readonly Dictionary<ulong, ulong[]> tables = new();
-        private readonly HashSet<ulong> failedTables = [];
         private readonly List<string> problems = [];
         private int resolvedTables;
 
@@ -218,26 +223,18 @@ public sealed class CfgBuilder
             return null;
         }
 
-        public MachineFunction Run()
+        public MachineFunction? Run()
         {
-            var roots = new List<ulong> { entry };
-            foreach (var region in range.ExceptionRegions)
-                if (region.LandingPad != 0 && InRange(region.LandingPad) && !roots.Contains(region.LandingPad)) roots.Add(region.LandingPad);
-            foreach (var root in roots)
-            {
-                leaders.Add(root);
-                Explore(root);
-            }
+            leaders.Add(entry);
+            Explore(entry);
             while (true)
             {
                 var blocks = Assemble(out var blockAt);
                 var progress = false;
                 foreach (var block in blocks)
                 {
-                    if (block.Statements.LastOrDefault() is not IndirectJump jump || tables.ContainsKey(jump.Address) || failedTables.Contains(jump.Address)) continue;
-                    var targets = JumpTables.Resolve(owner.machine, block, blockAt, InRange,
-                        knownCounts is not null && knownCounts.TryGetValue(jump.Address, out var known) ? known : null);
-                    if (targets is null) { failedTables.Add(jump.Address); continue; }
+                    if (block.Statements.LastOrDefault() is not IndirectJump jump || tables.ContainsKey(jump.Address) || rejectedTables.Contains(jump.Address)) continue;
+                    if (Targets(block, jump) is not { } targets) continue;
                     tables[jump.Address] = targets;
                     resolvedTables++;
                     foreach (var target in targets)
@@ -247,9 +244,19 @@ public sealed class CfgBuilder
                     }
                     progress = true;
                 }
-                if (!progress) return Finish(blocks, blockAt);
+                if (progress) continue;
+                // 表目标可以带来新的入边。按完整图复核，旧证明失效时从入口重新探索。
+                foreach (var block in blocks)
+                    if (block.Statements.LastOrDefault() is IndirectJump jump && tables.TryGetValue(jump.Address, out var table)
+                        && (Targets(block, jump) is not { } targets || !table.AsSpan().SequenceEqual(targets)))
+                        rejectedTables.Add(jump.Address);
+                return tables.Keys.Any(rejectedTables.Contains) ? null : Finish(blocks, blockAt);
             }
         }
+
+        private ulong[]? Targets(Block block, IndirectJump jump) =>
+            JumpTables.Resolve(owner.machine, block, entry, InRange,
+                knownCounts is not null && knownCounts.TryGetValue(jump.Address, out var known) ? known : null);
 
         private void Explore(ulong start)
         {
@@ -276,6 +283,11 @@ public sealed class CfgBuilder
                 var insn = new Insn(address, size, statements);
                 insns[address] = insn;
                 Classify(insn);
+                if (insn.IsCall && RegionAt(address) is { LandingPad: not 0 } region && InRange(region.LandingPad))
+                {
+                    leaders.Add(region.LandingPad);
+                    work.Push(region.LandingPad);
+                }
                 if (insn.FallsThrough)
                 {
                     if (!InRange(insn.Next))

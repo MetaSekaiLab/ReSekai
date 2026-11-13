@@ -34,4 +34,12 @@ internal static class LibraryAccessors
     public static bool IsRead(MethodDef method, FieldDef field) =>
         !method.IsStatic && method.Parameters.Count == 0 && method.Owner == field.Owner
         && Reads.Contains((method.Owner.FullName, method.Name, field.Name));
+
+    /// <summary>Unity 的无检查缓冲区访问器按值接收 NativeArray，只返回它的 m_Buffer。</summary>
+    public static bool IsNativeArrayBufferRead(MethodRef method, FieldRef field) =>
+        field is { Field.Name: "m_Buffer", DeclaringType: DefinitionRef { Definition.FullName: "Unity.Collections.NativeArray" } owner }
+        && method.Method is { IsStatic: true, Name: "GetUnsafeBufferPointerWithoutChecks", Owner.FullName: "Unity.Collections.LowLevel.Unsafe.NativeArrayUnsafeUtility",
+            Parameters: [var parameter] }
+        && method.Method.Owner.Assembly == owner.Definition.Assembly
+        && method.Concrete(parameter.Type).Equals(owner);
 }

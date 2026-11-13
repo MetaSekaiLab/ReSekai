@@ -346,6 +346,12 @@ public static class Fold
                         var condition = code switch { FlagCondition.Hs => Cond.Uge, FlagCondition.Lo => Cond.Ult, FlagCondition.Hi => Cond.Ugt, _ => Cond.Ule };
                         return Compare(condition, add.Left, boundary);
                     }
+                    if (code is FlagCondition.Hs or FlagCondition.Lo)
+                    {
+                        // 无符号和回绕时，结果小于任一加数。
+                        var sum = Binary(BinOp.Add, add.Left, right, add.OperandWidth);
+                        return Compare(code == FlagCondition.Hs ? Cond.Ult : Cond.Uge, sum, add.Left);
+                    }
                     // cmn x, #k 等价于 cmp x, #-k（-k 可表示时有符号条件一致）
                     if (right is Const k && k.Value != 0 && k.Value != 1UL << (add.OperandWidth - 1) && code is FlagCondition.Ge or FlagCondition.Lt or FlagCondition.Gt or FlagCondition.Le)
                     {

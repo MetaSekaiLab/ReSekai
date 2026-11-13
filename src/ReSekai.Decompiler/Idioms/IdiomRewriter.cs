@@ -203,9 +203,13 @@ public sealed class IdiomRewriter(ProgramFacts facts)
         /// <summary>变量的定义表达式（不展开）；不是 Define 定义的为 null。</summary>
         public Expr? Raw(Variable variable) => values.GetValueOrDefault(variable);
 
-        public Expr Expand(Expr expr, int depth = 8) => depth == 0 ? expr : Fold.Simplify(ExprMap.Map(expr, e =>
-            e is Use use && values.TryGetValue(use.Variable, out var value)
-                ? Fold.Convert(ConvKind.Truncate, Expand(value, depth - 1), use.Width)
+        public Expr Expand(Expr expr, int depth = 8) => Expand(expr, depth, null);
+
+        public Expr Expand(Expr expr, Func<Variable, bool> within) => Expand(expr, 8, within);
+
+        private Expr Expand(Expr expr, int depth, Func<Variable, bool>? within) => depth == 0 ? expr : Fold.Simplify(ExprMap.Map(expr, e =>
+            e is Use use && (within is null || within(use.Variable)) && values.TryGetValue(use.Variable, out var value)
+                ? Fold.Convert(ConvKind.Truncate, Expand(value, depth - 1, within), use.Width)
                 : null));
     }
 }

@@ -22,6 +22,7 @@ internal static class SharedValuesPass
         changed |= ValueBranches(state);
         changed |= FieldWrites(state);
         changed |= CopyOperations(state);
+        changed |= AlreadyClearedField(state);
         return changed;
     }
 
@@ -141,26 +142,50 @@ internal static class SharedValuesPass
         foreach (var head in state.function.Blocks)
         {
             if (head.Statements.LastOrDefault() is not Branch branch || head.NormalSuccessors.ToArray() is not [var taken, var fallthrough]) continue;
-            var polarity = branch.Condition switch
+            var test = branch.Condition switch
             {
-                ClassProperty { Kind: ClassPropertyKind.IsValueType } => true,
-                Not { Operand: ClassProperty { Kind: ClassPropertyKind.IsValueType } } => false,
-                _ => (bool?)null,
+                ClassProperty { Kind: ClassPropertyKind.IsValueType } property => (Property: property, ValueTaken: true),
+                Not { Operand: ClassProperty { Kind: ClassPropertyKind.IsValueType } property } => (Property: property, ValueTaken: false),
+                _ => default,
             };
-            if (polarity is not { } valueTaken) continue;
-            var (value, reference) = valueTaken ? (taken, fallthrough) : (fallthrough, taken);
-            static bool Arm(Block arm, Block head) => arm.Predecessors is [var only] && only == head && !arm.IsLandingPad
-                && arm.Statements.All(s => s is Define or Nop or Jump);
-            if (!Arm(reference, head) || reference.NormalSuccessors.ToArray() is not [var join]) continue;
+            if (test.Property is not { } classTest) continue;
+            var (value, reference) = test.ValueTaken ? (taken, fallthrough) : (fallthrough, taken);
+            static bool SingleArm(Block arm, Block head) => arm.Predecessors is [var only] && only == head && !arm.IsLandingPad && arm.Handler is null;
+            static bool Pure(Stmt statement) => statement is Define or Nop or Jump;
+            if (!SingleArm(reference, head) || !reference.Statements.All(Pure) || reference.NormalSuccessors.ToArray() is not [var join]) continue;
             var direct = value == join;
-            if (!direct && (!Arm(value, head) || value.NormalSuccessors.ToArray() is not [var other] || other != join)) continue;
+            if (!direct && (!SingleArm(value, head) || value.NormalSuccessors.ToArray() is not [var other] || other != join)) continue;
             var valueEdge = join.Predecessors.IndexOf(direct ? head : value);
             var referenceEdge = join.Predecessors.IndexOf(reference);
             if (valueEdge < 0 || referenceEdge < 0) continue;
-            var same = join.Statements.OfType<Phi>().All(phi =>
+            var phis = join.Statements.OfType<Phi>().ToArray();
+            Expr? copyTarget = null, copySource = null;
+            if (!direct && !value.Statements.All(Pure))
+            {
+                if (value.Statements.Where(s => !Pure(s)).ToArray() is not
+                    [Call { Op: { Kind: OpKind.CopyGenericValue, Operand: TypeRef copyType }, Arguments: [var target, var source] }]
+                    || !copyType.Equals(classTest.Type)) continue;
+                copyTarget = state.defs.Expand(target);
+                copySource = state.defs.Expand(source);
+                if (copyTarget is not StackAllocation destination || copySource is not StackAllocation origin || destination == origin
+                    || !destination.Element.Equals(copyType) || !origin.Element.Equals(copyType)) continue;
+                // 复制目标是独占的临时槽，只有值类型分支及其合流实参读取它。
+                bool UsesDestination(Expr expression) => ExprMap.Walk(state.defs.Expand(expression)).Contains(destination);
+                bool Escapes(Stmt statement) => statement switch
+                {
+                    Define definition when definition.Value == destination => false,
+                    Phi phi => phi.Sources.Where((_, edge) => !phis.Contains(phi) || edge != valueEdge)
+                        .Any(v => UsesDestination(new Use(v, v.Width))),
+                    _ => ExprMap.Operands(statement).Any(UsesDestination),
+                };
+                if (state.function.Blocks.Where(b => b != value).SelectMany(b => b.Statements).Any(Escapes)) continue;
+            }
+            var same = phis.All(phi =>
             {
                 var handle = state.defs.Expand(new Use(phi.Sources[valueEdge], phi.Target.Width));
                 var held = state.defs.Expand(new Use(phi.Sources[referenceEdge], phi.Target.Width));
+                if (copyTarget is not null && handle == copyTarget)
+                    return held == new Load(copySource!, 64) && OnlyByValueArguments(state, phi.Target);
                 return handle == held || phi.Target.Width == 64 && held == new Load(handle, 64);
             });
             if (!same)
@@ -173,6 +198,26 @@ internal static class SharedValuesPass
             changed = true;
         }
         return changed;
+    }
+
+    private static bool OnlyByValueArguments(IdiomState state, Variable value)
+    {
+        bool Reads(Expr expression) => ExprMap.Walk(expression).OfType<Use>().Any(u => u.Variable == value);
+        foreach (var statement in state.function.Blocks.SelectMany(b => b.Statements))
+        {
+            if (statement is Phi phi && phi.Sources.Contains(value)) return false;
+            if (!ExprMap.Operands(statement).Any(Reads)) continue;
+            if (statement is not Call call || Reads(call.Target) || call.DelegateReceiver is { } receiver && Reads(receiver)
+                || call.StackPointer is { } pointer && Reads(pointer) || state.owner.Shapes.Of(call).Signature is not { } signature) return false;
+            for (var i = 0; i < call.Arguments.Length; i++)
+            {
+                if (!Reads(call.Arguments[i])) continue;
+                if (call.Arguments[i] is not Use use || use.Variable != value || i >= call.Sources.Length
+                    || !signature.Arguments.Any(a => a is { Transfer: Transfer.Copy, Access: MemoryAccess.Read }
+                        && a.Pointer?.Register == call.Sources[i] && ManagedAbi.SharedValue(a.Type))) return false;
+            }
+        }
+        return true;
     }
 
     /// <summary>按 stackslot_size(T) 的复制与清零是对 T 位置的操作。</summary>
@@ -196,7 +241,14 @@ internal static class SharedValuesPass
                         Results = [address.Storage], Defines = [address],
                     },
                 };
-                if (width > 0) writes.Add(new Store(call.Address, new Use(address, 64), Fold.Simplify(new Extract(value, 0, width))));
+                if (width == 1)
+                {
+                    var bit = Fold.Simplify(new Binary(BinOp.And, value, Expr.C(1, value.Width), value.Width));
+                    writes.Add(new Store(call.Address, new Use(address, 64), Fold.Simplify(new Extract(bit, 0, 8))));
+                }
+                else if (width == 128 && Argument(3) is { } high)
+                    writes.Add(new Store(call.Address, new Use(address, 64), new Insert(Fold.Convert(ConvKind.ZeroExtend, value, 128), high, 64)));
+                else if (width is 32 or 64) writes.Add(new Store(call.Address, new Use(address, 64), Fold.Simplify(new Extract(value, 0, width))));
                 else if (Argument(3) is { } size)
                     writes.Add(new Call(call.Address, CallKind.Direct, Expr.C(0, 64))
                     {
@@ -230,6 +282,48 @@ internal static class SharedValuesPass
                 else continue;
                 changed = true;
             }
+        return changed;
+    }
+
+    /// <summary>清零后的新局部尚未经过可观察的操作，按字段写入同样的零不会改变值。</summary>
+    private static bool AlreadyClearedField(IdiomState state)
+    {
+        var changed = false;
+        foreach (var block in state.function.Blocks.Where(b => b.Statements.Any(s => s is Call { Op.Kind: OpKind.ClearGenericValue })))
+        {
+            StackAllocation? cleared = null;
+            var addresses = new Dictionary<Variable, int>();
+            for (var i = 0; i < block.Statements.Count; i++)
+            {
+                switch (block.Statements[i])
+                {
+                    case Call { Op: { Kind: OpKind.ClearGenericValue, Operand: TypeRef type }, Arguments: [var target] }
+                        when state.defs.Expand(target) is StackAllocation allocation && allocation.Element.Equals(type):
+                        cleared = allocation;
+                        addresses.Clear();
+                        break;
+                    case Call { Op.Kind: OpKind.FieldAddress, Arguments: [var receiver, var field], Defines: [{ } result] }
+                        when cleared is not null && state.defs.Expand(receiver) == cleared
+                        && state.defs.Expand(field) is Symbol { Kind: SymbolKind.Field, Value: FieldRef { DeclaringType: DefinitionRef owner } reference }
+                        && !reference.Field.IsStatic && owner.Equals(cleared.Element):
+                        var fieldType = reference.Field.Type.Substitute(owner.Arguments, []);
+                        if (state.facts.Layouts.TrySizeAndAlignment(fieldType) is { Size: > 0 } fieldLayout)
+                            addresses[result] = fieldLayout.Size * 8;
+                        break;
+                    case Store { Target: Use address, Value: var value } when addresses.TryGetValue(address.Variable, out var width)
+                        && value.Width == width && state.defs.Expand(value) is Const { Value: 0 }:
+                        block.Statements.RemoveAt(i--);
+                        changed = true;
+                        break;
+                    case Define or Nop:
+                        break;
+                    default:
+                        cleared = null;
+                        addresses.Clear();
+                        break;
+                }
+            }
+        }
         return changed;
     }
 }

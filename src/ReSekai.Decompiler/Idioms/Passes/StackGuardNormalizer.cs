@@ -9,6 +9,7 @@ internal static class StackGuardNormalizer
     internal static bool Run(MachineFunction function)
     {
         var definitions = new IdiomRewriter.Defs(function);
+        var phis = function.Blocks.SelectMany(b => b.Statements).OfType<Phi>().ToDictionary(phi => phi.Target);
         // Bionic TLS_SLOT_STACK_GUARD = 5，每槽 8 字节。
         static bool Guard(Expr expression) => expression is Load
         {
@@ -19,12 +20,22 @@ internal static class StackGuardNormalizer
                 Right: Const { Value: 40 }
             }
         };
+        // 尾部合并可以先从同一个 TLS 槽分别读取，再合流到同一比较。
+        bool AllGuardReads(Expr operand, int remaining = 8)
+        {
+            var expanded = definitions.Expand(operand);
+            if (Guard(expanded)) return true;
+            return remaining > 0 && expanded is Use { Width: 64 } use
+                && phis.TryGetValue(use.Variable, out var phi) && phi.Sources.Length > 0
+                && phi.Sources.All(source => AllGuardReads(new Use(source, 64), remaining - 1));
+        }
+
         var changed = false;
         foreach (var block in function.Blocks)
         {
             if (block.Statements.LastOrDefault() is not Branch
                 { Condition: Compare { Cond: Cond.Eq or Cond.Ne } comparison } branch
-                || !Guard(definitions.Expand(comparison.Left)) || !Guard(definitions.Expand(comparison.Right))) continue;
+                || !AllGuardReads(comparison.Left) || !AllGuardReads(comparison.Right)) continue;
             var failureAddress = comparison.Cond == Cond.Ne ? branch.Target : branch.Fallthrough;
             var failure = block.NormalSuccessors.FirstOrDefault(b => b.Start == failureAddress);
             // 失败一侧可能先经只有跳转的块（尾部合并后的落地块）。

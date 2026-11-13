@@ -161,7 +161,8 @@ internal sealed partial class BodyBuilder
             if (block.Handler is { } pad && pad.Predecessors.IndexOf(block) is var padIndex and >= 0
                 && copies.TryGetValue((block, pad, padIndex), out var exceptional) && exceptional.Count > 0)
             {
-                var at = statements.FindLastIndex(s => s is ManagedCall or ManagedCheck or ManagedThrow);
+                var at = statements.FindLastIndex(s => s is ManagedCall or ManagedCheck or ManagedThrow
+                    || s is ManagedAssignment { Value: BoxValue or NewObjectValue or NewArrayValue or NewMultiArrayValue });
                 statements.InsertRange(at < 0 ? statements.Count : at, exceptional.Select(c => (ManagedStatement)new ManagedAssignment(block.End, c.Target, c.Value) { ExceptionArrival = true }));
             }
             switch (exit)
@@ -183,7 +184,8 @@ internal sealed partial class BodyBuilder
         var managedRegions = regions.Where(r => reachable.Contains(r.Pad) && r.Try.Any(reachable.Contains)).Select(r => new ManagedRegion(
             r.Try.Where(reachable.Contains).Select(b => b.Start).ToArray(), r.Pad.Start, r.Handler.Where(reachable.Contains).Select(b => b.Start).ToArray(),
             r.BeginCatch is { } begin ? exceptions[begin] : null, r.IsCatch ? ManagedRegionKind.Catch : ManagedRegionKind.Fault)).ToArray();
-        var body = ExceptionEntries.Run(new ManagedBody(analysis.Method, blocks) { Regions = managedRegions }, () => NewLocal(types.Int32));
+        var body = VerifyNullableProjections(new ManagedBody(analysis.Method, blocks) { Regions = managedRegions });
+        body = ExceptionEntries.Run(body, () => NewLocal(types.Int32));
         return new(body, holes.DistinctBy(h => (h.Address, h.Reason)).ToArray(), new Dictionary<Variable, PendingConstruction>(pendingConstructions), nextLocal)
             { Unfolded = unfolded.DistinctBy(u => (u.Site, u.Detail)).ToArray() };
     }

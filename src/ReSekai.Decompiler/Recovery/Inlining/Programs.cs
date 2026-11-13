@@ -176,7 +176,6 @@ internal sealed class Program
             foreach (var copy in edge.Copies) target.Remove(copy.Target.Variable);
             live.UnionWith(target);
         }
-        if (HandlerLive(block) is { } handler) live.UnionWith(handler);
         return live;
     }
 
@@ -187,7 +186,7 @@ internal sealed class Program
         return handlerLive!.TryGetValue(region, out var own) ? own : liveIn!.GetValueOrDefault(region.HandlerEntry) ?? [];
     }
 
-    /// <summary>块末尾活跃的局部：可执行的出边上目标活跃的局部去掉边上复制的目标、加上复制读到的局部；try 中并入处理块入口活跃的局部（边上复制可能抛出）。</summary>
+    /// <summary>块的正常出边上活跃的局部；异常入口的活跃值只在可能抛出的语句之前加入。</summary>
     private HashSet<Variable> Out(ulong block, IReadOnlyDictionary<ulong, HashSet<Variable>> live, Func<ulong, ulong, bool> feasible)
     {
         var result = new HashSet<Variable>(Escaped);
@@ -201,7 +200,6 @@ internal sealed class Program
             foreach (var copy in edge.Copies) target.UnionWith(ManagedValues.Walk(copy.Value).OfType<LocalValue>().Select(l => l.Variable));
             result.UnionWith(target);
         }
-        if (HandlerLive(block) is { } handler) result.UnionWith(handler);
         return result;
     }
 
@@ -228,7 +226,7 @@ internal sealed class Program
         var ops = Units[unit].Ops;
         bool Safe(Place place) => place.Root == RootKind.Cell || place.Root is RootKind.Field or RootKind.Reference
             && ops.Any(o => o is PureOp { Node: ArgumentValue { Index: -1 } } self && self.Statement == index && self.Target == place.Base);
-        return ops.Any(op => op.Statement == index && op switch
+        bool Throws(MicroOp op) => op.Statement == index && op switch
         {
             PureOp { Node: BinaryValue { Op: BinOp.SDiv or BinOp.UDiv or BinOp.SRem or BinOp.URem } } => true,
             LoadOp load => !Safe(load.Place),
@@ -236,7 +234,10 @@ internal sealed class Program
             AddressOp address => !Safe(address.Place),
             PureOp or LocalOp or AssignOp or CopyOp or ProjectOp or JumpOp or GotoOp or BranchOp or SwitchOp or ReturnOp => false,
             _ => true,
-        });
+        };
+        if (ops.Any(Throws)) return true;
+        return index == Blocks[block].Statements.Count - 1
+            && Units.Any(edge => edge.Edge && edge.Source == block && edge.Ops.Any(Throws));
     }
 
     /// <summary>try 中的块：最内层处理块入口在异常进入时活跃的局部；不在 try 中为 null。</summary>

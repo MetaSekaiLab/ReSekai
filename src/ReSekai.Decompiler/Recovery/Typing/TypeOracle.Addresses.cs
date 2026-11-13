@@ -1,5 +1,6 @@
 using ReSekai.Decompiler.Facts;
 using ReSekai.Decompiler.Ir;
+using ReSekai.Decompiler.Machine.Flow;
 using ReSekai.Decompiler.Recovery.Values;
 
 namespace ReSekai.Decompiler.Recovery.Typing;
@@ -27,6 +28,51 @@ public sealed partial class TypeOracle
         return bits is ReadSym read && Decompose(read.Address) is (var owner, RuntimeLayout.ArrayMaxLength, null, _)
             && ReferenceEquals(SymTable.Resolve(owner), SymTable.Resolve(root)) ? (root, array) : null;
     }
+
+    /// <summary>对长度已知为正的新数组取首元素指针。成功分配保证非空且可取首元素。</summary>
+    public (Sym Array, ArrayRef Type)? PinnedArrayHead(Sym address, TypeRef? expected)
+    {
+        if (expected is not PointerRef { Element: var element }
+            || address is not OpSym { Op.Kind: OperatorKind.Binary, Op.Binary: BinOp.Add }
+            || Decompose(address) is not (var root, RuntimeLayout.ArrayData, null, _)
+            || root is not ResultSym { Site: { Op.Kind: OpKind.NewArray } allocation }
+            || TypeOf(root) is not ArrayRef { IsVector: true } array || !element.Equals(array.Element)
+            || !types.Unmanaged(element) || values.Operands(allocation) is not [_, _, var length]
+            || SymTable.Resolve(length) is not ConstSym { Value: > 0 and <= int.MaxValue }) return null;
+        return (root, array);
+    }
+
+    public (Sym Array, ArrayRef Type)? PinnedArray(PhiSym phi)
+    {
+        if (phi is not { Width: 64, Projection: null, Sources: [Sym first, Sym] })
+            return null;
+        var dataSide = SymTable.IsZero(first) ? 1 : 0;
+        if (!SymTable.IsZero(phi.Sources[1 - dataSide]!))
+            return null;
+        var (root, offset, index, _) = Decompose(phi.Sources[dataSide]!);
+        if (offset != RuntimeLayout.ArrayData || index is not null || TypeOf(root) is not ArrayRef { IsVector: true } array
+            || !types.Unmanaged(array.Element))
+            return null;
+        var data = phi.Block.Predecessors[dataSide];
+        var empty = phi.Block.Predecessors[1 - dataSide];
+        if (data.Predecessors is not [var lengthTest] || lengthTest.Predecessors is not [var nullTest]
+            || !ZeroBranches(nullTest, root, empty, lengthTest)
+            || empty.Predecessors.Count != 2
+            || lengthTest.Statements.LastOrDefault() is not Branch lengthBranch
+            || values.Operands(lengthBranch) is not [OpSym { Args: [var bits, _] }])
+            return null;
+        var length = SymTable.Resolve(bits) is SliceSym { Low: 0, Base: var whole } ? SymTable.Resolve(whole) : SymTable.Resolve(bits);
+        return length is ReadSym read && Decompose(read.Address) is (var owner, RuntimeLayout.ArrayMaxLength, null, _)
+            && ReferenceEquals(SymTable.Resolve(owner), SymTable.Resolve(root))
+            && ZeroBranches(lengthTest, bits, empty, data) ? (root, array) : null;
+    }
+
+    private bool ZeroBranches(Block block, Sym operand, Block zero, Block nonzero) =>
+        block.Statements.LastOrDefault() is Branch branch && block.NormalSuccessors.Count() == 2
+        && values.Operands(branch) is [OpSym { Op: { Kind: OperatorKind.Compare, Cond: Cond.Eq or Cond.Ne } comparison, Args: [var tested, var constant] }]
+        && ReferenceEquals(SymTable.Resolve(tested), SymTable.Resolve(operand)) && SymTable.IsZero(constant)
+        && (comparison.Cond == Cond.Eq ? branch.Target : branch.Fallthrough) == zero.Start
+        && (comparison.Cond == Cond.Eq ? branch.Fallthrough : branch.Target) == nonzero.Start;
 
     /// <summary>路径拆分期间不把合流的地址当作托管指针：能拆分时各路径各自访问单一实体。</summary>
     public bool MergedAddresses { get; set; } = true;
@@ -116,7 +162,10 @@ public sealed partial class TypeOracle
         expected is ByRefRef { Element: var element } && SymTable.Resolve(value) is var sym
         && (sym is OpSym { Op: { Kind: OperatorKind.Binary, Binary: BinOp.Add } }
             or EntitySym { Symbol.Kind: SymbolKind.StaticFields or SymbolKind.ThreadStaticFields }
-            || sym is PhiSym phi && Cursor(phi) is not null) ? Addressed(sym, element) : null;
+            || sym is PhiSym phi && Cursor(phi) is not null
+            // 首字段与 ref 参数使用同一原生地址，期望的元素类型可确认具体字段。
+            || sym is ArgSym { Index: >= 0 } arg && Parameter(arg.Index) is ByRefRef { Element: var owner }
+                && !owner.Equals(element)) ? Addressed(sym, element) : null;
 
     /// <summary>地址处类型为 element 的位置；表示链上的外层按字段进入。</summary>
     private Location? Addressed(Sym address, TypeRef element)
@@ -203,14 +252,17 @@ public sealed partial class TypeOracle
     }
 
     /// <summary>
-    /// φ 的每条边是自身加步长，或一个初值：数组上（可带比例下标）或外层游标上的地址；elementSize 不为零时初值没有数组，只是字节偏移。
+    /// φ 的每条边是自身加步长，或从下标计算的值：数组上（可带比例下标）或外层游标上的地址；elementSize 不为零时只有字节偏移。
     /// 步长是元素大小的倍数，各初值落在元素内的同一偏移。
     /// </summary>
     private ElementCursor? FindCursor(PhiSym phi, int elementSize, long start = RuntimeLayout.ArrayData)
     {
         if (phi.Width != 64 || phi.Projection is not null || phi.Sources.Any(s => s is null)) return null;
         var edges = phi.Sources.Select(s => AddressTerms(s!)).ToArray();
-        if (!edges.Any(e => ReferenceEquals(e.Root, phi) && e.Index is null && e.Offset != 0)) return null;
+        var steps = edges.Any(e => ReferenceEquals(e.Root, phi) && e.Index is null && e.Offset != 0);
+        // 编译器也会在回边从独立下标重算偏移，此时每条入边都必须能按固定元素大小解释。
+        if (!steps && (elementSize == 0 || !edges.Any(e => e.Index is not null)
+            || edges.Any(e => ReferenceEquals(e.Root, phi)))) return null;
         Sym? array = null;
         var size = elementSize;
         long? inside = null;
@@ -231,11 +283,13 @@ public sealed partial class TypeOracle
                     || array is not null && !ReferenceEquals(array, root)) return null;
                 (array, size) = (root, bytes);
             }
-            if (offset < start || index is not null && scale != size) return null;
+            // 独立的字节游标可能把“长度减一”留在常量里；基址未参与递推，负元素偏移也可准确拆出。
+            if (elementSize == 0 && offset < start || index is not null && scale != size) return null;
             var within = offset - start;
-            if (inside is { } previous && previous != within % size) return null;
-            inside = within % size;
-            seeds[edge] = (index, within / size);
+            var remainder = (within % size + size) % size;
+            if (inside is { } previous && previous != remainder) return null;
+            inside = remainder;
+            seeds[edge] = (index, (within - remainder) / size);
         }
         if (inside is null || edges.Any(e => ReferenceEquals(e.Root, phi) && e.Index is null && e.Offset % size != 0)) return null;
         var syms = values.Syms;

@@ -1,6 +1,7 @@
 using ReSekai.Decompiler.Facts;
 using ReSekai.Decompiler.Ir;
 using ReSekai.Decompiler.Machine.Flow;
+using ReSekai.Decompiler.Machine.Storage;
 using ReSekai.Decompiler.Recovery.Runtime;
 
 namespace ReSekai.Decompiler.Idioms;
@@ -50,7 +51,8 @@ internal static class OnceGuardsPass
                 return new(Kind.Metadata, initialize, skip, null, address.Value);
             case { Width: 32, Address: Binary { Op: BinOp.Add, Left: Symbol { Kind: SymbolKind.Class, Value: TypeRef type }, Right: Const { Value: RuntimeLayout.ClassCctorFinishedOrNoCctor } } }:
                 // 类自身的静态构造中，标志位的含义不同。
-                return state.self?.Method.Name == ".cctor" ? null : new(Kind.ClassConstructor, initialize, skip, type, 0);
+                return state.self?.Method.Name == ".cctor" && type is DefinitionRef definition
+                    && state.self.Method.Owner == definition.Definition ? null : new(Kind.ClassConstructor, initialize, skip, type, 0);
             case { Width: 8 or 16, Address: Binary { Op: BinOp.Add, Left: Symbol { Kind: SymbolKind.Class, Value: TypeRef type }, Right: Const { Value: RuntimeLayout.ClassBitflags1 } } }
                 when ClassInitializationFlags.IsBitTest(condition, flag):
                 return new(Kind.ClassLayout, initialize, skip, type, 0);
@@ -81,8 +83,12 @@ internal static class OnceGuardsPass
         private const int Depth = 32;
         private readonly Dictionary<Variable, Expr> definitions = state.function.Blocks.SelectMany(b => b.Statements).OfType<Define>().ToDictionary(d => d.Target, d => d.Value);
         private readonly Dictionary<Variable, Block> owners = state.function.Blocks.SelectMany(b => b.Statements.OfType<Define>().Select(d => (d.Target, Block: b))).ToDictionary(p => p.Target, p => p.Block);
+        private readonly Dictionary<Variable, Variable> copies = state.function.Blocks.SelectMany(b => b.Statements).OfType<Phi>()
+            .Where(p => p.Sources.Length > 0 && p.Sources.All(v => v == p.Sources[0]) && p.Sources[0].Version >= 0)
+            .ToDictionary(p => p.Target, p => p.Sources[0]);
         private readonly Dictionary<Variable, bool> unchanged = [];
         private Func<Expr, TypeRef?>? types;
+        private FrameModel? frame;
         private bool loadAfterStore;
         private Line? slow;
 
@@ -95,6 +101,19 @@ internal static class OnceGuardsPass
             var merge = fast.Merge;
             if (merge is null && fast.Exit is null && fast.Returned is null) { reason = "快路径没有终点"; return false; }
             if (!Walk(taken, guard.Initialize, true, merge, out reason)) return false;
+            if (merge is not null && taken.Exit is not null && guard.Kind == Kind.Metadata
+                && merge.Statements.LastOrDefault() is Branch && merge.Statements.All(s => s is Phi or Nop or Branch))
+            {
+                // 快路径复用前面读过的值，在共享分支块取本入边的 φ 来源后再比较出口。
+                fast.Exit = (Branch)merge.Statements[^1];
+                var incoming = merge.Predecessors.IndexOf(fast.Previous);
+                if (incoming < 0 || merge.Statements.OfType<Phi>().Any(p => p.Sources.Length != merge.Predecessors.Count))
+                { reason = "共享分支的入边不明"; return false; }
+                foreach (var phi in merge.Statements.OfType<Phi>())
+                    fast.Values[phi.Target] = Normal(new Use(phi.Sources[incoming], phi.Target.Width), fast, 0);
+                fast.Previous = merge;
+                merge = null;
+            }
             // 同一标志的前一个守卫已经初始化时，这一臂的调用被清理掉，只剩写标志。
             if (!taken.Initialized && taken.FlagStore is null) { reason = "慢路径没有初始化"; return false; }
             if (loadAfterStore) { reason = "写入之后还有读取"; return false; }
@@ -164,8 +183,11 @@ internal static class OnceGuardsPass
             var (previous, current) = (head, start);
             while (true)
             {
-                // 快路径止于第一个其他路径也进入的块，慢路径走到同一点。
-                if (current == stop || !initializing && current.Predecessors.Count > 1)
+                // 常量返回的跳板可以与其他路径共用，真正的合流发生在返回值合并处。
+                var shared = current.Predecessors.Count > 1;
+                var forwarding = guard.Kind == Kind.Metadata && shared && current.Statements.All(s => s is Nop or Jump or Define { Value: Const })
+                    && current.Handler is null && !current.IsLandingPad && current.NormalSuccessors.Count() == 1;
+                if (current == stop || !initializing && shared && !forwarding)
                 {
                     line.Previous = previous;
                     line.Merge = current;
@@ -176,7 +198,6 @@ internal static class OnceGuardsPass
                 { reason = "路径含异常边或环"; return false; }
                 line.Previous = previous;
                 var incoming = current.Predecessors.IndexOf(previous);
-                var shared = current.Predecessors.Count > 1;
                 Block? onward = null;
                 foreach (var statement in current.Statements)
                 {
@@ -193,6 +214,10 @@ internal static class OnceGuardsPass
                         case Branch when initializing && stop is not null && !shared && Survivor(current) is { } continuing:
                             onward = continuing;
                             break;
+                        case Branch test when initializing && guard.Kind == Kind.Metadata && stop is not null && !shared
+                            && line.Stores.Count == 0 && ReloadedNonNull(test, current, line) is { } nonNull:
+                            onward = nonNull;
+                            break;
                         case Branch exit when !shared:
                             line.Previous = current;
                             line.Exit = exit;
@@ -201,12 +226,16 @@ internal static class OnceGuardsPass
                             line.Previous = current;
                             line.Returned = finished;
                             return true;
-                        case Define define when !shared && !ExprMap.Walk(define.Value).Any(e => e is Intrinsic or Unknown):
+                        case Define define when forwarding || !shared && !ExprMap.Walk(define.Value).Any(e => e is Intrinsic or Unknown):
                             line.Values[define.Target] = Normal(define.Value, line, 0);
                             break;
                         case Store { Target: Const target, Value: Const { Value: 1, Width: 8 } } set when initializing && guard.Kind == Kind.Metadata && target.Value == guard.Flag:
                             line.FlagStore = set;
                             line.FlagBlock = current;
+                            break;
+                        // 守卫内的暂存若没有后续观察者，不参与两臂的内存效果比较。
+                        case Store { Target: FrameAddress, Value: Use or Const } spill when !shared && guard.Kind == Kind.Metadata
+                            && (frame ??= new FrameModel(state.function, state.owner.CallEffects)).UnobservedAfter(current, spill):
                             break;
                         case Store store when !shared && !ExprMap.Walk(store.Value).Concat(ExprMap.Walk(store.Target)).Any(e => e is Intrinsic or Unknown):
                             line.Stores.Add((Normal(store.Target, line, 0), Normal(store.Value, line, 0)));
@@ -277,6 +306,8 @@ internal static class OnceGuardsPass
                             Expr value;
                             if (line.Values.TryGetValue(use.Variable, out var known)) value = known;
                             else if (line.Expanded.TryGetValue(use.Variable, out var expanded)) value = expanded;
+                            else if (copies.TryGetValue(use.Variable, out var alias))
+                                value = line.Expanded[use.Variable] = Normal(new Use(alias, use.Width), line, depth + 1);
                             else if (definitions.TryGetValue(use.Variable, out var source)
                                 && (!ExprMap.Walk(source).Any(e => e is Load) || Unchanged(use.Variable, source)))
                                 value = line.Expanded[use.Variable] = Normal(source, line, depth + 1);
@@ -355,6 +386,24 @@ internal static class OnceGuardsPass
             return false;
         }
 
+        private Block? ReloadedNonNull(Branch branch, Block block, Line line)
+        {
+            if (Normal(branch.Condition, line, 0) is not Compare { Cond: Cond.Eq or Cond.Ne, Left: Load subject, Right: Const { Value: 0 } } compare)
+                return null;
+            foreach (var statement in Before())
+            {
+                if (statement is Store || statement is Call call && !KeepsMemory(call)) return null;
+                if (statement is Call { Op.Kind: OpKind.NullCheck, Arguments: [Use checkedValue] }
+                    && definitions.TryGetValue(checkedValue.Variable, out var read) && Unchanged(checkedValue.Variable, read)
+                    && Normal(checkedValue, line, 0) == subject)
+                {
+                    var destination = compare.Cond == Cond.Eq ? branch.Fallthrough : branch.Target;
+                    return block.NormalSuccessors.SingleOrDefault(b => b.Start == destination);
+                }
+            }
+            return null;
+        }
+
         /// <summary>从守卫沿唯一前驱向前的语句。</summary>
         private IEnumerable<Stmt> Before()
         {
@@ -396,6 +445,9 @@ internal static class OnceGuardsPass
         {
             Ir.Convert { Kind: ConvKind.Bitcast } cast => Plain(cast.Operand),
             Ir.Convert { Kind: ConvKind.Truncate, Width: var width, Operand: Binary { Op: BinOp.LShr, Left: var whole, Right: Const shift } } => Fold.Extract(Plain(whole), (int)shift.Value, width),
+            // 仅比较已观察到的值：小端读取的低位来自同一地址。
+            Ir.Convert { Kind: ConvKind.Truncate, Operand: Load load } cast when cast.Width % 8 == 0 && cast.Width < load.Width
+                => load with { Width = cast.Width },
             _ => null,
         }));
 
@@ -403,8 +455,32 @@ internal static class OnceGuardsPass
         {
             if (!seen.Add(variable)) return 0;
             var statements = state.function.Blocks.SelectMany(b => b.Statements).ToArray();
-            var used = statements.SelectMany(ExprMap.Operands).Select(e => ObservedBits(e, variable)).DefaultIfEmpty(0).Max();
+            var used = statements.Select(s => Observed(s, variable)).DefaultIfEmpty(0).Max();
             return Math.Max(used, statements.OfType<Phi>().Where(p => p.Sources.Contains(variable)).Select(p => Observed(p.Target, seen)).DefaultIfEmpty(0).Max());
+        }
+
+        private int Observed(Stmt statement, Variable variable)
+        {
+            // SIMD 寄存器保存整寄存器，标量实参只读取 ABI 指定的低位。
+            if (variable.Storage.Bank != Bank.Vec || statement is not Call { Op: null, Kind: CallKind.Direct or CallKind.Tail } call
+                || !call.Arguments.Any(a => a is Use use && use.Variable == variable)
+                || state.owner.Shapes.Of(call).Signature is not { } signature)
+                return ExprMap.Operands(statement).Select(e => ObservedBits(e, variable)).DefaultIfEmpty(0).Max();
+
+            var used = Math.Max(ObservedBits(call.Target, variable), call.StackPointer is { } sp ? ObservedBits(sp, variable) : 0);
+            if (call.DelegateReceiver is { } receiver) used = Math.Max(used, ObservedBits(receiver, variable));
+            var sourceStart = call.Arguments.Length - call.Sources.Length;
+            var pieces = signature.Arguments.SelectMany(a => a.Pieces).Where(p => p.Register.Bank == Bank.Vec).ToArray();
+            for (var i = 0; i < call.Arguments.Length; i++)
+            {
+                var argument = call.Arguments[i];
+                var width = ObservedBits(argument, variable);
+                if (argument is Use && width > 0 && i >= sourceStart
+                    && pieces.FirstOrDefault(p => p.Register == call.Sources[i - sourceStart]) is { } piece)
+                    width = Math.Min(width, piece.Width);
+                used = Math.Max(used, width);
+            }
+            return used;
         }
     }
 }

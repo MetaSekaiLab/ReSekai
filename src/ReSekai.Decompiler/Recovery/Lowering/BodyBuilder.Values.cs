@@ -19,6 +19,7 @@ internal sealed partial class BodyBuilder
         sym = SymTable.Resolve(sym);
         // 取址须能写入该位置，不接受只读的访问器证明。
         if (oracle.AddressArm(sym, expected) is { } addressed) return new AddressValue(LocationValue(addressed, address, store: true));
+        if (oracle.PinnedArrayHead(sym, expected) is var (array, arrayType)) return new PinnedArrayValue(View(array, arrayType, address), arrayType);
         if (expected is DefinitionRef structure && types.Kind(expected) == TypeKind.Struct && sym is not ConcatSym && oracle.BitRepresentation(sym))
             return StructBits(sym, structure, address);
         if (sym is not LocalSym && locals.TryGetValue(sym, out var known)) return Coerce(known, expected, address);
@@ -51,6 +52,8 @@ internal sealed partial class BodyBuilder
                 return Read(read, address) is { } value ? Coerce(value, expected, address) : Hole(address, "内存 读取", expected);
             case ResultSym result when constructions.ContainsKey(result):
                 return Hole(address, "构造 对象在构造函数调用前被使用", expected);
+            case PhiSym phi when oracle.PinnedArray(phi) is var (pinnedArray, pinnedType):
+                return Coerce(new PinnedArrayValue(View(pinnedArray, pinnedType, address), pinnedType), expected, address);
             case PhiSym phi:
                 {
                     if (oracle.ProjectedField(phi) is var (whole, wholeType, path, fieldType))
@@ -237,7 +240,13 @@ internal sealed partial class BodyBuilder
                 : types.Integer(oracle.StorageBits(scalar.Type), false);
             return Coerce(IntegerBits(slice, target, address)!, expected, address);
         }
-        if (slice.Base is ReadSym merged && oracle.Part(merged, slice.Low, slice.Width) is { } part)
+        if (slice.Base is ReadSym merged && oracle.ProjectedReadPart(merged, slice.Low, slice.Width) is { } projection)
+        {
+            var (parent, field) = projection;
+            var snapshot = View(values.Syms.Slice(merged, parent.Bit, parent.Width), parent.Leaf.Type, address);
+            return Coerce(Nest(snapshot, field.Path, field.Type, false, address), expected, address);
+        }
+        if (slice.Base is ReadSym mergedRead && oracle.Part(mergedRead, slice.Low, slice.Width) is { } part)
         {
             return Coerce(LocationValue(part, address), expected);
         }
@@ -330,7 +339,10 @@ internal sealed partial class BodyBuilder
         if (oracle.Aggregate(bits, structure) is not { } plan) return Hole(address, $"值 {structure} 超出位宽 {bits.Width}", structure);
         if (plan.Whole is { } whole) return View(whole, structure, address);
         if (plan.Snapshot is { } snapshot) return SnapshotUpdate(structure, snapshot, plan.Fields, address);
-        return StructPhi(structure, plan) ?? Composed(structure, plan.Fields.Select(f => (f.Projection.Path, View(f.Value, f.Projection.Type, address))).ToList(), address);
+        if (PartialNullable(structure, plan, address) is { } nullable) return nullable;
+        return BranchConstruction(bits, structure, plan, address)
+            ?? StructPhi(structure, plan)
+            ?? Composed(structure, plan.Fields.Select(f => (f.Projection.Path, View(f.Value, f.Projection.Type, address))).ToList(), address);
     }
 
     /// <summary>快照改写（<see cref="TypeOracle.UpdatedRead"/>）：复制快照，再写改动的直接字段。</summary>
@@ -427,6 +439,16 @@ internal sealed partial class BodyBuilder
             return TryCompose(structure, leaves.Except(covered).ToList(), address);
         // 叶子全部取自同一个结构体时就是整体复制，先于构造函数证明：后者的实参仍要逐个读私有字段。
         if (StructUpdate(structure, leaves, address, copyOnly: true) is { } copied) return copied;
+        if (structure is { Definition.FullName: "System.Nullable", Arguments: [var underlying] }
+            && leaves is [([var hasValue], var present)] && hasValue.Field.Name == "hasValue"
+            && hasValue.Field.Owner == structure.Definition
+            && types.Kind(underlying) is TypeKind.Int or TypeKind.Bool
+            && present is not ConstantValue
+            && TryCompose(structure, [(new[] { hasValue }, new ConstantValue(1, types.Boolean, 8))], address) is NewObjectValue filled)
+        {
+            return new ChoiceValue(Coerce(present, types.Boolean, address), filled, new ComposedValue(structure, []),
+                structure, Width(structure));
+        }
         if (templates.ProveValueConstruction(structure, leaves) is { } construction)
         {
             var arguments = construction.Arguments.Select((value, i) => value is AddressValue ? value

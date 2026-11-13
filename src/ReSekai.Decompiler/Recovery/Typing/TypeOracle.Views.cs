@@ -49,10 +49,20 @@ public sealed partial class TypeOracle
     }
 
     /// <summary>合流投影已有完整结构体载体时保留该整体，让后续字段访问共用同一接收者。</summary>
-    public (PhiSym Whole, TypeRef WholeType, IReadOnlyList<FieldRef> Path, TypeRef Type)? ProjectedField(PhiSym phi) =>
-        phi.Projection is var (whole, low) && TypeOf(whole) is DefinitionRef structure
-        && types.Project(structure, low, phi.Width) is { } field
-            ? (whole, structure, field.Path, field.Type) : null;
+    public (PhiSym Whole, TypeRef WholeType, IReadOnlyList<FieldRef> Path, TypeRef Type)? ProjectedField(PhiSym phi)
+    {
+        if (phi.Projection is not { } projection) return null;
+        var (whole, low) = projection;
+        var candidates = whole.Sources.OfType<Sym>().Select(TypeOf).OfType<DefinitionRef>().Distinct().ToArray();
+        if (candidates.Where(s => types.Kind(s) == TypeKind.Struct && types.StorageBits(s) == whole.Width)
+                .OrderByDescending(s => Representation(s).Count).FirstOrDefault() is not { } structure
+            || !whole.Sources.All(source => source is not null && (TypeOf(source)?.Equals(structure) == true
+                || WholeRead(source, structure) is not null || TypeOf(source) is { } sourceType
+                    && Representation(structure).Any(t => t.Type.Equals(sourceType))))
+            || types.Project(structure, low, phi.Width) is not { } field) return null;
+        Use(whole, structure);
+        return (whole, structure, field.Path, field.Type);
+    }
 
     /// <summary>标量合流的投影复用完整载体，避免为循环中的每一级截断建立新的合流。</summary>
     public (PhiSym Whole, TypeRef Type, int Low)? ProjectedScalar(PhiSym phi) =>

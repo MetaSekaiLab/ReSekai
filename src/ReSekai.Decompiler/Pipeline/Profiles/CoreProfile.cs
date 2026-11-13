@@ -61,7 +61,7 @@ internal static class CoreProfile
         ReportStage.WritePublications(output, results, skeleton);
         var bytes = results.Select(r => r.Entry).Distinct().ToDictionary(e => e, e => e == 0 ? 0 : checked((long)facts.Code.At(e)!.Size));
         ReportStage.WriteRecovery(output, results, bytes, dependencyMethods, emitProblems, partialEmitted,
-            _ => "native-recovery", _ => null);
+            r => r.ReferenceSource is null ? "native-recovery" : "reference-source", _ => null);
         ReportStage.WriteTraces(output, targets);
         ReportStage.WriteEmitted(output, emitted, skeleton, dependencyMethods);
         var sourceProblems = SourceSuitability.Check(emitted.Select(r => r.Body!).Concat(partialEmitted.Select(r => r.Partial!)));

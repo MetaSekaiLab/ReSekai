@@ -1,6 +1,7 @@
 using ReSekai.Decompiler.Facts;
 using ReSekai.Decompiler.Ir;
 using ReSekai.Decompiler.Machine.Flow;
+using ReSekai.Decompiler.Recovery.Calls;
 using ReSekai.Decompiler.Recovery.Control;
 using ReSekai.Decompiler.Recovery.Memory;
 using ReSekai.Decompiler.Recovery.Runtime;
@@ -81,7 +82,12 @@ internal sealed partial class BodyBuilder
                 ? View(operands[1 + call.Arguments.Length], type, call.Address)
                 // 被吸收的判空要求接收者就是判过的值：换成默认值后 callvirt 必然抛出。
                 : value.Index < 0 && absorbedChecks.Contains(contents[i]) ? Argument(call, value, type, contents[i], arguments, output)
-                : Unconstrained(shape, value, type, contents[i]) ?? Argument(call, value, type, contents[i], arguments, output);
+                : UnusedReceiver(block, index, shape, callee, value, type, contents[i], contents)
+                    ?? UnusedScalar(shape, callee, value, type, contents[i]) ?? Unconstrained(shape, value, type, contents[i])
+                    ?? UnusedStackArgument(call, callee, value, type, contents[i])
+                    ?? UnusedCopyArgument(shape, callee, value, type, contents[i])
+                    ?? UnusedReference(shape, callee, value, type, contents[i], output)
+                    ?? Argument(call, value, type, contents[i], arguments, output);
             if (value.Index < 0) receiver = argument;
             else managed.Add(argument);
         }
@@ -149,6 +155,87 @@ internal sealed partial class BodyBuilder
             ArgumentSupply.Default => types.Kind(type) == TypeKind.Struct ? new ComposedValue(type, []) : new ConstantValue(0, type, Width(type)),
             _ => null,
         };
+
+    private ManagedValue? UnusedReceiver(Block block, int index, CallShape shape, MethodRef callee, MachineValue value, TypeRef type, Sym content, IReadOnlyList<Sym> arguments)
+    {
+        if (value.Index != -1 || !ManagedTypes.IsReferenceType(type) || shape.IsDispatch
+            || shape.Call is not { Kind: CallKind.Direct, Target: Const target } call
+            || oracle.Supply(shape, value, type, content) != ArgumentSupply.Default) return null;
+        // 直接调用省略了 this 时，优先复用计算该调用实参时实际解引用的同类型对象。
+        var receivers = arguments.Skip(1).Select(SymTable.Resolve).OfType<ReadSym>()
+            .Select(read => oracle.Locate(read.Address, read.Width))
+            .Where(location => location is { Kind: LocationKind.Instance, Base: not null })
+            .Select(location => location!.Base!)
+            .Where(owner => oracle.TypeOf(owner) is { } known && (known.Equals(type) || types.IsAssignable(known, type)))
+            .Distinct().ToArray();
+        if (receivers is [var receiver] && templates.UnusedParameter(callee, target.Value, -1)) return View(receiver, type, call.Address);
+        // 未使用的 this 寄存器可以被 clang 丢弃；紧邻的原生判空仍指名了该接收者。
+        if (index != 0 || block.Predecessors is not [var previous] || !previous.NormalSuccessors.Contains(block)
+            || previous.Statements.LastOrDefault(s => s is not (Ir.Jump or Nop)) is not Call { Op.Kind: OpKind.NullCheck } check
+            || values.Operands(check) is not [_, var checkedReceiver]
+            || oracle.TypeOf(checkedReceiver) is not { } checkedType || !ManagedTypes.IsReferenceType(checkedType)
+            || !(types.IsAssignable(type, checkedType) || types.IsAssignable(checkedType, type))
+            || !templates.UnusedParameter(callee, target.Value, -1)) return null;
+        return View(checkedReceiver, type, call.Address);
+    }
+
+    private ManagedValue? UnusedScalar(CallShape shape, MethodRef callee, MachineValue value, TypeRef type, Sym content)
+    {
+        if (shape.Call is not { Kind: CallKind.Direct, Target: Const target } || shape.IsDispatch
+            || value is not { Transfer: Transfer.Value, Index: >= 0, Pieces: [var piece] } || !shape.Unused.Contains(piece.Register))
+            return null;
+        var scalar = piece.Register.Bank == Bank.Gpr && piece.Width <= 32 && types.Kind(type) is TypeKind.Int or TypeKind.Bool
+            || piece.Register.Bank == Bank.Vec && piece.Width is 32 or 64 && types.Kind(type) is TypeKind.Float or TypeKind.Double;
+        if (!scalar) return null;
+        while (SymTable.Resolve(content) is SliceSym { Low: 0 } slice)
+            content = slice.Base;
+        return OmittedRegister(SymTable.Resolve(content)) && templates.UnusedParameter(callee, target.Value, value.Index)
+            ? new ConstantValue(0, type, Width(type)) : null;
+    }
+
+    private static bool OmittedRegister(Sym source) => source is UndefSym || source is UnknownSym { Reason: var reason }
+        && reason.EndsWith("被调用破坏", StringComparison.Ordinal);
+
+    /// <summary>直接转发时，原生代码可省略被调方不读取的栈实参。用已证明未读的同名形参补齐调用。</summary>
+    private ManagedValue? UnusedStackArgument(Call call, MethodRef callee, MachineValue value, TypeRef type, Sym content)
+    {
+        if (call is not { Kind: CallKind.Direct, Target: Const target } || value is not { Index: >= 0, Transfer: Transfer.Value, Pieces.Length: > 0 }
+            || value.Pieces.Any(p => p.Register.Bank != Bank.Stack) || SymTable.Resolve(content) is not UndefSym) return null;
+        var name = callee.Method.Parameters[value.Index].Name;
+        var parameters = analysis.Method.Method.Parameters;
+        var index = Enumerable.Range(0, parameters.Count).FirstOrDefault(i => parameters[i].Name == name && oracle.Parameter(i)?.Equals(type) == true, -1);
+        return index >= 0 && templates.UnusedParameter(callee, target.Value, value.Index) ? new ArgumentValue(index, type, Width(type)) : null;
+    }
+
+    /// <summary>编译器可省略被调方从不读取的值类型副本。</summary>
+    private ManagedValue? UnusedCopyArgument(CallShape shape, MethodRef callee, MachineValue value, TypeRef type, Sym content)
+    {
+        if (shape.Call is not { Kind: CallKind.Direct, Op: null, Target: Const target }
+            || value is not { Index: >= 0, Transfer: Transfer.Copy, Pieces: [var piece] } || types.Kind(type) != TypeKind.Struct
+            || SymTable.Resolve(content) is not (UndefSym or UnknownSym) || !shape.Unused.Contains(piece.Register)
+            || !templates.UnusedParameter(callee, target.Value, value.Index)) return null;
+        return new ComposedValue(type, []);
+    }
+
+    /// <summary>尾转发省略了不读写的 ref bool，原寄存器仍保存调用方的隐藏 MethodInfo。</summary>
+    private ManagedValue? UnusedReference(CallShape shape, MethodRef callee, MachineValue value, TypeRef type, Sym content, List<ManagedStatement> output)
+    {
+        if (shape.Call is not { Kind: CallKind.Direct or CallKind.Tail, Target: Const target } call
+            || value is not { Index: >= 0, Transfer: Transfer.Reference, Pieces: [var piece] }
+            || type is not ByRefRef { Element: var element } || !shape.Unused.Contains(piece.Register)) return null;
+        var source = SymTable.Resolve(content);
+        var omitted = call.Kind == CallKind.Direct && !shape.IsDispatch && OmittedRegister(source);
+        var forwarded = call.Kind == CallKind.Tail && element.Equals(types.Boolean)
+            && analysis.Signature.MethodInfo?.Register == piece.Register
+            && source is EntitySym { Symbol: { Kind: SymbolKind.Method, Value: MethodRef hidden } } && hidden.Equals(analysis.Method);
+        if ((!omitted && !forwarded) || !templates.UnusedParameter(callee, target.Value, value.Index)) return null;
+
+        var local = NewLocal(element);
+        var initial = types.Kind(element) == TypeKind.Struct ? (ManagedValue)new ComposedValue(element, [])
+            : new ConstantValue(0, element, Width(element));
+        output.Add(new ManagedAssignment(call.Address, local, initial));
+        return new AddressValue(local);
+    }
 
     /// <summary>
     /// 一个 IL 实参。按值传递时为内容的视图；按副本传递时为被指单元在调用前的内容；

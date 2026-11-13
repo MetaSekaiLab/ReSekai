@@ -165,6 +165,8 @@ internal sealed class Interpreter(ManagedTypes types, Solver solver, InlineEvide
     private readonly Dictionary<TypeRef, Leaf[]> leaves = [];
     public int StepBudget { get; set; } = 6000;
     public Meter? Meter { get; init; }
+    public bool SplitFieldAliases { get; init; }
+    private Term? pendingAlias;
     private int nextFrame = 1;
     public int NewFrameId() => nextFrame++;
 
@@ -320,8 +322,11 @@ internal sealed class Interpreter(ManagedTypes types, Solver solver, InlineEvide
             return false;
         if (x.Root == RootKind.Reference || y.Root == RootKind.Reference)
         {
-            var other = x.Root == RootKind.Reference ? y : x;
+            var (reference, other) = x.Root == RootKind.Reference ? (x, y) : (y, x);
             if (other.Root != RootKind.Reference && Private(side, other)) return false;
+            // 入口引用已指向既有存储，之后分配的对象即使已发布，其字段也不会与该引用重叠。
+            if (reference.Args[0].IsAtom(AtomKind.Argument) && other.Root is RootKind.Field or RootKind.Element or RootKind.MultiElement
+                && solver.Allocations.Contains(other.Args[0])) return false;
             if (x.Root == RootKind.Reference && y.Root == RootKind.Reference && ReferenceEquals(x.Args[0], y.Args[0]))
                 return FieldsOverlap(px, py);
             return x.Root == RootKind.Reference && Within(px, py) || y.Root == RootKind.Reference && Within(py, px);
@@ -364,8 +369,7 @@ internal sealed class Interpreter(ManagedTypes types, Solver solver, InlineEvide
 
     /// <summary>
     /// 读取标量。写入表从新到旧找：同一位置取其值；可能重叠的写入若只差对象（同一字段路径），Φ 判定两对象相等时取其值、
-    /// 判定不等时跳过；其他情况内容不可判定（null）。
-    /// 按对象是否相等分情况（分叉，或读经写的条件项）在语义上成立，但循环中每次迭代都会产生新的条件，路径或项指数增长，因此不做。
+    /// 判定不等时跳过。复核中的显式读取可用同字段的接收者相等条件分叉，受联合执行的路径预算限制；其他重叠返回未知。
     /// </summary>
     public Term? ReadScalar(SideState side, Term location, Leaf leaf, bool freshFrame, ImmutableList<Term>? phi = null)
     {
@@ -396,7 +400,11 @@ internal sealed class Interpreter(ManagedTypes types, Solver solver, InlineEvide
             if (phi is null || SameObject(written, location) is not { } same) return null;
             var decided = solver.Decide(phi, same);
             if (decided == true) return value;
-            if (decided is null) return null;
+            if (decided is null)
+            {
+                if (SplitFieldAliases && !same.HasFormal) pendingAlias ??= same;
+                return null;
+            }
         }
         if (location.Root is RootKind.Field or RootKind.Element or RootKind.MultiElement && side.Fresh.Contains(location.Args[0]))
             return Terms.Constant(0, leaf.Width);
@@ -662,8 +670,14 @@ internal sealed class Interpreter(ManagedTypes types, Solver solver, InlineEvide
                             value = Project(whole, load.Place.Path, load.Place.Type);
                             if (value is null) return Fail("结构体局部的字段不能投影");
                         }
-                        else if ((value = ReadValue(side, location!, load.Place.Type, frame.Fresh, phi)) is null)
-                            return Fail($"读取 {location} 的别名不可判定");
+                        else
+                        {
+                            pendingAlias = null;
+                            value = ReadValue(side, location!, load.Place.Type, frame.Fresh, phi);
+                            if (value is null) return pendingAlias is { } alias
+                                ? new Stop(StopKind.Fork) { Alternatives = [alias, Terms.Not(alias)] }
+                                : Fail($"读取 {location} 的别名不可判定");
+                        }
                         frame.Temps[load.Target] = value;
                         if (trace is not null)
                         {

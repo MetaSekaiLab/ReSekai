@@ -482,15 +482,21 @@ public static class RuntimeOps
         };
         yield return new(OpKind.BoundsCheck)
         {
-            Inputs = (_, a, t) => a.Count == 2 ? [new(a[0], t.Types.Int32), new(a[1], t.Types.Int32)] : [],
+            Inputs = (_, a, t) => a.Count switch
+            {
+                1 => [new(a[0], t.Types.Boolean)],
+                2 => [new(a[0], t.Types.Int32), new(a[1], t.Types.Int32)],
+                _ => [],
+            },
             Behavior = new(EffectKind.None, ExceptionEffect.Bounds),
             Lower = (IRuntimeLowering c, out ManagedStatement? terminal) =>
             {
                 terminal = null;
-                if (c.Arguments.Count != 2) return false;
-                if (c.AbsorbBounds(c.Arguments[0], c.Arguments[1])) return true;
+                if (c.Arguments.Count is not (1 or 2)) return false;
+                if (c.Arguments.Count == 2 && c.AbsorbBounds(c.Arguments[0], c.Arguments[1])) return true;
                 if (c.ExceptionConstructor("System.IndexOutOfRangeException") is not { } ctor) return false;
-                c.Emit(new ManagedCheck(c.Call.Address, new ComparisonValue(Cond.Uge, c.Input(0), c.Input(1), c.Types.Boolean), ctor));
+                var fails = c.Arguments.Count == 1 ? c.Input(0) : new ComparisonValue(Cond.Uge, c.Input(0), c.Input(1), c.Types.Boolean);
+                c.Emit(new ManagedCheck(c.Call.Address, fails, ctor));
                 return true;
             },
         };

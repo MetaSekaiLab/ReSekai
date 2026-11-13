@@ -64,6 +64,9 @@ public static partial class UnregisteredInference
                 // 机器码（含引用的数据）与唯一一个注册的非泛型定义同形时，它就是这个方法的副本。
                 // 它的身份只由方法体决定，个别调用方分析不完整不影响结论。
                 var copied = definitions.Length == 0 ? UniqueCopy(functions[group.Key], shapes) : null;
+                var scheduled = definitions.Length == 0 && copied is null
+                    ? ScheduledCopy(functions[group.Key], shapes, out matches) : null;
+                copied ??= scheduled;
                 if (copied is not null)
                 {
                     definition = copied.Method;
@@ -84,7 +87,7 @@ public static partial class UnregisteredInference
                         .Where(IsComplete).Any(m => Signature(m) is { } sig && Shape(sig) != Shape(signature))) reason = "ABI/候选槽位不吻合";
                     if (reason == "A/通过")
                     {
-                        reason = Compare(functions[group.Key], definition, signature, shapes, out matches);
+                        reason = scheduled is not null ? "接受" : Compare(functions[group.Key], definition, signature, shapes, out matches);
                         // ABI 由本调用的完整实例分类；开放参数不替换成任意封闭见证。
                     }
                 }

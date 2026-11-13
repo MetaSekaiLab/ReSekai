@@ -44,8 +44,9 @@ sealed class Scripts(ProgramModel model, Packages packages, Output output)
     {
         var recover = model.Assemblies.Where(a => !Engine(a.AssemblyName) && !packages.Assemblies.ContainsKey(a.AssemblyName)).ToArray();
         foreach (var assembly in model.Assemblies)
-            output.AssemblySources[assembly.AssemblyName] = Engine(assembly.AssemblyName) ? "Unity"
-                : packages.Assemblies.TryGetValue(assembly.AssemblyName, out var package) ? $"UPM {package}@{packages.Versions[package]}" : full ? "反编译" : "空桩";
+            output.AssemblySources[assembly.AssemblyName] = packages.Assemblies.TryGetValue(assembly.AssemblyName, out var package)
+                ? $"UPM {package}@{packages.Versions[package]}"
+                : packages.WriteManagedRuntime(assembly.AssemblyName, output) ?? (Engine(assembly.AssemblyName) ? "Unity" : full ? "反编译" : "空桩");
         if (recover.Length == 0) return null;
         string stage = stagedScripts ?? Path.Join(work, "scripts");
         string assemblies = Path.Join(stage, "assemblies"), sources = Path.Join(stage, "src");

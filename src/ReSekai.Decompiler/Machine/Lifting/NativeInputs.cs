@@ -83,9 +83,14 @@ internal static class NativeInputs
         var definitions = statements.OfType<Define>().ToDictionary(d => d.Target, d => d.Value);
         Expr Expand(Expr value, int depth = 32) => depth == 0 ? value : Fold.Simplify(ExprMap.Map(value,
             e => e is Use use && definitions.TryGetValue(use.Variable, out var source) ? Expand(source, depth - 1) : null));
-        if (Expand(call.Target) is not Load { Width: 64, Address: Binary { Op: BinOp.Add, Left: Load { Width: 64 } klass, Right: Const offset } }
-            || offset.Value < RuntimeLayout.ClassVtable || (offset.Value - RuntimeLayout.ClassVtable) % RuntimeLayout.VirtualInvokeDataSize != 0)
-            return false;
-        return call.Arguments.Length > 0 && Expand(call.Arguments[0]) == klass.Address;
+        if (call.Arguments.Length == 0) return false;
+        var receiver = Expand(call.Arguments[0]);
+        bool IsSlot(Expr value) => value is Load { Width: 64, Address: Binary { Op: BinOp.Add, Left: Load { Width: 64 } klass, Right: Const offset } }
+            && offset.Value >= RuntimeLayout.ClassVtable && (offset.Value - RuntimeLayout.ClassVtable) % RuntimeLayout.VirtualInvokeDataSize == 0
+            && receiver == klass.Address;
+        if (IsSlot(Expand(call.Target))) return true;
+        // 两个虚表槽可先合流再尾跳转；每条入边都必须从同一接收者取虚表。
+        return call.Target is Use target && statements.OfType<Phi>().FirstOrDefault(p => p.Target == target.Variable) is { } phi
+            && phi.Sources.Length > 1 && phi.Sources.All(source => IsSlot(Expand(new Use(source, target.Width))));
     }
 }

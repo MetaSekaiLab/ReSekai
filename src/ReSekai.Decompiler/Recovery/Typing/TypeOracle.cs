@@ -332,7 +332,8 @@ public sealed partial class TypeOracle : Runtime.IRuntimeTyping
             case ConcatSym concat when CompositeRead(concat) is { } whole:
                 return TypeOf(whole);
             case PhiSym phi:
-                return solution.Types.TryGetValue(phi, out var solved) ? solved : Lower(phi);
+                return PinnedArray(phi) is var (_, pinnedArray) ? new PointerRef(pinnedArray.Element)
+                    : solution.Types.TryGetValue(phi, out var solved) ? solved : Lower(phi);
             case OpSym op:
                 return OperatorType(op) ?? (op.Width is 8 or 16 or 32 or 64 && op.Op.Kind is OperatorKind.Select or OperatorKind.Binary or OperatorKind.Unary
                     ? types.Integer(op.Width, true) : null);
@@ -613,7 +614,9 @@ public sealed partial class TypeOracle : Runtime.IRuntimeTyping
         var terms = AddressTerms(address);
         if (terms.Root is PhiSym phi && terms.Index is null && Cursor(phi) is { } cursor)
             return (cursor.Array!, terms.Offset + cursor.Offset, cursor.Index, cursor.Size);
-        if (terms.Index is PhiSym bytes && terms.Scale == 1 && ArrayView(terms.Root) is { } array && OffsetCursor(bytes, ElementSize(array.Element)) is { } walked)
+        if (terms.Index is PhiSym bytes && terms.Scale == 1 && ArrayView(terms.Root) is { } array
+            && ElementSize(array.Element) is var size
+            && (OffsetCursor(bytes, size) ?? (terms.Offset >= RuntimeLayout.ArrayData ? OffsetCursor(bytes, size, 0) : null)) is { } walked)
             return (terms.Root, terms.Offset + walked.Offset, walked.Index, walked.Size);
         return terms;
     }
@@ -649,6 +652,14 @@ public sealed partial class TypeOracle : Runtime.IRuntimeTyping
             if (index is null) { (index, scale) = (term, 1); continue; }
             root ??= term;
         }
+        if (root is not null && TypeOf(root) is PointerRef && variable.Length > 2)
+        {
+            // 非托管指针可以把多个动态偏移相加；这些项都是原地址计算的字节数。
+            var rootIndex = Array.IndexOf(variable, root);
+            index = variable.Where((_, i) => i != rootIndex).Aggregate<Sym, Sym>(values.Syms.Const(0, 64),
+                (sum, term) => values.Syms.Binary(BinOp.Add, sum, values.Syms.ZeroExtend(term, 64), 64));
+            scale = 1;
+        }
         return (root ?? address, offset, index, scale);
     }
 
@@ -674,7 +685,7 @@ public sealed partial class TypeOracle : Runtime.IRuntimeTyping
             ConcatSym { Parts: [ConstSym { Value: 0 } zero, ..] } concat when zero.Width < 8
                 => (values.Syms.Slice(concat, zero.Width, concat.Width - zero.Width), 1 << zero.Width),
             OpSym { Op.Kind: OperatorKind.Binary, Args: [var x, ConstSym { Value: > 1 and <= 4096 } factor] } mul when mul.Op.Binary == BinOp.Mul => (x, (int)factor.Value),
-            OpSym { Op: { Kind: OperatorKind.Convert, Conversion: ConvKind.SignExtend }, Args: [var x] } extend when SymTable.Resolve(x) is PhiSym phi => ShiftedPhi(phi, extend.Width),
+            OpSym { Op: { Kind: OperatorKind.Convert, Conversion: ConvKind.SignExtend }, Args: [var x] } extend => ShiftedIndex(x, extend.Width),
             _ => null,
         };
         if (simple is var (inner, outer) && (Multiple(inner) ?? Scaled(inner)) is var (index, times) && outer * times <= 4096) return (index, outer * times);
@@ -682,15 +693,15 @@ public sealed partial class TypeOracle : Runtime.IRuntimeTyping
     }
 
     /// <summary>
-    /// 符号扩展的 φ 低位恒为零（强度削减的游标每次加 k &lt;&lt; 32，用时算术右移）：扩展值等于去掉低位零后的标准宽度整数
-    /// 先扩展再左移，即按这个整数下标乘 2 的幂。
+    /// 符号扩展前的低位恒为零时，先取去掉低位后的有符号下标，再按比例放大。
+    /// 常量增量在截去低位时一并换算，并保留原下标位宽的回绕。
     /// </summary>
-    private (Sym Index, int Factor)? ShiftedPhi(PhiSym phi, int width)
+    private (Sym Index, int Factor)? ShiftedIndex(Sym value, int width)
     {
-        var zeros = LowZeros(phi);
+        var zeros = LowZeros(value);
         foreach (var rest in new[] { 32, 16, 8 })
-            if (phi.Width - rest is var shift and >= 1 and <= 12 && shift <= zeros)
-                return (values.Syms.Convert(ConvKind.SignExtend, values.Syms.Slice(phi, shift, rest), width), 1 << shift);
+            if (value.Width - rest is var shift and >= 1 and <= 12 && shift <= zeros)
+                return (values.Syms.Convert(ConvKind.SignExtend, values.Syms.Slice(value, shift, rest), width), 1 << shift);
         return null;
     }
 
@@ -698,7 +709,7 @@ public sealed partial class TypeOracle : Runtime.IRuntimeTyping
     /// φ 在每条入边上低位恒为零的位数：初值与环上的增量都只由低位为零的常量、拼接和加减组成。
     /// 各值按最小值合并，环上再次到达的 φ 按归纳假设不限制，结果是整个环共同的下界。
     /// </summary>
-    private static int LowZeros(PhiSym start)
+    private static int LowZeros(Sym start)
     {
         var active = new HashSet<PhiSym>();
         int Zeros(Sym? sym)
@@ -830,7 +841,9 @@ public sealed partial class TypeOracle : Runtime.IRuntimeTyping
             case PointerRef pointer when index is not null || offset != 0:
                 {
                     var size = ElementSize(pointer.Element);
-                    if (size > 0 && offset % size == 0 && width == StorageBits(pointer.Element)
+                    var byteStorage = size == 1 && width is 16 or 32 or 64
+                        && root is PhiSym pinned && PinnedArray(pinned) is not null;
+                    if (size > 0 && offset % size == 0 && (width == StorageBits(pointer.Element) || byteStorage)
                         && (index is null || scale >= size && scale % size == 0))
                     {
                         // 比例下标可能只保留低位；先零扩展再乘原比例，保留模 2^64 的字节地址。
@@ -843,7 +856,8 @@ public sealed partial class TypeOracle : Runtime.IRuntimeTyping
                             displacement = values.Syms.Binary(BinOp.Add,
                                 values.Syms.Binary(BinOp.Mul, values.Syms.ZeroExtend(bits, 64), values.Syms.Const((ulong)scale, 64), 64), displacement, 64);
                         }
-                        return new Location(LocationKind.Reference, root, null, 0, null, [], pointer.Element) { ByteOffset = displacement };
+                        var element = byteStorage ? types.Integer(width, false) : pointer.Element;
+                        return new Location(LocationKind.Reference, root, null, 0, null, [], element) { ByteOffset = displacement };
                     }
                     return index is null && types.Kind(pointer.Element) == TypeKind.Struct
                         && FieldAt(pointer.Element, (int)offset + RuntimeLayout.ObjectHeaderSize, width, false, false) is var (pointerFields, pointerFieldType)
@@ -944,7 +958,7 @@ public sealed partial class TypeOracle : Runtime.IRuntimeTyping
         IReadOnlyList<FieldRef> path = [];
         var type = array.Element;
         if (width < 0 && ManagedAbi.SharedValue(array.Element) && offset == RuntimeLayout.ArrayData && scale == 1
-            && (RuntimeScaledIndex(root, index) ?? RuntimeScaledIndex(root, Commuted(index))) is { } scaled)
+            && RuntimeScaledIndex(root, index) is { } scaled)
             linear = scaled;
         else
         {
@@ -974,10 +988,6 @@ public sealed partial class TypeOracle : Runtime.IRuntimeTyping
         }
         return new Location(LocationKind.MultiElement, root, null, 0, null, path, type) { Indices = indices };
     }
-
-    /// <summary>乘积交换两个因子（运行时元素大小可能在任一侧）。</summary>
-    private Sym Commuted(Sym product) => SymTable.Resolve(product) is OpSym { Op.Kind: OperatorKind.Binary, Args: [var left, var right] } mul && mul.Op.Binary == BinOp.Mul
-        ? values.Syms.Binary(BinOp.Mul, right, left, mul.Width) : product;
 
     /// <summary>linear = i + n·rest，n 是数组第 dimension 维长度的读取：给出 (i, rest)；没有其他加数时 i 为 0。</summary>
     private (Sym Inner, Sym Outer)? OuterIndex(Sym array, Sym linear, int dimension)
@@ -1062,10 +1072,15 @@ public sealed partial class TypeOracle : Runtime.IRuntimeTyping
     /// <summary>下标乘以数组对象类的 element_size（[[array] + 0x104]）时的下标。</summary>
     private Sym? RuntimeScaledIndex(Sym array, Sym? scaled)
     {
-        if (SymTable.Resolve(scaled ?? array) is not OpSym { Op.Kind: OperatorKind.Binary, Args: [var size, var index] } mul || mul.Op.Binary != BinOp.Mul) return null;
-        var bits = SymTable.Resolve(size) is ConcatSym { Parts: [var low, ConstSym { Value: 0 }] } ? low : size;
-        return SymTable.Resolve(bits) is ReadSym { Width: 32 } read && Decompose(read.Address) is (var klass, RuntimeLayout.ClassElementSize, null, _)
-            && SymTable.Resolve(klass) is ReadSym { Width: 64 } header && ReferenceEquals(SymTable.Resolve(header.Address), SymTable.Resolve(array)) ? index : null;
+        if (scaled is null || SymTable.Resolve(scaled) is not OpSym { Op: { Kind: OperatorKind.Binary, Binary: BinOp.Mul }, Args: [var left, var right] }) return null;
+        return IsElementSize(left) ? right : IsElementSize(right) ? left : null;
+
+        bool IsElementSize(Sym value)
+        {
+            var bits = SymTable.Resolve(value) is ConcatSym { Parts: [var low, ConstSym { Value: 0 }] } ? low : value;
+            return SymTable.Resolve(bits) is ReadSym { Width: 32 } read && Decompose(read.Address) is (var klass, RuntimeLayout.ClassElementSize, null, _)
+                && SymTable.Resolve(klass) is ReadSym { Width: 64 } header && ReferenceEquals(SymTable.Resolve(header.Address), SymTable.Resolve(array));
+        }
     }
 
     private readonly Dictionary<ReadSym, IReadOnlyList<AccessPart>?> parts = [];
@@ -1079,20 +1094,35 @@ public sealed partial class TypeOracle : Runtime.IRuntimeTyping
     public IReadOnlyList<AccessPart>? Parts(ReadSym read)
     {
         if (!parts.TryGetValue(read, out var known))
-            parts[read] = known = Locate(read.Address, read.Width) is null && Split(read.Address, read.Width) is { } split
+            parts[read] = known = Locate(read.Address, read.Width) is null && Split(read.Address, read.Width, wholeFields: true) is { } split
                 && split.All(p => p.FieldBit == 0 && p.Width == (ManagedTypes.IsReferenceType(p.Leaf.Type) ? 64 : types.Size(p.Leaf.Type) * 8)) ? split : null;
         return known;
     }
 
     /// <summary>读取中恰为一个字段的一段。</summary>
-    public Location? Part(ReadSym read, int bit, int width) => Parts(read)?.FirstOrDefault(p => p.Bit == bit && p.Width == width)?.Leaf;
+    public Location? Part(ReadSym read, int bit, int width) =>
+        Parts(read)?.FirstOrDefault(p => p.Bit == bit && p.Width == width)?.Leaf
+        ?? (ProjectedReadPart(read, bit, width) is { } projection
+            ? projection.Part.Leaf with { Path = [.. projection.Part.Leaf.Path, .. projection.Field.Path], Type = projection.Field.Type } : null);
+
+    /// <summary>宽读取保留了完整值类型字段时，在其快照内定位实际使用的子字段。</summary>
+    public (AccessPart Part, ValueProjection Field)? ProjectedReadPart(ReadSym read, int bit, int width)
+    {
+        if (Parts(read) is not { } parts) return null;
+        foreach (var part in parts)
+            if (part.Leaf.Type is DefinitionRef structure && types.Kind(structure) == TypeKind.Struct
+                && bit >= part.Bit && bit + width <= part.Bit + part.Width && width < part.Width
+                && types.Project(structure, bit - part.Bit, width) is { } field)
+                return (part, field);
+        return null;
+    }
 
     /// <summary>
     /// 跨越多个标量字段的访问按布局拆成的段：每段是一个标量字段 Leaf 的 [FieldBit, FieldBit+Width) 位，位于访问的第 Bit 位起。
     /// 段覆盖整个字段时 FieldBit 为 0 且 Width 为字段宽度；访问只覆盖字段一部分时为部分段。
     /// 不属于任何字段的字节是填充；不能定位又不是填充时拆分不成立，返回 null。
     /// </summary>
-    public IReadOnlyList<AccessPart>? Split(Sym address, int width)
+    public IReadOnlyList<AccessPart>? Split(Sym address, int width, bool wholeFields = false)
     {
         var bytes = width / 8;
         var parts = new List<AccessPart>();
@@ -1104,7 +1134,8 @@ public sealed partial class TypeOracle : Runtime.IRuntimeTyping
             AccessPart? part = null;
             // 从此处开始的字段：整个落在访问内为整段，超出访问末尾为部分段。
             foreach (var w in new[] { 64, 32, 16, 8 })
-                if (Locate(piece, w) is { } location && types.Kind(location.Type) != TypeKind.Struct && Bits(location) == w)
+                if (Locate(piece, w) is { } location && Bits(location) == w
+                    && (types.Kind(location.Type) != TypeKind.Struct || wholeFields && w <= (bytes - at) * 8))
                 {
                     part = new(location, at * 8, 0, Math.Min(w, (bytes - at) * 8));
                     break;

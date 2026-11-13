@@ -60,6 +60,26 @@ internal sealed class InlineEvidence(ManagedTypes types, MethodRef caller, Func<
         if ((field.Field.Attributes & FieldAttributes.Static) == 0 && ManagedTypes.IsReferenceType(owner))
             foreach (var method in ParameterReaders(owner))
                 if (seen.Add(method)) yield return method;
+        if (owner.Definition.FullName == "Unity.Collections.NativeArray" && field.Field.Name == "m_Buffer" && owner.Arguments.Count == 1
+            && types.Model.Types.SingleOrDefault(t => t.Assembly == owner.Definition.Assembly
+                && t.FullName == "Unity.Collections.LowLevel.Unsafe.NativeArrayUnsafeUtility") is { } utility)
+            foreach (var definition in utility.Methods.Where(m => m.Name == "GetUnsafeBufferPointerWithoutChecks" && m.GenericParameters.Count == 1))
+            {
+                var method = new MethodRef(definition, [], owner.Arguments);
+                if (LibraryAccessors.IsNativeArrayBufferRead(method, field) && seen.Add(method)) yield return method;
+            }
+        var factoryOwner = owner.Definition.FullName switch
+        {
+            "System.EmptyArray" => types.CorlibDefinition("System.Array"),
+            "System.Linq.EmptyEnumerable" => types.Model.Types.SingleOrDefault(t => t.Assembly == owner.Definition.Assembly && t.FullName == "System.Linq.Enumerable"),
+            _ => null,
+        };
+        if (field.Field.IsStatic && factoryOwner is not null && owner.Arguments is [var element])
+            foreach (var definition in factoryOwner.Methods.Where(m => m.IsStatic && m.Name == "Empty" && m.GenericParameters.Count == 1 && m.Parameters.Count == 0))
+            {
+                var method = new MethodRef(definition, [], [element]);
+                if (seen.Add(method)) yield return method;
+            }
         foreach (var method in referenced ?? [])
             if (method.Method.Name is not (".ctor" or ".cctor") && seen.Add(method))
                 yield return method;

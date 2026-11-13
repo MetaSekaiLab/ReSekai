@@ -7,6 +7,7 @@ namespace ReSekai.Decompiler.Machine.Storage;
 /// <summary>调用对一个实参的使用。Size 为 -1 时范围未知；Retained 表示地址在调用之后仍可能被使用。</summary>
 internal readonly record struct ArgumentUse(int Size, MemoryAccess Access, bool Retained)
 {
+    public bool WritesResult { get; init; }
     public static readonly ArgumentUse Unknown = new(-1, MemoryAccess.ReadWrite, true);
     public static readonly ArgumentUse None = new(0, MemoryAccess.None, false);
 }
@@ -37,7 +38,7 @@ internal sealed class FrameModel
 {
     private const int ReachBudget = 8192;
 
-    private readonly record struct CallRange(long Offset, int Size, MemoryAccess Access);
+    private readonly record struct CallRange(long Offset, int Size, MemoryAccess Access, bool WritesResult);
 
     private readonly MachineFunction function;
     private readonly IFrameCallEffects calls;
@@ -70,6 +71,9 @@ internal sealed class FrameModel
 
     public bool Escaped(long offset, int bytes) => escaped.Any(e => Overlaps(e.Offset, e.Size, offset, bytes));
 
+    /// <summary>语句是否可能覆盖指定帧区间中的任一字节。</summary>
+    public bool MayWrite(Stmt statement, long offset, int bytes) => Kill(statement, offset, bytes, out _);
+
     /// <summary>
     /// 区间不再被读取，地址未逃逸，调用也不经指针观察它。没有被直接读取过的槽可能是未解析调用的栈实参，因此要求调用不读这段栈；
     /// 被读取过的槽是私有保存，不在实参区。
@@ -86,6 +90,82 @@ internal sealed class FrameModel
         return function.Blocks.SelectMany(b => b.Statements).SelectMany(ExprMap.Operands).SelectMany(ExprMap.Walk).OfType<Load>()
             .All(load => !Points(load.Address).Any(at => at < offset + bytes && offset < at + load.Width / 8)
                 && !IndexedRoots(load.Address).Any(root => root < offset + bytes));
+    }
+
+    public bool UnobservedAfter(Block block, Store store, Func<Call, bool>? boundStackInput = null)
+    {
+        if (store.Value.Width <= 0 || store.Value.Width % 8 != 0 || Slot(store.Target) is not < 0) return false;
+        var offset = Slot(store.Target)!.Value;
+        var bytes = store.Value.Width / 8;
+        if (offset + bytes > 0 || Escaped(offset, bytes)) return false;
+
+        var pending = new Stack<(Block Block, int Start)>();
+        var visited = new HashSet<Block>();
+        pending.Push((block, block.Statements.IndexOf(store) + 1));
+        while (pending.TryPop(out var path))
+        {
+            // 回边可以再次进入写入之前的位置。
+            if (path.Start == 0 && !visited.Add(path.Block)) continue;
+            foreach (var statement in path.Block.Statements.Skip(path.Start))
+            {
+                if (statement is Opaque) return false;
+                if (statement is Call call && (boundStackInput?.Invoke(call) != true && ReadsOnStack(call, offset, bytes)
+                    || ranges.TryGetValue(call.Site, out var used) && used.Any(r => (r.Access & MemoryAccess.Read) != 0
+                        && Overlaps(r.Offset, r.Size < 0 ? null : r.Size, offset, bytes)))) return false;
+                foreach (var load in ExprMap.Operands(statement).SelectMany(ExprMap.Walk).OfType<Load>())
+                    if (Points(load.Address).Any(at => Overlaps(at, load.Width / 8, offset, bytes))
+                        || IndexedRoots(load.Address).Any(root => root < offset + bytes)) return false;
+            }
+            foreach (var successor in path.Block.Successors) pending.Push((successor, 0));
+        }
+        return true;
+    }
+
+    /// <summary>帧指针的保存值在所有后续路径上都未被观察，或在读取前已被覆盖。</summary>
+    public bool DeadPointerStore(Block block, Store store)
+    {
+        if (store.Value is not FrameAddress || store.Target is not FrameAddress { Offset: < 0 and var offset }) return false;
+        if (offset + 8 > 0 || Escaped(offset, 8)) return false;
+        var pending = new Stack<(Block Block, int Index, int Bytes)>();
+        var seen = new Dictionary<Block, int>();
+        var budget = ReachBudget;
+        pending.Push((block, block.Statements.IndexOf(store) + 1, 0xff));
+        while (pending.TryPop(out var path))
+        {
+            var live = path.Bytes;
+            if (path.Index == 0)
+            {
+                var visited = seen.GetValueOrDefault(path.Block);
+                live &= ~visited;
+                if (live == 0) continue;
+                seen[path.Block] = visited | live;
+            }
+            bool Reads(long start, int? size) => Enumerable.Range(0, 8)
+                .Any(b => (live & (1 << b)) != 0 && Overlaps(start, size, offset + b, 1));
+            void Overwrite(long start, int size)
+            {
+                for (var b = 0; b < 8; b++)
+                    if (Overlaps(start, size, offset + b, 1)) live &= ~(1 << b);
+            }
+            foreach (var statement in path.Block.Statements.Skip(path.Index))
+            {
+                if (live == 0) break;
+                if (--budget <= 0 || statement is Opaque) return false;
+                if (ExprMap.Operands(statement).SelectMany(ExprMap.Walk).OfType<Load>().Any(load =>
+                    Points(load.Address).Any(at => Reads(at, load.Width / 8)) || IndexedRoots(load.Address).Any(at => Reads(at, null)))) return false;
+                if (statement is Store { Target: FrameAddress target } write) Overwrite(target.Offset, write.Value.Width / 8);
+                if (statement is not Call call) continue;
+                if (ReadsOnStack(call, offset, 8)) return false;
+                if (path.Block.Handler is { } handler) pending.Push((handler, 0, live));
+                if (!ranges.TryGetValue(call.Site, out var used)) continue;
+                if (used.Any(r => (r.Access & MemoryAccess.Read) != 0 && Reads(r.Offset, r.Size < 0 ? null : r.Size))) return false;
+                foreach (var result in used.Where(r => r.WritesResult && r.Size > 0))
+                    Overwrite(result.Offset, result.Size);
+            }
+            if (live != 0)
+                foreach (var next in path.Block.NormalSuccessors) pending.Push((next, 0, live));
+        }
+        return true;
     }
 
     /// <summary>第 index 条语句之前，[offset, offset+bytes) 的来源。throughCalls：已知调用不改写它，只看写入。</summary>
@@ -293,12 +373,12 @@ internal sealed class FrameModel
                 {
                     var targets = Targets(call.Arguments[i]);
                     if (targets.Count == 0) { Walk(call.Arguments[i], true); continue; }
-                    var use = calls.Argument(call, i);
+                    var use = ConstrainedReferenceSlot(call, i) ?? calls.Argument(call, i);
                     if (!ranges.TryGetValue(call.Site, out var used)) ranges[call.Site] = used = [];
                     foreach (var target in targets)
                     {
                         if (use.Retained) escaped.Add((target, use.Size < 0 ? null : use.Size));
-                        else if (use.Access != MemoryAccess.None) used.Add(new(target, use.Size, use.Access));
+                        else if (use.Access != MemoryAccess.None) used.Add(new(target, use.Size, use.Access, use.WritesResult && call.Arguments[i] is FrameAddress));
                     }
                     Walk(call.Arguments[i], false);
                 }
@@ -307,6 +387,28 @@ internal sealed class FrameModel
                 foreach (var operand in ExprMap.Operands(statement)) Walk(operand, true);
                 break;
         }
+    }
+
+    // 共享泛型的引用分支从槽里取对象后再分派，槽地址不会交给目标方法。
+    private ArgumentUse? ConstrainedReferenceSlot(Call call, int index)
+    {
+        if (index != 0 || call.Op is not { Kind: OpKind.InvokeConstrainedGeneric, Operand: ValueTuple<TypeRef, MethodRef> constraint }) return null;
+        Expr ExpandCopies(Expr expression)
+        {
+            while (expression is Use use && definitions.TryGetValue(use.Variable, out var value)) expression = value;
+            return expression;
+        }
+        if (ExpandCopies(call.Arguments[index]) is not Select selection) return null;
+        var arms = selection.Condition switch
+        {
+            ClassProperty { Kind: ClassPropertyKind.IsValueType } test when test.Type.Equals(constraint.Item1) => (selection.True, selection.False),
+            Not { Operand: ClassProperty { Kind: ClassPropertyKind.IsValueType } test } when test.Type.Equals(constraint.Item1) => (selection.False, selection.True),
+            _ => default,
+        };
+        return arms is ({ } valueArm, { } referenceArm)
+            && ExpandCopies(referenceArm) is FrameAddress slot
+            && ExpandCopies(valueArm) is Load { Width: 64 } load && ExpandCopies(load.Address) == slot
+            && !Points(load).Any() ? new(8, MemoryAccess.Read, false) : null;
     }
 
     /// <summary>consumed 表示这个值不再只是地址的搬运：其中的帧地址就此逃逸。</summary>
@@ -423,9 +525,12 @@ internal static class FrameForwarding
                     block.Statements[i] = rewritten;
                     changed = true;
                 }
-            foreach (var block in function.Blocks)
-                changed |= block.Statements.RemoveAll(s => s is Store { Value.Width: > 0 } store && model.Slot(store.Target) is { } slot
-                    && slot < 0 && model.Unobserved(slot, store.Value.Width / 8)) > 0;
+            var dead = function.Blocks.SelectMany(block => block.Statements.OfType<Store>()
+                .Where(store => store.Value.Width > 0 && model.Slot(store.Target) is < 0 and var slot
+                    && (model.Unobserved(slot, store.Value.Width / 8) || model.DeadPointerStore(block, store)))
+                .Select(store => (Block: block, Store: store))).ToArray();
+            foreach (var (block, store) in dead) block.Statements.Remove(store);
+            changed |= dead.Length > 0;
             if (!changed) break;
             any = true;
         }

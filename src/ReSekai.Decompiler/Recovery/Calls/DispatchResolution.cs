@@ -1,6 +1,8 @@
 using ReSekai.Decompiler.Facts;
 using ReSekai.Decompiler.Ir;
 using ReSekai.Decompiler.Machine.Flow;
+using ReSekai.Decompiler.Machine.Storage;
+using ReSekai.Decompiler.Recovery.Memory;
 using ReSekai.Decompiler.Recovery.Typing;
 using ReSekai.Decompiler.Recovery.Values;
 
@@ -13,9 +15,9 @@ namespace ReSekai.Decompiler.Recovery.Calls;
 /// </summary>
 internal static class DispatchResolution
 {
-    public static int Run(MachineFunction function, ValueModel values, TypeOracle oracle)
+    public static int Run(MachineFunction function, ValueModel values, TypeOracle oracle, Func<Call, CallShape> shapes, ManagedAbi abi)
     {
-        var targets = Find(function, values, oracle);
+        var targets = Find(function, values, oracle, shapes, abi);
         foreach (var block in function.Blocks)
             for (var i = 0; i < block.Statements.Count; i++)
                 if (block.Statements[i] is Call call && targets.TryGetValue(call.Site, out var method))
@@ -24,9 +26,11 @@ internal static class DispatchResolution
     }
 
     /// <summary>只读发现调用目标；事实与图改写分开，供内存与分派共同求解。</summary>
-    public static IReadOnlyDictionary<CallSite, MethodRef> Find(MachineFunction function, ValueModel values, TypeOracle oracle)
+    public static IReadOnlyDictionary<CallSite, MethodRef> Find(MachineFunction function, ValueModel values, TypeOracle oracle,
+        Func<Call, CallShape> shapes, ManagedAbi abi)
     {
         var targets = new Dictionary<CallSite, MethodRef>();
+        FrameModel? frame = null;
         foreach (var call in function.Blocks.SelectMany(b => b.Statements).OfType<Call>().Where(c => c.Resolved is null))
         {
             MethodRef? method = call.Op switch
@@ -35,12 +39,46 @@ internal static class DispatchResolution
                 { Kind: OpKind.CallMethodPointer } => MethodPointer(values.Operands(call)[0]),
                 { Kind: OpKind.CallDelegate, Operand: MethodRef invoke } => invoke,
                 { Kind: OpKind.CallInterface, Operand: ValueTuple<object?, int> { Item1: DefinitionRef itf } pair } => Slot(itf, pair.Item2, interfaceOnly: true),
-                { Kind: OpKind.CallVirtual, Operand: int slot } when Receiver(call, values) is { } receiver => VirtualSlot(oracle.TypeOf(receiver), slot, oracle.Types, oracle.Substitute),
+                { Kind: OpKind.CallVirtual, Operand: int slot } when Receiver(call, values) is { } receiver =>
+                    VirtualSlot(oracle.TypeOf(receiver) ?? BufferedReceiver(receiver), slot, oracle.Types, oracle.Substitute),
                 _ => null,
             };
             if (method is not null) targets.Add(call.Site, method);
         }
         return targets;
+
+        // 接收者取自刚返回的结构体时，先按已知返回签名定位字段，避免未知分派让同一帧槽提前逃逸。
+        TypeRef? BufferedReceiver(Sym receiver)
+        {
+            if (SymTable.Resolve(receiver) is not ReadSym { Width: 64 } read
+                || SymTable.Resolve(read.Address) is not LocalSym { Space.Kind: LocalKind.Frame, Offset: < 0 and var offset })
+                return null;
+            frame ??= new FrameModel(function, new CallMemoryEffects(shapes, abi));
+            var block = values.BlockOf(read.Site);
+            var index = block.Statements.IndexOf(read.Site);
+            if (index < 0) return null;
+            var visited = new HashSet<Block>();
+            while (visited.Add(block) && visited.Count <= 12)
+            {
+                for (var i = index - 1; i >= 0; i--)
+                {
+                    var statement = block.Statements[i];
+                    if (statement is Call call && shapes(call) is { Signature.Return: { Transfer: Transfer.ResultBuffer, Size: > 0 } buffer, Candidates.Count: > 0 } shape
+                        && call.ArgumentIndex(buffer.Pieces[0].Register) is >= 0 and var position
+                        && call.Arguments[position] is FrameAddress start && start.Offset <= offset && offset + 8 <= start.Offset + buffer.Size)
+                    {
+                        if (shape.Candidates.Any(m => !m.Concrete(m.Method.ReturnType).Equals(buffer.Type))) return null;
+                        var field = oracle.FieldAt(buffer.Type, checked((int)(offset - start.Offset)) + RuntimeLayout.ObjectHeaderSize, 64, false, false);
+                        return field?.Type is { } type && ManagedTypes.IsReferenceType(type) ? type : null;
+                    }
+                    if (frame.MayWrite(statement, offset, 8)) return null;
+                }
+                if (block.Predecessors is not [var previous] || !previous.NormalSuccessors.Contains(block)) break;
+                block = previous;
+                index = block.Statements.Count;
+            }
+            return null;
+        }
     }
 
     /// <summary>符号求值已确定 MethodInfo 时，偏移零的 methodPointer 读取指向该方法。</summary>

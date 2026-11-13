@@ -5,7 +5,8 @@ internal static class ReadOnlyDataPass
 {
     internal static void ReadOnlyData(this IdiomState state)
     {
-        if (!ReadOnlyDataNormalizer.Run(state.function, state.facts.Model.Image, address => state.facts.Usages.At(address)?.Usage.Kind is UsageKind.StringLiteral or UsageKind.MethodDef or UsageKind.MethodRef))
+        if (!ReadOnlyDataNormalizer.Run(state.function, state.facts.Model.Image, address => state.facts.Usages.At(address)?.Usage.Kind
+            is UsageKind.StringLiteral or UsageKind.MethodDef or UsageKind.MethodRef or UsageKind.TypeInfo))
             return;
         state.Cleanup();
         if (state.MetadataSlotPhis())

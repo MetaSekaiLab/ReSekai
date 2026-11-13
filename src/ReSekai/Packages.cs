@@ -24,6 +24,39 @@ sealed class Packages
         scriptMap = data.RootElement.GetProperty("scripts").EnumerateArray().Select(p => p.Clone()).ToArray();
     }
 
+    public string? WriteManagedRuntime(string assembly, Output output)
+    {
+        if (assembly != "System.Runtime.CompilerServices.Unsafe" || Assemblies.ContainsKey(assembly)) return null;
+        string folder = $"Assets/Plugins/{assembly}";
+        string dll = $"{folder}/{assembly}.dll";
+        Write("dll", dll);
+        Write("LICENSE.TXT", $"{folder}/LICENSE.txt");
+        Write("THIRD-PARTY-NOTICES.TXT", $"{folder}/THIRD-PARTY-NOTICES.txt");
+        output.Meta(dll, Output.Guid("managed-plugin:" + assembly), "PluginImporter",
+            """
+              serializedVersion: 2
+              isExplicitlyReferenced: 0
+              validateReferences: 1
+              platformData:
+              - first:
+                  Any:
+                second:
+                  enabled: 1
+                  settings: {}
+
+            """);
+        return $"NuGet {assembly}@6.0.0";
+
+        void Write(string resource, string path)
+        {
+            using Stream input = typeof(Packages).Assembly.GetManifestResourceStream("Unsafe." + resource)
+                ?? throw new InvalidDataException($"缺少托管插件资源：{resource}");
+            using MemoryStream bytes = new();
+            input.CopyTo(bytes);
+            output.Write(path, bytes.ToArray());
+        }
+    }
+
     public async Task Prepare(Options options, ProgramModel model, Output output)
     {
         if (options.Upm == "none") return;

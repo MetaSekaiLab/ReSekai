@@ -7,7 +7,8 @@ namespace ReSekai.Decompiler.Output;
 public static class SourceProject
 {
     public static int Write(string assemblyPath, string searchDirectory, string output,
-        Func<ICSharpCode.Decompiler.TypeSystem.ITypeDefinition, bool> include, IDecompileTransformProvider? transforms = null, Func<string>? stubs = null, int jobs = 1)
+        Func<ICSharpCode.Decompiler.TypeSystem.ITypeDefinition, bool> include, IDecompileTransformProvider? transforms = null, Func<string>? stubs = null, int jobs = 1,
+        bool exposeSelectedAnonymousTypes = false)
     {
         using var module = ModuleDefinition.ReadModule(assemblyPath);
         var directory = Path.Combine(output, FileName(Path.GetFileName(assemblyPath)));
@@ -16,7 +17,8 @@ public static class SourceProject
         SourceReferences.Prepare(assemblyPath, searchDirectory, references);
         var paths = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         var count = 0;
-        foreach (var source in Decompilation.Decompile(Path.Combine(references, Path.GetFileName(assemblyPath)), references, include, true, groupByName: true, transforms: transforms, stubs: stubs, jobs: jobs))
+        foreach (var source in Decompilation.Decompile(Path.Combine(references, Path.GetFileName(assemblyPath)), references, include, true,
+            groupByName: true, transforms: transforms, stubs: stubs, jobs: jobs, exposeSelectedAnonymousTypes: exposeSelectedAnonymousTypes))
         {
             var relative = source.TypeName is null ? Path.Combine("Properties", "AssemblyInfo.cs")
                 : Path.Combine(source.Namespace.Length == 0 ? "" : FileName(source.Namespace),

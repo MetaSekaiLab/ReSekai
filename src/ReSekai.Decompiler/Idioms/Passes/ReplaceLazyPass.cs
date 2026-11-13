@@ -16,7 +16,9 @@ internal static class ReplaceLazyPass
             {
                 if (block.Statements[i] is not Call call || !calls.TryGetValue(call, out var value))
                     continue;
-                if (call.Defines.FirstOrDefault() is { } result)
+                if (call.Kind == CallKind.Tail)
+                    block.Statements[i] = new Return(call.Address) { Pieces = [new(0, value)] };
+                else if (call.Defines.FirstOrDefault() is { } result)
                     block.Statements[i] = new Define(call.Address, result, value);
                 else
                     block.Statements[i] = new Nop(call.Address, "InitMetadata");

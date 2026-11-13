@@ -9,23 +9,37 @@ namespace ReSekai.Decompiler.Idioms;
 internal static class SharedInterfaceTails
 {
     /// <summary>接口查找、虚表读取或委托的 invoke_impl 在同一间接调用前合流时，把调用放回对应的入边。尾合并可以多层，入边的值可能又是上一层的 φ。</summary>
-    internal static bool SplitInvokes(MachineFunction function, Func<Expr, Expr> expand)
+    internal static bool SplitInvokes(MachineFunction function, Func<Expr, Expr> expand, Func<Call, bool> isLookup)
     {
-        var data = function.Blocks.SelectMany(b => b.Statements).OfType<Call>()
-            .Where(c => c.Op?.Kind == OpKind.InterfaceInvokeData).SelectMany(c => c.Defines).ToHashSet();
+        var calls = function.Blocks.SelectMany(b => b.Statements).OfType<Call>().ToArray();
+        var data = calls.Where(c => c.Op?.Kind == OpKind.InterfaceInvokeData).SelectMany(c => c.Defines).ToHashSet();
+        var raw = calls.Where(isLookup).SelectMany(c => c.Defines).ToHashSet();
         var joins = function.Blocks.SelectMany(b => b.Statements).OfType<Phi>().ToDictionary(p => p.Target);
+        bool RawLookupPointer(Variable variable) => expand(new Use(variable, variable.Width)) is Load { Width: 64, Address: Use lookup }
+            && raw.Contains(lookup.Variable);
         bool Pointer(Variable variable) => JoinedPointer(variable, []);
         bool JoinedPointer(Variable variable, HashSet<Variable> visited)
         {
             if (joins.TryGetValue(variable, out var join)) return !visited.Add(variable) || join.Sources.All(source => JoinedPointer(source, visited));
             if (expand(new Use(variable, variable.Width)) is not Load { Width: 64 } load) return false;
-            if (load.Address is Use address && data.Contains(address.Variable)) return true;
+            if (load.Address is Use address && (data.Contains(address.Variable) || raw.Contains(address.Variable))) return true;
             var terms = TermsPass.Terms(load.Address).ToArray();
             var offset = terms.OfType<Const>().Aggregate(0UL, (sum, c) => sum + c.Value);
             if (offset == RuntimeLayout.DelegateInvokeImpl && terms.Count(e => e is not Const) == 1) return true;
-            return terms.Where(e => e is not Const).ToArray() is [Load { Width: 64 }]
-                && offset >= RuntimeLayout.ClassVtable && (offset - RuntimeLayout.ClassVtable) % RuntimeLayout.VirtualInvokeDataSize == 0;
+            if (offset < RuntimeLayout.ClassVtable || (offset - RuntimeLayout.ClassVtable) % RuntimeLayout.VirtualInvokeDataSize != 0) return false;
+            var operands = terms.Where(e => e is not Const).ToArray();
+            if (operands is [Load { Width: 64 }]) return true;
+            // 查找仍有快、慢两路时，快路径的槽位是从接口偏移表读出的动态值。
+            // 这里只拆分调用尾部；接口身份仍由后续规则核验。
+            return operands.Length == 2 && operands.Any(ClassLoad)
+                && operands.Any(e => e is Binary { Op: BinOp.Shl, Right: Const { Value: 4 } } slot
+                    && ExprMap.Walk(slot.Left).Any(p => p is Load { Width: 32 } || p is Use use
+                        && expand(use) is Load { Width: 32 } or Ir.Convert { Operand: Load { Width: 32 } }));
         }
+
+        bool ClassLoad(Expr value) => value is Load { Width: 64 }
+            || value is Use use && joins.TryGetValue(use.Variable, out var classes)
+                && classes.Sources.All(v => expand(new Use(v, 64)) is Load { Width: 64 });
         bool MergedClass(Block merge, Expr target)
         {
             if (expand(target) is not Load { Width: 64 } load) return false;
@@ -39,7 +53,8 @@ internal static class SharedInterfaceTails
         return ReSekai.Decompiler.Machine.Ssa.TailDuplication.Run(function, merge =>
             merge.Statements.OfType<Call>().Any(call => call is { Op: null, Kind: CallKind.Indirect or CallKind.TailIndirect }
                 && (call.Target is Use target && merge.Statements.OfType<Phi>().FirstOrDefault(p => p.Target == target.Variable) is { } pointer
-                    && pointer.Sources.All(Pointer) || MergedClass(merge, call.Target))));
+                    // 同一次查找的命中和慢路径必须保持合流，由接口规则一起核验。
+                    && !pointer.Sources.Any(RawLookupPointer) && pointer.Sources.All(Pointer) || MergedClass(merge, call.Target))));
     }
 
     internal static bool Run(MachineFunction function, Func<Call, bool> isLookup, Func<int, Variable> fresh)

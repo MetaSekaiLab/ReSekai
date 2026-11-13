@@ -20,7 +20,7 @@ public sealed record FieldAccessor(MethodRef Method, FieldRef Field, TypeRef Val
             || !Write && ManagedTypes.IsReferenceType(ValueType)
                 && types.IsAssignable(ValueType, Method.Concrete(Method.Method.ReturnType)))
         && (value is StaticFieldValue ? Method.Method.IsStatic : value is FieldValue f && (ReceiverParameter
-            ? !write && Method.Method.Parameters.Count == 1 && types.IsAssignable(f.Receiver.Type, Method.Method.Parameters[0].Type)
+            ? !write && Method.Method.Parameters.Count == 1 && types.IsAssignable(f.Receiver.Type, Method.Concrete(Method.Method.Parameters[0].Type))
             : !Method.Method.IsStatic && (types.IsAssignable(f.Receiver.Type, Method.DeclaringType)
                 || Method.Method.Owner.IsValueType && f.Receiver.Type is ByRefRef { Element: var element } && element.Equals(Method.DeclaringType))))
         && ManagedAccess.Method(types, caller, Method, Method.Method.IsStatic ? null : ReceiverType(value));

@@ -159,6 +159,11 @@ internal static class PathSplitting
                 break;
             case Call call:
                 yield return operands[0];
+                if (oracle.Callee(call) is { Method: { Name: ".ctor", IsStatic: false } }
+                    && call.ArgumentIndex(Storage.Gpr(0)) is >= 0 and var receiver
+                    && SymTable.Resolve(operands[receiver + 1]) is PhiSym construction
+                    && construction.Sources.All(s => s is not null && SymTable.Resolve(s) is ResultSym { Site.Op.Kind: OpKind.NewObject }))
+                    yield return construction;
                 // 没有解析的间接调用：目标从 φ 选出的对象上读取时也按路径处理（不同类型的委托合流后共用一次调用）。
                 if (call is { Op: null, Resolved: null, Kind: CallKind.Indirect or CallKind.TailIndirect })
                     foreach (var read in Reads(operands[0]))
@@ -270,6 +275,11 @@ internal static class PathSplitting
     private static bool Distinct(Sym sym, Block block, TypeOracle oracle)
     {
         var root = Root(SymTable.Resolve(sym));
+        // 不同类型的数组可以共用同一条元素访问指令；拆分后各边仍使用原下标和步长。
+        if (oracle.Decompose(sym) is (PhiSym arrays, Facts.RuntimeLayout.ArrayData, not null, _)
+            && ReferenceEquals(arrays.Block, block) && arrays.Sources.All(s => s is not null && oracle.TypeOf(s) is ArrayRef { IsVector: true })
+            && arrays.Sources.Select(s => oracle.TypeOf(s!)).Distinct().Count() > 1)
+            return true;
         if (root is not PhiSym phi || !ReferenceEquals(phi.Block, block) || phi.Sources.Any(s => s is null)) return false;
         // 多层合流的实体选择：先拆外层，φ 随之下移到前驱，下一轮再拆。
         if (phi.Sources.Any(s => SymTable.Resolve(s!) is PhiSym) && Entities(phi, true, addresses: true) is { } entities) return entities.Count > 1;

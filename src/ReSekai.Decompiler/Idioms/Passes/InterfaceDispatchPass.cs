@@ -59,9 +59,19 @@ internal static class InterfaceDispatchPass
             // 否则慢路径一侧必须是未定义值（或该 φ 没有实际使用），合并后改为未定义值
             var overrides = new Dictionary<Variable, Variable>();
             var hoisted = new List<Stmt>();
+            var reads = new List<Stmt>();
+            var data = state.Fresh();
             var consistent = true;
             foreach (var p in phis.Where(p => p != selected[0] && regionDefined.Contains(p.Sources[hitIndex])))
             {
+                if (InvokeDataRead(state, p, selected[0], slowIndex, hitIndex) is { } offset)
+                {
+                    var value = state.Fresh(p.Target.Width);
+                    var address = Fold.Simplify(new Binary(BinOp.Add, new Use(data, 64), Expr.C(offset, 64), 64));
+                    reads.Add(new Define(call.Address, value, new Load(address, 64)));
+                    overrides[p.Target] = value;
+                    continue;
+                }
                 if (SameInBothArms(state, p, slowIndex, hitIndex, regionDefined) is { } same)
                 {
                     var value = state.Fresh(p.Target.Width);
@@ -97,7 +107,6 @@ internal static class InterfaceDispatchPass
                 continue;
             var iface = state.defs.Expand(call.Arguments[1]);
             var operand = (iface is Symbol { Kind: SymbolKind.Class } c ? c.Value : null, (int)slot.Value);
-            var data = state.Fresh();
             var op = new Call(call.Address, CallKind.Direct, call.Target)
             {
                 Op = new RuntimeOp(OpKind.InterfaceInvokeData, operand),
@@ -109,7 +118,7 @@ internal static class InterfaceDispatchPass
             if (state.recording && state.Location(target, head, at) is { } objectAt && state.Location(iface, head, at) is { } ifaceAt && selected[0].Target.Storage.Bank == Bank.Gpr)
                 state.Record(Template.InterfaceDispatch, head, at, new() { ["merge"] = merge.Start }, new() { ["object"] = objectAt, ["interface"] = ifaceAt, ["slot"] = slot.Value, ["result"] = $"x{selected[0].Target.Storage.Index}", ["helper"] = ((Const)call.Target).Value, });
             overrides[selected[0].Target] = data;
-            CollapsePass.Collapse(head, merge, hit, [.. hoisted, op], overrides, call.Address);
+            CollapsePass.Collapse(head, merge, hit, [.. hoisted, op, .. reads], overrides, call.Address);
             state.Remove(region);
             state.interfaceData[data] = operand;
             state.Result.Hit(Template.InterfaceDispatch);
@@ -119,13 +128,31 @@ internal static class InterfaceDispatchPass
         return changed;
     }
 
+    /// <summary>两臂读取同一个调用数据字段时，改为从归一后的调用数据读取。</summary>
+    private static ulong? InvokeDataRead(IdiomState state, Phi value, Phi data, int slowIndex, int hitIndex)
+    {
+        if (value.Target.Width != 64) return null;
+        var slow = state.defs.Expand(new Use(value.Sources[slowIndex], 64));
+        var hit = state.defs.Expand(new Use(value.Sources[hitIndex], 64));
+        if (slow is not Load { Width: 64 } slowLoad || hit is not Load { Width: 64 } hitLoad) return null;
+        var slowBase = state.defs.Expand(new Use(data.Sources[slowIndex], 64));
+        var hitBase = state.defs.Expand(new Use(data.Sources[hitIndex], 64));
+        if (slowLoad.Address == slowBase && hitLoad.Address == hitBase) return 0;
+        const ulong methodInfo = RuntimeLayout.VirtualInvokeDataMethod;
+        return AtMethodInfo(slowLoad.Address, slowBase) && AtMethodInfo(hitLoad.Address, hitBase) ? methodInfo : null;
+
+        static bool AtMethodInfo(Expr address, Expr source) =>
+            address == Fold.Simplify(new Binary(BinOp.Add, source, Expr.C(methodInfo, 64), 64));
+    }
+
     /// <summary>φ 的两侧展开后是同一个不读内存、只依赖区域之外的值的表达式时返回它；查找本身不改变这样的值，所以与走哪一臂无关。</summary>
     private static Expr? SameInBothArms(IdiomState state, Phi phi, int slowIndex, int hitIndex, HashSet<Variable> regionDefined)
     {
-        var value = state.defs.Expand(new Use(phi.Sources[hitIndex], phi.Target.Width));
-        if (state.defs.Expand(new Use(phi.Sources[slowIndex], phi.Target.Width)) != value) return null;
+        // 区域外定义的值已经求过，提到查找前时只读取 SSA 快照。
+        var value = state.defs.Expand(new Use(phi.Sources[hitIndex], phi.Target.Width), within: regionDefined.Contains);
+        if (state.defs.Expand(new Use(phi.Sources[slowIndex], phi.Target.Width), within: regionDefined.Contains) != value) return null;
         foreach (var part in ExprMap.Walk(value))
-            if (part is Load || part is Use use && regionDefined.Contains(use.Variable)) return null;
+            if (part is Load or Intrinsic or Unknown || part is Use use && regionDefined.Contains(use.Variable)) return null;
         return value;
     }
 }

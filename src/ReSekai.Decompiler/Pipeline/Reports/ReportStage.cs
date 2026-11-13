@@ -82,6 +82,7 @@ internal static class ReportStage
                     bytes = bytes[result.Entry],
                     dependency = dependencies.Contains(result.Method.Method),
                     bodySource = result.Declaration is not null ? "runtime-declaration" : result.Body is null ? null : bodySource(result),
+                    referenceSource = result.ReferenceSource,
                     declaration = result.Declaration?.ToString(),
                     platformImport = result.PlatformImport,
                     accessorProof = accessorProof(result),

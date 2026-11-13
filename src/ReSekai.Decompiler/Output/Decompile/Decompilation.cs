@@ -54,13 +54,13 @@ public static partial class Decompilation
         decompiler.AstTransforms.Add(new MemberTokens());
         decompiler.AstTransforms.Add(new NullConditionalReceivers());
         decompiler.AstTransforms.Add(new ReferenceNullTests());
-        decompiler.AstTransforms.Add(new EscapeInvalidIdentifiers());
         decompiler.AstTransforms.Add(new RemoveCLSCompliantAttribute());
         decompiler.AstTransforms.Add(new StrippedMathConstants());
         decompiler.AstTransforms.Add(new WritableUnboxing());
         decompiler.AstTransforms.Add(new TupleInitializers());
         decompiler.AstTransforms.Add(new InaccessibleAttributes());
         decompiler.AstTransforms.Add(new ExternalTypeNames());
+        decompiler.AstTransforms.Add(new EscapeInvalidIdentifiers());
         decompiler.AstTransforms.Add(new InterfaceTupleNames());
         decompiler.AstTransforms.Add(new ExplicitAccessors());
         decompiler.AstTransforms.Add(new ForwardingImplementations());
@@ -122,7 +122,8 @@ public static partial class Decompilation
     /// 依赖从 <paramref name="searchDirectory"/> 解析。共享一个类型系统，默认逐类型串行处理。
     /// </summary>
     public static IReadOnlyList<SourceFile> Decompile(string assemblyPath, string searchDirectory, Func<ITypeDefinition, bool> include, bool assemblyAttributes,
-        bool groupByName = false, IDecompileTransformProvider? transforms = null, Func<string>? stubs = null, int jobs = 1)
+        bool groupByName = false, IDecompileTransformProvider? transforms = null, Func<string>? stubs = null, int jobs = 1,
+        bool exposeSelectedAnonymousTypes = false)
     {
         ArgumentOutOfRangeException.ThrowIfLessThan(jobs, 1);
         using var file = new PEFile(assemblyPath);
@@ -145,8 +146,14 @@ public static partial class Decompilation
             var (handles, ns, name) = types[i];
             try
             {
-                var tree = CreateDecompiler(typeSystem, settings, transforms).DecompileTypes(handles);
-                results.Add((i, new SourceFile(name, ns, Print(tree, settings))));
+                var selected = settings;
+                if (exposeSelectedAnonymousTypes && name.StartsWith("<>f__AnonymousType", StringComparison.Ordinal))
+                {
+                    selected = settings.Clone();
+                    selected.AnonymousTypes = false;
+                }
+                var tree = CreateDecompiler(typeSystem, selected, transforms).DecompileTypes(handles);
+                results.Add((i, new SourceFile(name, ns, Print(tree, selected))));
             }
             // 只有调用方提供了占位程序集才继续（--keep-going）；否则照常中断。
             catch (Exception e) when (stubs is not null)
@@ -166,7 +173,8 @@ public static partial class Decompilation
             // 反编译失败的类型退回成占位体，工程的结构仍然完整。
             var directory = stubs!();
             var wanted = failed.ToDictionary(f => (f.Namespace, f.Name), f => f.Reason);
-            foreach (var source in Decompile(Path.Combine(directory, Path.GetFileName(assemblyPath)), directory, t => wanted.ContainsKey(Named(t)), false, groupByName, transforms, jobs: jobs))
+            foreach (var source in Decompile(Path.Combine(directory, Path.GetFileName(assemblyPath)), directory, t => wanted.ContainsKey(Named(t)), false, groupByName, transforms, jobs: jobs,
+                exposeSelectedAnonymousTypes: exposeSelectedAnonymousTypes))
                 files.Add(source with { Source = $"// 反编译失败（{wanted[(source.Namespace, source.TypeName!)]}），这个类型只有占位体。\n{source.Source}" });
         }
         if (assemblyAttributes)

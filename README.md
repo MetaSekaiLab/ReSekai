@@ -11,4 +11,5 @@
 ## 引用项目
 
 - 脚本和 metadata 使用 [Cpp2CS](https://github.com/MetaMikuAI/Cpp2CS)、[Il2CppDumper](https://github.com/Perfare/Il2CppDumper)。
+- 游戏引用的 `System.Runtime.CompilerServices.Unsafe` 由同名 NuGet 包提供，导出为托管插件并附带许可证。
 - 纹理和音频使用 [TextureDecoder](https://github.com/AssetRipper/TextureDecoder)、[UnityCrunch](https://github.com/AssetRipper/AssetRipper.Conversions.Crunch)、[Fmod5Sharp](https://github.com/SamboyCoding/Fmod5Sharp)。

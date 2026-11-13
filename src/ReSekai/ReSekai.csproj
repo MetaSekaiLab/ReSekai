@@ -2,6 +2,7 @@
   <PropertyGroup>
     <OutputType>Exe</OutputType>
     <AssemblyName>resekai</AssemblyName>
+    <UnsafePackage>$(NuGetPackageRoot)system.runtime.compilerservices.unsafe/6.0.0</UnsafePackage>
   </PropertyGroup>
   <ItemGroup>
     <InternalsVisibleTo Include="ReSekai.Tests" />
@@ -12,5 +13,9 @@
     <PackageReference Include="AssetRipper.Conversions.UnityCrunch" Version="1.0.3" />
     <PackageReference Include="Fmod5Sharp" Version="3.1.0" />
     <PackageReference Include="Microsoft.Bcl.Memory" Version="10.0.12" />
+    <PackageDownload Include="System.Runtime.CompilerServices.Unsafe" Version="[6.0.0]" />
+    <EmbeddedResource Include="$(UnsafePackage)/lib/netstandard2.0/System.Runtime.CompilerServices.Unsafe.dll" LogicalName="Unsafe.dll" />
+    <EmbeddedResource Include="$(UnsafePackage)/LICENSE.TXT" LogicalName="Unsafe.LICENSE.TXT" />
+    <EmbeddedResource Include="$(UnsafePackage)/THIRD-PARTY-NOTICES.TXT" LogicalName="Unsafe.THIRD-PARTY-NOTICES.TXT" />
   </ItemGroup>
 </Project>

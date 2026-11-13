@@ -231,6 +231,7 @@ internal sealed class RegionProver(ManagedTypes types, InlineEvidence evidence, 
         public required Candidate Candidate { get; init; }
         /// <summary>模板的形参（下标 0 为 this）。</summary>
         public Term[] Formals { get; set; } = [];
+        public (Term Address, FieldValue Source, FieldRef Field, DefinitionRef Wrapper)? WrappedReceiver { get; set; }
         /// <summary>区域必须覆盖的语句（待证访问、待证构造的基类构造调用）；出口语句满足时须改写。</summary>
         public required Func<TracePoint, bool> Anchor { get; init; }
     }
@@ -316,6 +317,11 @@ internal sealed class RegionProver(ManagedTypes types, InlineEvidence evidence, 
             attempt.Solver.Reset(seed);
             attempt.Solver.Allocations.Clear();
             var path = new JointPath { A = TemplateSide(attempt), B = CallerSide(attempt, attempt.Caller, true), Phi = attempt.Entry.Phi };
+            if (round == 0 && WrappedReceiverSeed(attempt) is { } receiver)
+            {
+                seed[attempt.Formals[0]] = receiver;
+                attempt.Solver.Reset(seed);
+            }
             string? unsettled = null;
             var joint = new Joint(attempt.Interpreter, templates, JointMode.Discovery)
             {
@@ -340,6 +346,31 @@ internal sealed class RegionProver(ManagedTypes types, InlineEvidence evidence, 
             seed = next;
         }
         return null;
+    }
+
+    /// <summary>尝试在同布局的单字段包装副本上执行。入口的叶子值按底层字段位置建立，合成后仍须复核全部路径。</summary>
+    private Term? WrappedReceiverSeed(Attempt attempt)
+    {
+        var method = attempt.Candidate.Method;
+        if (attempt.Candidate.Kind != ReplacementKind.Call || method.Method.IsStatic || method.DeclaringType is not DefinitionRef wrapper
+            || types.Kind(wrapper) != TypeKind.Struct || types.Fields(wrapper).ToArray() is not [var field]
+            || field.Bit != 0 || field.Width != types.StorageBits(wrapper) || field.Type is not DefinitionRef inner
+            || types.Kind(inner) != TypeKind.Struct) return null;
+        var candidates = attempt.Caller.Blocks[attempt.Block].Statements.Skip(attempt.Index).Take(3)
+            .SelectMany(ManagedValues.Of).OfType<FieldValue>().Select(f => f.Receiver).OfType<FieldValue>()
+            .Where(f => f.Type.Equals(inner)).Distinct().ToArray();
+        if (candidates is not [var source] || attempt.Entry.Evaluate(new AddressValue(source)) is not { Kind: TermKind.Address } address) return null;
+        var terms = attempt.Terms;
+        var variable = newLocal(wrapper);
+        var cell = terms.CellRoot(0, variable.Variable, FieldPath.Empty);
+        foreach (var leaf in attempt.Interpreter.Leaves(inner))
+        {
+            var original = terms.Append(address.Location, leaf.Path);
+            var copy = terms.Append(cell, terms.Concat(terms.Path(field.Path), leaf.Path));
+            terms.Know(copy, terms.Read(0, original, leaf.Width, leaf.Bit));
+        }
+        attempt.WrappedReceiver = (terms.Address(cell), source, field.Path[0], wrapper);
+        return attempt.WrappedReceiver.Value.Address;
     }
 
     /// <summary>形参的缩窄：失败路径的条件里只含未绑定形参的文字，取使它不成立的常量。</summary>
@@ -1019,7 +1050,8 @@ internal sealed class RegionProver(ManagedTypes types, InlineEvidence evidence, 
         if (!definition.IsStatic && candidate.Kind == ReplacementKind.Call)
         {
             var bound = attempt.Solver.Apply(attempt.Formals[0]);
-            if (bound.HasFormal || Reify(attempt, before, bound, null) is not { } self) { failure = "接收者不能写回"; return null; }
+            if (bound.HasFormal || (ConstructWrappedReceiver(attempt, before, bound) ?? Reify(attempt, before, bound, null) ?? CopyReceiver(attempt, before, bound, method)) is not { } self)
+            { failure = "接收者不能写回"; return null; }
             receiver = self;
         }
         if (candidate.Kind == ReplacementKind.BaseConstructor) receiver = new ArgumentValue(-1, caller.Method.DeclaringType, 64);
@@ -1154,6 +1186,26 @@ internal sealed class RegionProver(ManagedTypes types, InlineEvidence evidence, 
         else statements.Add(new ManagedJump(at, edges[0]));
         var blocks = caller.Body.Blocks.Select(b => b.Address == attempt.Block ? new ManagedBlock(b.Address, statements) : b).ToList();
         return Prune(caller.Body with { Blocks = blocks });
+    }
+
+    private ManagedValue? ConstructWrappedReceiver(Attempt attempt, Moment before, Term bound)
+    {
+        if (attempt.WrappedReceiver is not { } wrapped || !ReferenceEquals(wrapped.Address, bound)
+            || ValueConstruction?.Invoke(wrapped.Wrapper, [([wrapped.Field], wrapped.Source)]) is not { } construction) return null;
+        var local = newLocal(wrapped.Wrapper);
+        before.Prelude!.Add(new ManagedAssignment(before.At, local, new NewObjectValue(construction.Constructor, construction.Arguments) { Transparent = true }));
+        return new AddressValue(local);
+    }
+
+    /// <summary>经按值访问器读到的结构体先保存在局部，再以局部的地址调用。复核比较写入和异常，拒绝改变原位置的调用。</summary>
+    private ManagedValue? CopyReceiver(Attempt attempt, Moment before, Term bound, MethodRef method)
+    {
+        if (bound.Kind != TermKind.Address || !method.Method.Owner.IsValueType
+            || Location(attempt, before, bound.Location) is not { } value || !value.Type.Equals(method.DeclaringType)
+            || value is not (FieldValue { Accessor: not null } or StaticFieldValue { Accessor: not null })) return null;
+        var local = newLocal(value.Type);
+        before.Prelude!.Add(new ManagedAssignment(before.At, local, value));
+        return new AddressValue(local);
     }
 
     /// <summary>轨迹中第一个事件语句处局部的值；没有事件时为 null。</summary>
@@ -1471,7 +1523,7 @@ internal sealed class RegionProver(ManagedTypes types, InlineEvidence evidence, 
             .Select(b => b.Address));
         if (Introduced(oldProgram, newProgram, unchanged) is { } unfaithful) return unfaithful;
         var solver = new Solver(attempt.Terms, types);
-        var interpreter = new Interpreter(types, solver, evidence) { Meter = attempt.Interpreter.Meter };
+        var interpreter = new Interpreter(types, solver, evidence) { Meter = attempt.Interpreter.Meter, SplitFieldAliases = true };
         var validation = new Attempt
         {
             Terms = attempt.Terms, Solver = solver, Interpreter = interpreter, Entry = attempt.Entry, Caller = oldProgram, Block = attempt.Block,

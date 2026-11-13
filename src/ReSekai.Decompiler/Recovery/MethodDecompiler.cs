@@ -31,7 +31,7 @@ public sealed record MethodAnalysis(MethodRef Method, ulong Entry, MachineSignat
 /// 单个托管方法的恢复入口：签名 → 提升 → L2 → 符号值 → 类型 → 下降。
 /// 实例不是线程安全的，并行时每个线程各用一个。
 /// </summary>
-public sealed class MethodDecompiler
+public sealed partial class MethodDecompiler
 {
     private readonly ProgramFacts facts;
     private readonly ManagedTypes types;
@@ -156,6 +156,7 @@ public sealed class MethodDecompiler
     public MethodRecoveryResult SourceForm(MethodRecoveryResult result)
     {
         RecoveryCancellation.Check();
+        if (result.Body is null && RestoreReferenceSource(result) is { } restored) return restored;
         var formed = ControlForm(result);
         if (formed.Body is not { } body) return formed;
         var shared = SharedValues.Run(body, types, out var extracted);
@@ -274,16 +275,22 @@ public sealed class MethodDecompiler
         CleanupCalls.Run(function, address => facts.Helpers.At(address)?.Kind == HelperKind.Unknown
             ? native.CleanupThunk(address, method.Method.Owner) : null);
         ExceptionNormalization.Run(function, ExceptionFacts.WrapperWithoutDestructor(facts.Checks));
+        // 同一异常处理体的落地跳板收缩后，才能证明类型检查与拆箱的异常去向一致。
+        if (function.Range.ExceptionRegions.Length != 0 && UnboxGuardsPass.Run(function, new IdiomRewriter.Defs(function))
+            && ReSekai.Decompiler.Machine.Ssa.Lowering.Cleanup(function) is [var unboxError, ..])
+            return RecoveryDiagnostics.Fail(entry, $"L2 {unboxError}", rule: "UnboxGuards");
         var environment = new MethodEnvironment(method, signature, shapes);
         var splits = PathSplitting.Run(function, f => ValueModel.Build(f, environment),
             v => new TypeOracle(types, facts, method, environment.Shape, v), lifter.Calls, lifter.Machine.Convention.StackPointer, rewriter.RecognizeSplitTypeChecks);
-        InvokerCallsPass.AfterSplitting(function, method, rewriter);
+        var beforeInvokers = ValueModel.Build(function, environment);
+        var invokerTypes = new TypeOracle(types, facts, method, environment.Shape, beforeInvokers);
+        InvokerCallsPass.AfterSplitting(function, method, rewriter, RootType(invokerTypes, beforeInvokers));
         // 分派在内存提升之前解析，使经指针的调用效果有签名可依。
         var preliminary = ValueModel.Build(function, environment);
         // 路径拆分后才唯一确定的接收者。
         if (StackBoxingPass.Run(function, new CallMemoryEffects(environment.Shape, abi), environment.Shape, abi.Size, FreshTemporaries(function)))
             preliminary = ValueModel.Build(function, environment);
-        DispatchResolution.Run(function, preliminary, new TypeOracle(types, facts, method, environment.Shape, preliminary));
+        DispatchResolution.Run(function, preliminary, new TypeOracle(types, facts, method, environment.Shape, preliminary), environment.Shape, abi);
         // 每轮从稳定输入构建分析图，只累积已证明的调用目标，不回滚生产语句和 SSA。
         var prepared = function;
         var targets = new Dictionary<CallSite, MethodRef>();
@@ -300,15 +307,24 @@ public sealed class MethodDecompiler
             environment.Layout = layout;
             var promoted = ValueModel.Build(function, environment);
             var promotedOracle = new TypeOracle(types, facts, method, environment.Shape, promoted, layout);
-            var discovered = DispatchResolution.Find(function, promoted, promotedOracle).ToDictionary();
+            var discovered = DispatchResolution.Find(function, promoted, promotedOracle, environment.Shape, abi).ToDictionary();
             foreach (var (site, invoke) in DelegateCallNormalizer.Discover(facts, function, RootType(promotedOracle, promoted)))
                 discovered.TryAdd(site, invoke);
+            foreach (var (site, copy) in FindLocalCopies(function, promoted, promotedOracle, method))
+                discovered.TryAdd(site, copy);
             if (discovered.Count == 0) break;
             foreach (var (site, target) in discovered) targets.Add(site, target);
         }
         // 活动异常栈的长度字段提升之后才是 SSA 值：栈顶可以按路径求出，读完之后 push 不再被观察。
         // 读取换掉之后，下标地址的定义要清理掉，下一轮才能确认 push 没人读。
-        for (var round = 0; round < 3 && (ExceptionStackValues.TopValues(function, new CallMemoryEffects(environment.Shape, abi, settled: true), FreshTemporaries(function)) | ExceptionStackValues.Run(function)); round++)
+        var exceptionMemory = new CallMemoryEffects(environment.Shape, abi, settled: true);
+        for (var round = 0; round < 4 && ExceptionPathPruning.Run(function); round++)
+        {
+            if (ReSekai.Decompiler.Machine.Ssa.Lowering.Cleanup(function) is [var pathError, ..])
+                return RecoveryDiagnostics.Fail(entry, $"L2 {pathError}", rule: "ExceptionPath");
+        }
+        for (var round = 0; round < 3 && (ExceptionStackValues.TopValues(function, exceptionMemory, FreshTemporaries(function))
+            | ExceptionStackValues.Run(function) | Machine.Storage.FrameForwarding.Run(function, exceptionMemory)); round++)
         {
             var errors = ReSekai.Decompiler.Machine.Ssa.Lowering.Cleanup(function);
             if (errors.Count > 0) return RecoveryDiagnostics.Fail(entry, $"L2 {errors[0]}", rule: "ExceptionStack");
@@ -320,6 +336,9 @@ public sealed class MethodDecompiler
             if (errors.Count > 0) return RecoveryDiagnostics.Fail(entry, $"L2 {errors[0]}", rule: "StackGuard");
         }
         ExceptionNormalization.Run(function, ExceptionFacts.WrapperWithoutDestructor(facts.Checks));
+        // 仅在落地路径使用的栈写入消失后，初始化守卫的两条正常边才可能等价。
+        if (EmptyArmBranches.Run(function) && ReSekai.Decompiler.Machine.Ssa.Lowering.Cleanup(function) is [var branchError, ..])
+            return RecoveryDiagnostics.Fail(entry, $"L2 {branchError}", rule: "EmptyArmBranches");
         environment.Layout = layout;
         var values = ValueModel.Build(function, environment);
         var oracle = new TypeOracle(types, facts, method, environment.Shape, values, layout);

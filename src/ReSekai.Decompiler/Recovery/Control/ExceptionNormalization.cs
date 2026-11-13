@@ -31,7 +31,12 @@ internal static class ExceptionNormalization
                 MachineFunction.RemoveEdgeAt(block, block.Successors.Count - 1);
         if (wrapperWithoutDestructor)
             foreach (var block in function.Blocks)
-                block.Statements.RemoveAll(s => s is Call { Op.Kind: OpKind.EndCatch, Defines.Length: 0 });
+                for (var i = block.Statements.Count - 1; i >= 0; i--)
+                    if (block.Statements[i] is Call { Op.Kind: OpKind.EndCatch, Defines.Length: 0 } end)
+                    {
+                        if (end.Kind == CallKind.Tail) block.Statements[i] = new Return(end.Address);
+                        else block.Statements.RemoveAt(i);
+                    }
         // selector 常量先折叠分支，再收缩落地链：收缩把链上的常量移到各抛出点，之后不再参与折叠。
         Machine.Ssa.Lowering.Cleanup(function);
         while (FoldBranches(function))

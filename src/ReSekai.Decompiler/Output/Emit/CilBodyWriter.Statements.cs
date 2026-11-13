@@ -26,12 +26,16 @@ internal sealed partial class CilBodyWriter
                 var initialization = Instruction.Create(OpCodes.Initobj, TypeReference(i.Type));
                 il.Append(initialization); ExplicitInitializations.Add(initialization); break;
             case ManagedStore { Target: IndirectValue i } s:
-                Value(i.Address); Value(s.Value); il.Emit(OpCodes.Stobj, TypeReference(i.Type)); break;
+                Value(i.Address); Value(s.Value); IndirectAlignment(i); il.Emit(OpCodes.Stobj, TypeReference(i.Type)); break;
             // 结构体字段清零写成 ldflda; initobj，和 C# 编译器一样；反编译器认状态机清理被提升的局部时只认这个写法。
             case ManagedStore { Target: FieldValue { Accessor: null } f, Value: ComposedValue { Leaves.Count: 0 } }:
                 Value(f.Receiver); il.Emit(OpCodes.Ldflda, FieldReference(f.Field)); il.Emit(OpCodes.Initobj, TypeReference(f.Type)); break;
             case ManagedStore { Target: FieldValue f } s:
-                Value(f.Receiver); Value(s.Value);
+                // 值类型的 setter 接收原存储的地址，才能把写入保留在该字段中。
+                if (f.Accessor is { Method.Method.Owner.IsValueType: true } && f.Receiver.Type is not ByRefRef)
+                    Address(f.Receiver);
+                else Value(f.Receiver);
+                Value(s.Value);
                 if (f.Accessor is { } setter) AccessorCall(setter); else il.Emit(OpCodes.Stfld, FieldReference(f.Field)); break;
             case ManagedStore { Target: StaticFieldValue f } s:
                 Value(s.Value);
@@ -116,19 +120,50 @@ internal sealed partial class CilBodyWriter
         {
             var method = new MethodDefinition(name, MethodAttributes.Public | MethodAttributes.Static | MethodAttributes.HideBySig, returns);
             method.Parameters.Add(new ParameterDefinition("address", ParameterAttributes.None, TypeReference(types.UInt64)));
-            var processor = method.Body.GetILProcessor();
-            processor.Emit(OpCodes.Ldnull); processor.Emit(OpCodes.Throw);
             type.Methods.Add(method);
             return method;
         }
+        var exception = TypeReference(types.Corlib("System.Exception"));
+        var fail = Method("Fail", exception);
+        var timeOut = Method("TimeOut", exception);
+        ExceptionFactory(fail, "System.InvalidOperationException", "Unrecovered IL2CPP code at 0x");
+        ExceptionFactory(timeOut, "System.TimeoutException", "IL2CPP recovery timed out at 0x");
+
         var value = Method("Value", TypeReference(types.Object));
         var parameter = new GenericParameter("T", value);
         value.GenericParameters.Add(parameter);
         value.ReturnType = parameter;
-        var exception = TypeReference(types.Corlib("System.Exception"));
-        var created = (Method("At", TypeReference(types.Corlib("System.Void"))), Method("Fail", exception), value, Method("TimeOut", exception));
+        var at = Method("At", TypeReference(types.Corlib("System.Void")));
+        foreach (var marker in new[] { at, value })
+        {
+            var processor = marker.Body.GetILProcessor();
+            processor.Emit(OpCodes.Ldarg_0);
+            processor.Emit(OpCodes.Call, fail);
+            processor.Emit(OpCodes.Throw);
+        }
+        var created = (at, fail, value, timeOut);
         unrecovered.Add(module, created);
         return created;
+
+        void ExceptionFactory(MethodDefinition method, string exceptionType, string prefix)
+        {
+            var text = module.TypeSystem.String;
+            var format = new MethodReference("ToString", text, module.TypeSystem.UInt64) { HasThis = true };
+            format.Parameters.Add(new ParameterDefinition(text));
+            var concat = new MethodReference("Concat", text, text);
+            concat.Parameters.Add(new ParameterDefinition(text));
+            concat.Parameters.Add(new ParameterDefinition(text));
+            var ctor = new MethodReference(".ctor", module.TypeSystem.Void, TypeReference(types.Corlib(exceptionType))) { HasThis = true };
+            ctor.Parameters.Add(new ParameterDefinition(text));
+            var processor = method.Body.GetILProcessor();
+            processor.Emit(OpCodes.Ldstr, prefix);
+            processor.Emit(OpCodes.Ldarga, method.Parameters[0]);
+            processor.Emit(OpCodes.Ldstr, "x16");
+            processor.Emit(OpCodes.Call, format);
+            processor.Emit(OpCodes.Call, concat);
+            processor.Emit(OpCodes.Newobj, ctor);
+            processor.Emit(OpCodes.Ret);
+        }
     }
 
     private GenericInstanceMethod Generic(MethodDefinition method, params TypeRef[] arguments)

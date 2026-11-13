@@ -14,8 +14,10 @@ internal static class ClassGuardExits
             var to = from.NormalSuccessors.FirstOrDefault(b => b.Start == address);
             while (to is not null && visited.Add(to))
             {
-                if (to.Handler != from.Handler || to.IsLandingPad) return null;
+                if (to.IsLandingPad) return null;
                 if (to.Statements.Where(s => s is not Nop).ToArray() is not [Jump jump]) return (from, to);
+                // 只沿无抛出点的跳板比较出口；共同出口内的调用可以有自己的异常边。
+                if (to.Handler is not null) return null;
                 if (to.NormalSuccessors.ToArray() is not [var next] || next.Start != jump.Target) return null;
                 from = to; to = next;
             }

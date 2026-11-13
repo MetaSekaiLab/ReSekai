@@ -1,3 +1,4 @@
+using ReSekai.Decompiler.Facts;
 using ReSekai.Decompiler.Ir;
 using ReSekai.Decompiler.Machine.Flow;
 using ReSekai.Decompiler.Machine.Ssa;
@@ -30,6 +31,8 @@ public sealed partial class TypeOracle
         var (root, offset, index, _) = Decompose(address);
         if (index is not null) return null;
         root = SymTable.Resolve(root);
+        if (RepeatedCast(root, block, position) is { } cast)
+            return Locate(values.Syms.Binary(BinOp.Add, cast, values.Syms.Const(unchecked((ulong)offset), 64), 64), width);
         foreach (var (type, result) in Guards(root, block, position))
         {
             if (result is not null)
@@ -42,6 +45,32 @@ public sealed partial class TypeOracle
                 return new(LocationKind.Instance, root, null, 0, null, path, fieldType) { View = reference };
         }
         return null;
+    }
+
+    /// <summary>同一对象再次按目标深度查继承表时，使用支配该位置的同类型转换结果。</summary>
+    private Sym? RepeatedCast(Sym root, Block block, int position)
+    {
+        if (root is not OpSym { Op.Kind: OperatorKind.Select, Args: [OpSym { Op.Kind: OperatorKind.Compare, Op.Cond: Cond.Eq,
+                Args: [ReadSym entry, EntitySym { Symbol: { Kind: SymbolKind.Class, Value: TypeRef target } } entity] }, var selected, ConstSym { Value: 0 }] }
+            || entry.Address is not OpSym { Op.Kind: OperatorKind.Binary, Op.Binary: BinOp.Add, Args: [ReadSym hierarchy, ConcatSym { Parts: [ConstSym { Width: 3, Value: 0 }, var index] }] }
+            || Decompose(hierarchy.Address) is not (ReadSym klass, RuntimeLayout.ClassTypeHierarchy, null, _)
+            || ClassOwner(klass) is not { } obj) return null;
+        var depth = values.Syms.Read(entry.Site, int.MinValue, values.Syms.Binary(BinOp.Add, entity,
+            values.Syms.Const(RuntimeLayout.ClassTypeHierarchyDepth, 64), 64), 8);
+        var shiftedDepth = values.Syms.Binary(BinOp.Add, values.Syms.ZeroExtend(depth, 61), values.Syms.Const(unchecked(0UL - 1), 61), 61);
+        if (!SameDepth(index, shiftedDepth)) return null;
+        if (!ReferenceEquals(SymTable.Resolve(selected), obj) && (SymTable.Resolve(selected) is not ResultSym { Site: { Op.Kind: OpKind.IsInst } earlier }
+            || values.Operands(earlier) is not [_, var original] || !ReferenceEquals(SymTable.Resolve(original), obj)
+            || ClassOperand(earlier) is not { } baseType || !types.IsAssignable(target, baseType))) return null;
+        return Guards(obj, block, position).FirstOrDefault(g => g.Type.Equals(target) && g.Result is not null).Result;
+
+        static bool SameDepth(Sym a, Sym b) => (a, b) switch
+        {
+            (ReadSym x, ReadSym y) => x.Width == y.Width && ReferenceEquals(x.Address, y.Address),
+            (OpSym x, OpSym y) => x.Op.Equals(y.Op) && x.Width == y.Width && x.Args.Length == y.Args.Length && x.Args.Zip(y.Args).All(p => SameDepth(p.First, p.Second)),
+            (ConcatSym x, ConcatSym y) => x.Parts.Length == y.Parts.Length && x.Parts.Zip(y.Parts).All(p => SameDepth(p.First, p.Second)),
+            _ => ReferenceEquals(a, b),
+        };
     }
 
     /// <summary>由近及远支配这个位置的、对 root 的类型判断：类型与 isinst 的结果（继承检查没有结果）。</summary>

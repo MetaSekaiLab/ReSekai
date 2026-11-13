@@ -65,6 +65,13 @@ internal sealed class BodyValidation(ManagedTypes types, EmissionPolicy policy, 
                 return writeProblem;
             }
             if (statement is ManagedStore { Target: not (FieldValue or StaticFieldValue or ArrayElementValue or MultiArrayElementValue or IndirectValue) }) return new(EmissionProblemKind.Unsupported, "写入位置不是字段或数组元素");
+            if (statement is ManagedStore { Target: FieldValue { Accessor.Method.Method.Owner.IsValueType: true } field }
+                && field.Receiver.Type is not ByRefRef)
+            {
+                if (!Addressable(field.Receiver) || ManagedValues.Walk(field.Receiver).Any(v => v is FieldValue { Accessor: not null } or StaticFieldValue { Accessor: not null }))
+                    return new(EmissionProblemKind.Unsupported, "值类型 setter 的接收者需要可取址的存储位置");
+                if (ReadonlyWriteProblem(field.Receiver, member: true) is { } receiverProblem) return receiverProblem;
+            }
             if (statement is ManagedCheck check && !CanAccess(check.Exception, null)) return new(EmissionProblemKind.AccessDenied, $"访问权限 异常构造 {check.Exception}");
             var values = ManagedValues.Of(statement).Concat(statement switch
             {
@@ -98,8 +105,10 @@ internal sealed class BodyValidation(ManagedTypes types, EmissionPolicy policy, 
     {
         // async void 的完成标记不产生栈值，不能按普通值要求非零位宽。
         if (value is AsyncResultValue { Value: null } && ManagedTypes.IsVoid(value.Type)) return null;
-        // 开放 T 的大小由 CLR 决定；仅保留有类型的复制、字段、局部和 default(T)。
-        var genericStorage = value.Type is GenericParameterRef && value is ArgumentValue or LocalValue or FieldValue or IndirectValue or UnboxValue or ComposedValue { Leaves.Count: 0 };
+        // 开放泛型值及其结构体的大小由 CLR 决定，整值复制与初始化仍有确定的托管类型。
+        var genericStorage = (value.Type is GenericParameterRef
+                || value.Type is DefinitionRef { Definition.IsValueType: true } structure && SharedTypes.IsVariableSized(structure))
+            && value is ArgumentValue or LocalValue or FieldValue or IndirectValue or UnboxValue or ComposedValue { Leaves.Count: 0 };
         if (value.Width is not (1 or 8 or 16 or 32 or 64) && !(value.Width == 0 && (types.Kind(value.Type) == TypeKind.Struct || genericStorage))) return new(EmissionProblemKind.Unsupported, $"位宽 {value.Width} 尚未支持");
         // C# 里每个值的类型都可能要按名写出（局部变量声明、转换）
         if (!CanAccess(value.Type)) return new(EmissionProblemKind.AccessDenied, $"访问权限 类型 {value.Type}");

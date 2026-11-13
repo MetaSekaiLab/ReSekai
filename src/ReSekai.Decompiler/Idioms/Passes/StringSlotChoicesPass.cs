@@ -18,7 +18,8 @@ internal static class StringSlotChoicesPass
                     var address = load.Address;
                     for (var depth = 0; depth < 8 && address is Use use && definitions.Raw(use.Variable) is { } value; depth++)
                         address = value;
-                    if (address is not Select || state.SlotValue(definitions.Expand(address), out var slots) is not { } choice || slots.Any(s => s.Usage.Kind != UsageKind.StringLiteral))
+                    if (address is not Select || state.SlotValue(definitions.Expand(address), out var slots) is not { } choice
+                        || slots.Any(s => s.Usage.Kind is not (UsageKind.StringLiteral or UsageKind.TypeInfo)))
                         return null;
                     changed = true;
                     state.Result.ReadSlots.UnionWith(slots.Select(s => s.Address));

@@ -1,5 +1,7 @@
 using System.Reflection;
 using ReSekai.Decompiler.Ir;
+using ReSekai.Decompiler.Recovery.Typing;
+using ReSekai.Decompiler.Recovery.Values;
 
 namespace ReSekai.Decompiler.Recovery.Inlining;
 
@@ -51,6 +53,11 @@ internal sealed class InlineProof
         if (method.Method == caller.Method || summaries(method) is not { Body: { } body } || body.Regions.Count > 0 || !Acyclic(body)) return null;
         return programs[method] = Program.Compile(body, types);
     }
+
+    public bool UnusedParameter(MethodRef method, ulong entry, int index) =>
+        method.Method != caller.Method && summaries(method) is { Body: { } body, Holes.Count: 0 } recovered && recovered.Entry == entry
+        && !body.Blocks.SelectMany(b => b.Statements).SelectMany(s => ManagedValues.Of(s).Concat(ManagedValues.CopiedValues(s)))
+            .SelectMany(ManagedValues.Walk).OfType<ArgumentValue>().Any(a => a.Index == index);
 
     private static bool Acyclic(ManagedBody body)
     {
@@ -116,6 +123,8 @@ internal sealed class InlineProof
         spent = 0;
         budget = Math.Max(MethodSteps, ItemSteps * (Pending(body).Count() + constructions.Count));
         nextLocal = firstLocal;
+        body = SeparateIndirectStores(body);
+        body = MoveCommonListAppendPrefix(body);
         if (InlineTrace.For(caller.Method)) InlineTrace.Before?.Invoke(body);
         body = ResolveAccessors(body);
         body = BaseConstructor(body);
@@ -126,6 +135,79 @@ internal sealed class InlineProof
         body = Seal(body);
         body = SealConstructions(body, constructions, constructionFailures);
         return new(body, holes.ToArray(), rules.ToArray());
+    }
+
+    /// <summary>列表追加的共同前缀跨无副作用的分支合并时，把前缀分回各单入边，使每个追加能单独证明。</summary>
+    private static ManagedBody MoveCommonListAppendPrefix(ManagedBody body)
+    {
+        if (body.Regions.Count != 0) return body;
+        var blocks = body.Blocks.ToDictionary(b => b.Address);
+        var incoming = body.Blocks.SelectMany(b => b.Statements.TakeLast(1).SelectMany(ManagedValues.Edges))
+            .GroupBy(e => e.Target).ToDictionary(g => g.Key, g => g.Count());
+        var entry = body.Blocks[0].Address;
+        var changed = false;
+        foreach (var original in body.Blocks)
+        {
+            var block = blocks[original.Address];
+            if (block.Statements is not [.., ManagedBranch { Taken: var yes, Fallthrough: var no } branch]
+                || !PureAppendBranch(branch.Condition)
+                || yes.Copies.Count != 0 || no.Copies.Count != 0 || yes.Target == no.Target || yes.Target == block.Address || no.Target == block.Address
+                || yes.Target == entry || no.Target == entry
+                || incoming.GetValueOrDefault(yes.Target) != 1 || incoming.GetValueOrDefault(no.Target) != 1) continue;
+            var tested = ManagedValues.Walk(branch.Condition).OfType<LocalValue>().Select(v => v.Variable).ToHashSet();
+            var start = block.Statements.ToList().FindLastIndex(s => s is ManagedAssignment
+                { Value: FieldValue { Receiver: LocalValue, Field.Field.Name: "_version" } });
+            var prefix = block.Statements.Skip(start).SkipLast(1).ToArray();
+            if (start < 0 || prefix is not [ManagedAssignment { Target: var saved, Value: FieldValue { Receiver: LocalValue list, Field.Field.Name: "_version" } version },
+                    ManagedStore { Target: FieldValue updated, Value: BinaryValue { Op: BinOp.Add, Left: LocalValue previous, Right: ConstantValue { Bits: 1 } } }, ..]
+                || !previous.Equals(saved) || !updated.Field.Equals(version.Field) || !updated.Receiver.Equals(list)
+                || list.Type is not DefinitionRef { Definition.FullName: "System.Collections.Generic.List" }
+                || prefix.OfType<ManagedAssignment>().Any(a => tested.Contains(a.Target.Variable) || a.Target.Variable.Equals(list.Variable))
+                || prefix.Skip(2).Any(s => s is not ManagedAssignment { Value: FieldValue { Receiver: LocalValue receiver } }
+                    || !receiver.Equals(list))) continue;
+            foreach (var edge in new[] { yes, no })
+                blocks[edge.Target] = new(edge.Target, [.. prefix, .. blocks[edge.Target].Statements]);
+            blocks[block.Address] = new(block.Address, [.. block.Statements.Take(start), branch]);
+            changed = true;
+        }
+        return changed ? body with { Blocks = body.Blocks.Select(b => blocks[b.Address]).ToArray() } : body;
+    }
+
+    private static bool PureAppendBranch(ManagedValue condition) => condition switch
+    {
+        LocalValue or ConstantValue => true,
+        ComparisonValue { Left: var left, Right: var right } => PureAppendBranch(left) && PureAppendBranch(right),
+        BinaryValue { Op: BinOp.And, Left: var left, Right: ConstantValue } => PureAppendBranch(left),
+        FieldValue { Receiver: ArgumentValue { Index: >= 0, Type: DefinitionRef { Definition.IsValueType: true } }, Pending: null } => true,
+        _ => false,
+    };
+
+    private static ManagedBody SeparateIndirectStores(ManagedBody body)
+    {
+        // 指针写入之后的原语句可以是复核出口。此处对齐堆，后续相同的读取沿原控制流执行。
+        var next = 3UL << 60;
+        var blocks = new List<ManagedBlock>();
+        var tails = new Dictionary<ulong, List<ulong>>();
+        foreach (var block in body.Blocks)
+        {
+            var address = block.Address;
+            var start = 0;
+            for (var i = 0; i + 1 < block.Statements.Count; i++)
+            {
+                if (block.Statements[i] is not ManagedStore { Target: IndirectValue { Address: PointerOffsetValue } }) continue;
+                var tail = next++;
+                blocks.Add(new(address, [.. block.Statements.Skip(start).Take(i + 1 - start),
+                    new ManagedJump(block.Statements[i].Address, new ManagedEdge(tail, []))]));
+                if (!tails.TryGetValue(block.Address, out var added)) tails[block.Address] = added = [];
+                added.Add(tail);
+                address = tail;
+                start = i + 1;
+            }
+            blocks.Add(start == 0 ? block : new(address, block.Statements.Skip(start).ToArray()));
+        }
+        if (tails.Count == 0) return body;
+        ulong[] Extend(IEnumerable<ulong> entries) => entries.SelectMany(a => tails.TryGetValue(a, out var extra) ? new[] { a }.Concat(extra) : [a]).ToArray();
+        return body with { Blocks = blocks, Regions = body.Regions.Select(r => r with { Try = Extend(r.Try), Handler = Extend(r.Handler) }).ToArray() };
     }
 
     private ManagedBody Adopt(ManagedBody replaced, ulong at, string form, MethodRef method)
@@ -327,7 +409,8 @@ internal sealed class InlineProof
     {
         if (analysis is { } known && ReferenceEquals(known.Body, body)) return (known.Program, known.Facts);
         var program = Program.Compile(body, types);
-        var facts = new EntryFacts(program, call => Template(call.Invocation.Method) is { } template && semantic.IsReadOnly(template));
+        var facts = new EntryFacts(program, call => Template(call.Invocation.Method) is { } template && semantic.IsReadOnly(template),
+            call => Template(call.Invocation.Method) is { } template ? semantic.ConstantWrites(template) : []);
         analysis = (body, program, facts);
         return (program, facts);
     }
@@ -359,14 +442,18 @@ internal sealed class InlineProof
         var prover = Prover();
         var reasons = new List<(string Reason, int Progress)>();
         (ManagedBody Body, (int, int, int) Key, string Form, MethodRef Method, ulong At)? best = null;
-        foreach (var (method, template) in Candidates(field, receiver))
+        var callerCalls = body.Blocks.SelectMany(b => b.Statements).OfType<ManagedCall>().Select(c => c.Invocation.Method.Method).ToHashSet();
+        var choices = Candidates(field, receiver).Select(c => (c.Method, c.Template, Calls: c.Template.Reach(Template)))
+            .Select(c => (c.Method, c.Template, c.Calls, Witnesses: c.Calls.Count(m => callerCalls.Contains(m.Method))));
+        foreach (var (method, template, calls, witnesses) in choices.OrderByDescending(c => c.Witnesses))
         {
+            // 已有调用见证支持的替换覆盖了待证访问时，优先推进方法体，再为新方法体寻找候选。
+            if (witnesses == 0 && best is { } matched && matched.Key.Item1 < before.Pending) break;
             if (Spent) { reasons.Add((Exhausted, int.MaxValue)); break; }
             if (evidence.CallFailure(method, receiver, receiver is null ? field.DeclaringType : null) is { } illegal) { reasons.Add((illegal, -1)); continue; }
             var (nearest, distance) = ((string?)null, -1);
             var reached = -1;
             var (starts, impossible) = (0, 0);
-            var calls = template.Reach(Template);
             var silent = template.Silent(Template);
             foreach (var (block, index, covered) in Starts(program, anchor.Block, anchor.Index, template.EventBound, s => Possible(s, calls)))
             {
@@ -482,42 +569,46 @@ internal sealed class InlineProof
     {
         foreach (var (variable, pending) in constructions)
         {
-            if (PendingCall(body, variable, pending) is not var (block, index)) continue;
-            var (program, facts) = Analysis(body);
-            var statements = program.Blocks[block].Statements;
-            var first = Enumerable.Range(0, index + 1).First(i => i == index || Program.Uses(statements[i]).Contains(variable));
-            var local = program.LocalOf(variable)!;
-            var prover = Prover();
-            var reasons = new List<string>();
-            var done = false;
-            foreach (var definition in pending.Allocated.Definition.Methods.Where(m => m.Name == ".ctor" && !m.IsStatic))
+            while (PendingCall(body, variable, pending) is var (block, index))
             {
-                var method = new MethodRef(definition, pending.Allocated.Arguments, []);
-                if (Template(method) is not { } template) { reasons.Add(definition.Address == 0 ? "构造函数没有原生代码" : "构造函数不能作模板"); continue; }
-                string? nearest = null;
-                for (var start = first; start >= 0 && !done; start--)
+                var (program, facts) = Analysis(body);
+                var statements = program.Blocks[block].Statements;
+                var first = Enumerable.Range(0, index + 1).First(i => i == index || Program.Uses(statements[i]).Contains(variable));
+                var local = program.LocalOf(variable)!;
+                var prover = Prover();
+                var reasons = new List<string>();
+                var done = false;
+                foreach (var definition in pending.Allocated.Definition.Methods.Where(m => m.Name == ".ctor" && !m.IsStatic))
                 {
-                    if (Spent) { reasons.Add(Exhausted); break; }
-                    var outcome = Prove(prover, program, facts, block, start, new Candidate(method, template, ReplacementKind.Construct, local),
-                        point => point.Block == block && point.Statement == index);
-                    if (InlineTrace.For(caller.Method))
+                    var method = new MethodRef(definition, pending.Allocated.Arguments, []);
+                    if (Template(method) is not { } template) { reasons.Add(definition.Address == 0 ? "构造函数没有原生代码" : "构造函数不能作模板"); continue; }
+                    string? nearest = null;
+                    for (var start = first; start >= 0 && !done; start--)
                     {
-                        InlineTrace.Template(caller.Method, template.Body);
-                        InlineTrace.Write($"  构造 {pending.Allocated} {definition.Name}({definition.Parameters.Count}) 起点 0x{block:x}:{start} 进度 {outcome.Progress} 步 {outcome.Steps}：{outcome.Failure ?? outcome.Form}");
-                        foreach (var note in outcome.Plans) InlineTrace.Write($"    方案 {note}");
+                        if (Spent) { reasons.Add(Exhausted); break; }
+                        var outcome = Prove(prover, program, facts, block, start, new Candidate(method, template, ReplacementKind.Construct, local),
+                            point => point.Block == block && point.Statement == index);
+                        if (InlineTrace.For(caller.Method))
+                        {
+                            InlineTrace.Template(caller.Method, template.Body);
+                            InlineTrace.Write($"  构造 {pending.Allocated} {definition.Name}({definition.Parameters.Count}) 起点 0x{block:x}:{start} 进度 {outcome.Progress} 步 {outcome.Steps}：{outcome.Failure ?? outcome.Form}");
+                            foreach (var note in outcome.Plans) InlineTrace.Write($"    方案 {note}");
+                        }
+                        if (outcome.Body is { } replaced)
+                        {
+                            body = Adopt(replaced, statements[start].Address, $"construct+{outcome.Form}", method);
+                            done = true;
+                            break;
+                        }
+                        nearest ??= outcome.Failure;
                     }
-                    if (outcome.Body is { } replaced)
-                    {
-                        body = Adopt(replaced, statements[start].Address, $"construct+{outcome.Form}", method);
-                        done = true;
-                        break;
-                    }
-                    nearest ??= outcome.Failure;
+                    if (done) break;
+                    reasons.Add($"{definition.Name}({definition.Parameters.Count})：{nearest}");
                 }
-                if (done) break;
-                reasons.Add($"{definition.Name}({definition.Parameters.Count})：{nearest}");
+                if (done) continue;
+                failed[variable] = reasons.Count == 0 ? "没有构造函数" : string.Join("；", reasons.Distinct().Take(3));
+                break;
             }
-            if (!done) failed[variable] = reasons.Count == 0 ? "没有构造函数" : string.Join("；", reasons.Distinct().Take(3));
         }
         return body;
     }
@@ -527,16 +618,21 @@ internal sealed class InlineProof
     {
         foreach (var (variable, pending) in constructions)
         {
-            if (PendingCall(body, variable, pending) is not var (block, index)) continue;
             var reason = $"构造 {pending.Allocated} 的构造函数被内联为 {pending.Base}：{failed.GetValueOrDefault(variable) ?? "没有构造函数"}";
-            holes.Add(new RecoveryHole(pending.Address, reason));
-            body = body with
+            var missing = false;
+            while (PendingCall(body, variable, pending) is var (block, index))
             {
-                Blocks = body.Blocks.Select(b => b.Address != block ? b : b with
+                missing = true;
+                holes.Add(new RecoveryHole(pending.Address, reason));
+                body = body with
                 {
-                    Statements = b.Statements.Select((s, i) => i != index ? s : new ManagedHole(pending.Address, $"构造 {pending.Allocated} 的构造函数被内联", false)).ToArray(),
-                }).ToArray(),
-            };
+                    Blocks = body.Blocks.Select(b => b.Address != block ? b : b with
+                    {
+                        Statements = b.Statements.Select((s, i) => i != index ? s : new ManagedHole(pending.Address, $"构造 {pending.Allocated} 的构造函数被内联", false)).ToArray(),
+                    }).ToArray(),
+                };
+            }
+            if (!missing) continue;
             ManagedValue Uninitialized(ManagedValue value) => value is LocalValue local && local.Variable == variable
                 ? new HoleValue(reason, local.Type, local.Width) : ManagedValues.Map(value, Uninitialized);
             body = ManagedValues.Map(body, Uninitialized);
@@ -617,16 +713,22 @@ internal sealed class InlineProof
         {
             var definition = method.Method;
             var receiverParameter = definition.IsStatic && !isStatic;
+            var libraryBufferRead = !write && LibraryAccessors.IsNativeArrayBufferRead(method, field) && receiver?.Equals(owner) == true;
             var shape = write
                 ? definition.Parameters.Count == 1 && ManagedTypes.IsVoid(definition.ReturnType) && definition.IsStatic == isStatic
                 : !ManagedTypes.IsVoid(definition.ReturnType) && (receiverParameter
-                    ? ManagedTypes.IsReferenceType(owner) && definition.Parameters.Count == 1 && method.Concrete(definition.Parameters[0].Type).Equals(owner)
+                    ? libraryBufferRead || ManagedTypes.IsReferenceType(owner) && definition.Parameters.Count == 1 && method.Concrete(definition.Parameters[0].Type).Equals(owner)
                     : definition.Parameters.Count == 0 && definition.IsStatic == isStatic);
             if (!shape) continue;
             var declared = method.Concrete(write ? definition.Parameters[0].Type : definition.ReturnType);
             if (!declared.Equals(valueType) && (write || !ManagedTypes.IsReferenceType(valueType)
                 || !ManagedTypes.IsReferenceType(declared) || !types.IsAssignable(valueType, declared))) continue;
             if (evidence.CallFailure(method, receiver, isStatic ? field.DeclaringType : null) is { } illegal) { reasons.Add(illegal); continue; }
+            if (libraryBufferRead)
+            {
+                found = new FieldAccessor(method, field, valueType, types.ValueWidth(valueType), write);
+                break;
+            }
             if (Template(method) is not { } template)
             {
                 // 总被内联的库访问器：方法体按库的源码给出；自动属性的访问器按编译器的生成方式给出。
@@ -674,6 +776,10 @@ internal sealed class InlineProof
 
     public ValueConstruction? ProveValueConstruction(DefinitionRef structure, IReadOnlyList<(IReadOnlyList<FieldRef> Path, ManagedValue Value)> leaves) =>
         semantic.Prove(structure, leaves, Template);
+
+    public (MethodRef Constructor, Sym[] Arguments)? ProveBranchConstruction(DefinitionRef structure, OpSym test, Sym[] taken, Sym[] fallthrough,
+        TypeOracle oracle, ValueModel values, int branchBlock) =>
+        semantic.ProveBranchConstruction(structure, test, taken, fallthrough, oracle, values, branchBlock, Template);
 
     // ---- 收尾 ----
 

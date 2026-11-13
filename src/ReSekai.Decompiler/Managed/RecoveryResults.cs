@@ -21,6 +21,8 @@ public sealed record MethodRecoveryResult(MethodRef Method, ulong Entry, Managed
     /// <summary>已核验的运行时声明；没有恢复原生方法体，不计入方法体及字节覆盖率。</summary>
     public RuntimeDeclarationKind? Declaration { get; init; }
     public NativeImport? PlatformImport { get; init; }
+    /// <summary>补回源码所依据的发布者参考；仅用于源码输出。</summary>
+    public string? ReferenceSource { get; init; }
     /// <summary>有洞时已恢复部分组成的方法体：洞写成 <see cref="ManagedHole"/>/<see cref="HoleValue"/>，只供阅读，不进执行对照与指标。</summary>
     public ManagedBody? Partial { get; init; }
 }

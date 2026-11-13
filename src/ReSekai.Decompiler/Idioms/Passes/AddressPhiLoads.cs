@@ -31,9 +31,29 @@ internal static class AddressPhiLoads
         var changed = false;
         foreach (var block in function.Blocks)
         {
-            if (block.IsLandingPad || block.Statements.FirstOrDefault(s => s is not (Phi or Nop)) is not Define read
+            if (block.IsLandingPad
                 || block.Predecessors.Count < 2 || block.Predecessors.Any(p => p == block || p.Handler != block.Handler
                     || p.NormalSuccessors.Count() != 1 || !p.NormalSuccessors.Contains(block))) continue;
+            var first = block.Statements.FirstOrDefault(s => s is not (Phi or Nop));
+            if (first is Store store && function.Range.ExceptionRegions.Length == 0 && block.Handler is null
+                && Pure(store.Target) && Pure(store.Value)
+                && Expand(store.Target) is Binary { Op: BinOp.Add, Left: Use target, Right: Const }
+                && block.Statements.OfType<Phi>().Any(p => p.Target == target.Variable))
+            {
+                var phis = block.Statements.OfType<Phi>().ToArray();
+                if (phis.Any(p => p.Sources.Length != block.Predecessors.Count)) continue;
+                var copies = block.Predecessors.Select((_, side) =>
+                    new PathCopy(v => fresh(v.Width), phis.ToDictionary(p => p.Target, p => p.Sources[side]))
+                        .Copy(store with { Target = Expand(store.Target) })).OfType<Store>().ToArray();
+                if (copies.Length != block.Predecessors.Count || copies.Any(s => ExprMap.Operands(s).SelectMany(ExprMap.Walk)
+                    .OfType<Use>().Any(u => u.Variable.Version < 0 || phis.Any(p => p.Target == u.Variable)))) continue;
+                foreach (var (parent, copy) in block.Predecessors.Zip(copies))
+                    parent.Statements.Insert(parent.Statements.Count - (parent.Statements.LastOrDefault() is Jump ? 1 : 0), copy);
+                block.Statements.Remove(store);
+                changed = true;
+                continue;
+            }
+            if (block.Statements.FirstOrDefault(s => s is not (Phi or Nop) && !(s is Define d && Pure(d.Value))) is not Define read) continue;
             var value = read.Value;
             while (value is Ir.Convert { Kind: ConvKind.ZeroExtend or ConvKind.SignExtend or ConvKind.Truncate } conversion)
                 value = conversion.Operand;
@@ -48,7 +68,20 @@ internal static class AddressPhiLoads
             if (addresses.Any(e => !Pure(e) || ExprMap.Walk(e).OfType<Use>().Any(u => merged.ContainsKey(u.Variable)))) continue;
             // 分别合流的扩展限于变址常量表；普通字段、数组保留原读取形态，供后续访问器认回。
             var direct = load.Address is Use pointer && merged.ContainsKey(pointer.Variable);
-            if (!direct && addresses.Any(e => e is not Binary { Op: BinOp.Add, Right: Const, Left: Binary { Op: BinOp.Shl, Right: Const scale } }
+            var typed = addresses.Select((address, side) =>
+            {
+                if (address is not Binary { Op: BinOp.Add, Left: Use owner, Right: Const offset }) return null;
+                // 每条边独立通过了类型检查，偏移必须从该边的有类型引用解释。
+                var pred = block.Predecessors[side];
+                return pred.Predecessors is [var test] && test.NormalSuccessors.Contains(pred)
+                    && test.Statements.LastOrDefault() is Branch
+                    && pred.Statements.OfType<Call>().FirstOrDefault(c =>
+                    c is { Op.Kind: OpKind.IsInst, Arguments: [Use original], Defines: [var result] }
+                    && original == owner && result.Width == owner.Width && c.Address == test.Statements[^1].Address) is { } cast
+                    ? (Expr)(new Binary(BinOp.Add, new Use(cast.Defines[0], owner.Width), offset, 64)) : null;
+            }).ToArray();
+            if (typed.All(e => e is not null)) addresses = typed.Select(e => e!).ToArray();
+            else if (!direct && addresses.Any(e => e is not Binary { Op: BinOp.Add, Right: Const, Left: Binary { Op: BinOp.Shl, Right: Const scale } }
                 || scale.Value > 3 || (1UL << (int)scale.Value) != (ulong)load.Width / 8)) continue;
             var sources = new Variable[addresses.Length];
             for (var i = 0; i < sources.Length; i++)

@@ -45,7 +45,8 @@ internal static class DecompileStage
             if (sourceLayout == "project")
             {
                 var count = SourceProject.Write(Path.Combine(sourceAssemblies, Skeleton.ImageFileName(assemblyName)), sourceAssemblies, sources,
-                    t => all || wanted.Contains((t.Namespace, t.Name)), transforms, stubs, request.Jobs);
+                    t => all || wanted.Contains((t.Namespace, t.Name)), transforms, stubs, request.Jobs,
+                    exposeSelectedAnonymousTypes: !all && (types is not null || list is not null));
                 files += count;
                 Log($"C# {assemblyName}：{count} 个类型文件，累计 {files}");
                 continue;

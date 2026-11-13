@@ -16,7 +16,9 @@ internal static class SuccessfulTypeCheckValuesPass
         var changed = false;
         foreach (var check in checks)
         {
-            if (check.Op?.Operand is not TypeRef type || check.Arguments is not [Use klass] || definitionOf(klass) is not Load { Width: 64, Address: Use obj } || check.Defines.FirstOrDefault() is not { } flag)
+            if (check.Op?.Operand is not TypeRef type || check.Arguments is not [var classArgument]
+                || (classArgument is Use klass ? definitionOf(klass) : classArgument) is not Load { Width: 64, Address: Use obj }
+                || check.Defines.FirstOrDefault() is not { } flag)
                 continue;
             bool Flag(Expr value, int depth = 0) => depth < 12 && value switch
             {
@@ -61,14 +63,61 @@ internal static class SuccessfulTypeCheckValuesPass
 
                 if (start is null)
                     continue;
+                var preservesNull = at >= 0 && block.Statements[at] is Call { Op.Operand: "System.InvalidCastException" }
+                    && type is DefinitionRef { Definition.IsValueType: false };
                 var cast = fresh();
                 CheckedClassValues.Refine(function, start, position, obj, cast, dominators);
                 start.Statements.Insert(position, new Call(check.Address, CallKind.Direct, Expr.C(0, 64)) { Op = new RuntimeOp(OpKind.IsInst, type), Arguments = [obj], Results = [cast.Storage], Defines = [cast], });
+                if (preservesNull)
+                    RefineNullableJoins(function, start, obj, type, check.Address, dominators, fresh);
                 changed = true;
                 break;
             }
         }
 
         return changed;
+    }
+
+    private static void RefineNullableJoins(MachineFunction function, Block guard, Use value, TypeRef type,
+        ulong address, Dominators dominators, Func<Variable> fresh)
+    {
+        if (guard.NormalSuccessors.ToArray() is not [var success] || success.Predecessors.Count != 1)
+            return;
+        var nullTest = guard;
+        while (nullTest.Predecessors is [var predecessor] && predecessor.NormalSuccessors.Contains(nullTest)
+            && dominators.Dominates(predecessor.Index, nullTest.Index) && predecessor != nullTest)
+        {
+            nullTest = predecessor;
+            if (nullTest.Statements.LastOrDefault() is Branch)
+                break;
+        }
+        if (nullTest.Statements.LastOrDefault() is not Branch
+            {
+                Condition: Compare { Cond: Cond.Eq or Cond.Ne, Left: var compared, Right: Const { Value: 0 } } test
+            } branch || compared != value || branch.Target == branch.Fallthrough)
+            return;
+        var nullEdge = nullTest.NormalSuccessors.SingleOrDefault(b => b.Start ==
+            (test.Cond == Cond.Eq ? branch.Target : branch.Fallthrough));
+        if (nullEdge is null || nullEdge.Predecessors.Count != 1 || dominators.Dominates(nullEdge.Index, guard.Index))
+            return;
+
+        // 合流的每条入边都必须来自检查成功后的正常路径，或来自同一引用的空值路径。
+        foreach (var index in dominators.Frontier[success.Index])
+        {
+            var join = function.Blocks[index];
+            if (join.IsLandingPad || !dominators.Dominates(nullTest.Index, index)
+                || !join.Predecessors.Any(p => dominators.Dominates(nullEdge.Index, p.Index))
+                || !join.Predecessors.All(p => p.NormalSuccessors.Contains(join) &&
+                    (dominators.Dominates(success.Index, p.Index) || dominators.Dominates(nullEdge.Index, p.Index))))
+                continue;
+            var position = join.Statements.TakeWhile(s => s is Phi).Count();
+            var cast = fresh();
+            if (!CheckedClassValues.Refine(function, join, position, value, cast, dominators))
+                continue;
+            join.Statements.Insert(position, new Call(address, CallKind.Direct, Expr.C(0, 64))
+            {
+                Op = new(OpKind.IsInst, type), Arguments = [value], Results = [cast.Storage], Defines = [cast],
+            });
+        }
     }
 }

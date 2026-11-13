@@ -125,7 +125,8 @@ internal sealed partial class CilBodyWriter
             case IndirectValue { Address: AddressValue { Target: LocalValue or FieldValue or StaticFieldValue or ArgumentValue { Index: >= 0 } } location } i
                 when location.Target.Type.Equals(i.Type):
                 Value(location.Target); break;
-            case IndirectValue i: Value(i.Address); il.Emit(OpCodes.Ldobj, TypeReference(i.Type)); break;
+            case IndirectValue i:
+                Value(i.Address); IndirectAlignment(i); il.Emit(OpCodes.Ldobj, TypeReference(i.Type)); break;
             case ComposedValue c: Compose(c); break;
             case FieldValue f:
                 // 枚举的 value__ 是整个值的底层表示；以 ldobj 读取，避免 C# 泄漏不可访问的字段名。
@@ -240,6 +241,12 @@ internal sealed partial class CilBodyWriter
                     name => TypeReference(types.Corlib(name))); break;
             default: throw new NotSupportedException(c.Kind.ToString());
         }
+    }
+
+    private void IndirectAlignment(IndirectValue access)
+    {
+        if (access.Address.Type is PointerRef { Element: var element } && types.StorageBits(element) == 8 && access.Width > 8)
+            il.Emit(OpCodes.Unaligned, (byte)1);
     }
 
     private void PinArray(PinnedArrayValue pinned)

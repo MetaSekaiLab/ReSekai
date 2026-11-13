@@ -135,6 +135,17 @@ internal sealed class Solver(TermTable terms, ManagedTypes? types = null)
             trial[t] = c;
             return true;
         }
+        // 常量可能来自选择的一侧；试探绑定之后必须连同条件重算整个选择。
+        if (t.IsOp(OpCode.Choice) && c.IsConstant && t.Args is [_, var yes, var no])
+        {
+            foreach (var arm in new[] { yes, no })
+            {
+                var candidate = new Dictionary<Term, Term>(trial, ReferenceEqualityComparer.Instance);
+                if (!MatchFree(arm, c, candidate) || !ReferenceEquals(With(t, candidate), c)) continue;
+                foreach (var (formal, value) in candidate) trial[formal] = value;
+                return true;
+            }
+        }
         // 经引用的位置：引用形参指向调用方位置的前缀。
         if (t.Kind == TermKind.Location && t.Root == RootKind.Reference && t.Args[0].IsAtom(AtomKind.Formal) && c.Kind == TermKind.Location
             && c.Root is RootKind.Field or RootKind.Static or RootKind.Element or RootKind.MultiElement or RootKind.Cell or RootKind.Reference)
@@ -237,7 +248,7 @@ internal sealed class Solver(TermTable terms, ManagedTypes? types = null)
     /// Φ 在当前绑定下的视图：已知值（x == c 的 x 取 c，其他文字取真，文字的否定取假）、文字集合，
     /// 以及按已知的常量值折叠后的文字（如已知 x == 0 时 l <= x 即 l == 0）。
     /// </summary>
-    private sealed record View(Dictionary<Term, Term> Known, HashSet<Term> Literals, ImmutableList<Term> Folded);
+    private sealed record View(Dictionary<Term, Term> Known, HashSet<Term> Literals, ImmutableList<Term> Folded, Term[] OffsetBounds);
 
     private (ImmutableList<Term> Phi, int Version, View View)? viewed;
 
@@ -256,6 +267,7 @@ internal sealed class Solver(TermTable terms, ManagedTypes? types = null)
             }
             else if (literal.Width == 1 && !literal.IsOp(OpCode.Not) && !literal.IsConstant) known.TryAdd(literal, terms.True);
             else if (literal.IsOp(OpCode.Not)) known.TryAdd(literal.Args[0], terms.False);
+            if (literal.IsOp(OpCode.Compare)) known.TryAdd(terms.Not(literal), terms.False);
         }
         var literals = new HashSet<Term>(applied, ReferenceEqualityComparer.Instance);
         // 文字按常量值折叠（定义常量值的等式本身除外）；折叠出的新文字同样成立。
@@ -270,7 +282,7 @@ internal sealed class Solver(TermTable terms, ManagedTypes? types = null)
                 if (!ReferenceEquals(f, literal) && literals.Add(f)) folded.Add(f);
             }
         }
-        var view = new View(known, literals, ImmutableList.CreateRange(folded));
+        var view = new View(known, literals, ImmutableList.CreateRange(folded), folded.Where(IsOffsetBound).ToArray());
         viewed = (phi, Version, view);
         return view;
     }
@@ -283,8 +295,10 @@ internal sealed class Solver(TermTable terms, ManagedTypes? types = null)
     {
         var applied = Apply(term);
         if (applied.IsConstant || phi.IsEmpty) return applied;
-        var known = ViewOf(phi).Known;
-        return known.Count == 0 ? applied : terms.Replace(applied, t => known.GetValueOrDefault(t), new(ReferenceEqualityComparer.Instance));
+        var view = ViewOf(phi);
+        if (view.Known.Count == 0 && view.OffsetBounds.Length == 0) return applied;
+        return terms.Replace(applied, t => view.Known.GetValueOrDefault(t)
+            ?? (ExcludedByOffsetBound(view.OffsetBounds, t) ? t.Cond == Cond.Ne ? terms.True : terms.False : null), new(ReferenceEqualityComparer.Instance));
     }
 
     /// <summary>Φ 下 c 的真值；判定不出为 null。c 与按已知值代入后的 c 都同 Φ 的文字（含折叠出的文字）比较，再看非空与区间。</summary>
@@ -296,6 +310,7 @@ internal sealed class Solver(TermTable terms, ManagedTypes? types = null)
         var view = ViewOf(phi);
         if (view.Literals.Contains(c)) return true;
         if (view.Literals.Contains(terms.Not(c))) return false;
+        if (ExcludedByOffsetBound(view.OffsetBounds, c)) return c.Cond == Cond.Ne;
         if (NonNull(phi, c) is { } nonNull) return nonNull;
         var substituted = c;
         if (view.Known.Count > 0)
@@ -306,6 +321,26 @@ internal sealed class Solver(TermTable terms, ManagedTypes? types = null)
             if (view.Literals.Contains(terms.Not(substituted))) return false;
         }
         return Interval(view.Folded, substituted) ?? (ReferenceEquals(substituted, c) ? null : Interval(view.Folded, c));
+    }
+
+    private static bool IsOffsetBound(Term term) => term.IsOp(OpCode.Compare) && term.Cond is Cond.Ule or Cond.Uge
+        && term.Args[1].IsConstant && term.Args[0] is { Kind: TermKind.Operation, Op: OpCode.Binary, BinOp: BinOp.Add } shifted
+        && shifted.Args[1].IsConstant;
+
+    /// <summary>用 (x + offset) 的无符号范围排除 x 的候选值；加法按机器位宽回绕。</summary>
+    private static bool ExcludedByOffsetBound(Term[] bounds, Term test)
+    {
+        if (bounds.Length == 0 || !test.IsOp(OpCode.Compare) || test.Cond is not (Cond.Eq or Cond.Ne)
+            || !test.Args[1].IsConstant || test.Args[0].Width is <= 0 or > 64) return false;
+        var value = test.Args[0];
+        foreach (var bound in bounds)
+        {
+            var shifted = bound.Args[0];
+            if (shifted.Width != value.Width || !ReferenceEquals(shifted.Args[0], value)) continue;
+            var candidate = unchecked(test.Args[1].Bits + shifted.Args[1].Bits) & TermTable.Mask(value.Width);
+            if (bound.Cond == Cond.Ule ? candidate > bound.Args[1].Bits : candidate < bound.Args[1].Bits) return true;
+        }
+        return false;
     }
 
     /// <summary>判空：分配得到的对象、地址、字符串常量、方法自己的 this（实例方法的 this 非空，由调用方检查）。</summary>

@@ -11,7 +11,7 @@ internal sealed record ValueConstruction(MethodRef Constructor, IReadOnlyList<Ma
 /// 模板的语义摘要：模板从入口单独执行到底（形参为未知量）得到的各条路径：路径条件、事件、写入、返回值。
 /// 访问器、值类型构造都按摘要判定，不看方法体的写法。
 /// </summary>
-internal sealed class TemplateSummaries(ManagedTypes types, InlineEvidence evidence)
+internal sealed partial class TemplateSummaries(ManagedTypes types, InlineEvidence evidence)
 {
     private sealed record PathSummary(ImmutableList<Term> Phi, SideState State, Stop End, List<EventInfo> Events);
 
@@ -79,6 +79,30 @@ internal sealed class TemplateSummaries(ManagedTypes types, InlineEvidence evide
         return readOnly[program.Method] = program.Body.Regions.Count == 0 && Execute(program, false) is { } run
             && run.Paths.All(p => p.Events.Count == 0 && p.End.Kind is StopKind.Return or StopKind.Throw
                 && p.State.Writes.All(w => TermTable.Immutable(w.Location) || run.Interpreter.Private(p.State, w.Location)));
+    }
+
+    private readonly Dictionary<MethodRef, (FieldRef Field, ulong Bits, int Width)[]> constantWrites = [];
+
+    /// <summary>实例调用正常返回时，所有路径都将同一常量写入的直接字段。</summary>
+    public (FieldRef Field, ulong Bits, int Width)[] ConstantWrites(Program program)
+    {
+        if (constantWrites.TryGetValue(program.Method, out var known)) return known;
+        constantWrites[program.Method] = [];
+        if (program.Method.Method.IsStatic || program.Method.Method.Owner.IsValueType || program.Body.Regions.Count != 0
+            || Execute(program, false) is not { } run || run.Paths.Any(p => p.End.Kind is not (StopKind.Return or StopKind.Throw))) return [];
+        var returns = run.Paths.Where(p => p.End.Kind == StopKind.Return).ToArray();
+        if (returns.Length == 0) return [];
+        var receiver = run.Formals[0];
+        var fields = new List<(FieldRef, ulong, int)>();
+        foreach (var (location, value) in returns[0].State.Writes)
+        {
+            if (location.Root != RootKind.Field || !ReferenceEquals(location.Args[0], receiver) || location.Path.Count != 1 || !value.IsConstant) continue;
+            var field = location.Path.Fields[0];
+            var type = field.Field.Type.Substitute(((DefinitionRef)field.DeclaringType).Arguments, []);
+            if (returns.All(p => ReferenceEquals(run.Interpreter.ReadValue(p.State, location, type, false, p.Phi), value)))
+                fields.Add((field, value.Bits, value.Width));
+        }
+        return constantWrites[program.Method] = fields.Distinct().ToArray();
     }
 
     // ---- 访问器 ----

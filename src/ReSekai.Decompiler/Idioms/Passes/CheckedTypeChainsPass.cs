@@ -1,5 +1,6 @@
 using ReSekai.Decompiler.Facts;
 using ReSekai.Decompiler.Ir;
+using ReSekai.Decompiler.Machine.Ssa;
 
 namespace ReSekai.Decompiler.Idioms;
 
@@ -42,6 +43,43 @@ internal static class CheckedTypeChainsPass
                 }
             }
 
+        return changed;
+    }
+
+    // 类型检查成功蕴含对象的继承深度足够；对象的类在后续显式转换时仍是同一个。
+    internal static bool RepeatedTypeDepthChecks(this IdiomState state)
+    {
+        var function = state.function;
+        var checks = function.Blocks.SelectMany(b => b.Statements).OfType<Call>()
+            .Where(c => c is { Op.Kind: OpKind.TypeCheck, Arguments.Length: 1, Defines.Length: 1 })
+            .ToDictionary(c => c.Defines[0]);
+        if (checks.Count == 0) return false;
+        var dominators = Dominators.Compute(function);
+        Expr Register(Expr expression) => state.defs.Expand(expression, v => state.defs.Raw(v) is not Load);
+        Expr Value(Expr expression) => expression is Use use ? state.defs.Raw(use.Variable) ?? expression : expression;
+        var changed = false;
+        foreach (var test in function.Blocks)
+        {
+            if (test.Statements.LastOrDefault() is not Branch branch
+                || state.defs.Expand(branch.Condition) is not Compare { Cond: Cond.Eq or Cond.Ne, Left: Use flag, Right: Const { Value: 0 } } result
+                || !checks.TryGetValue(flag.Variable, out var check)
+                || Value(Register(check.Arguments[0])) is not Load { Width: 64, Address: Use } klass) continue;
+            var address = result.Cond == Cond.Eq ? branch.Fallthrough : branch.Target;
+            var success = test.NormalSuccessors.FirstOrDefault(b => b.Start == address);
+            if (success is null || success.IsLandingPad || success.Predecessors is not [var source] || source != test) continue;
+            foreach (var block in function.Blocks.Where(b => dominators.Dominates(success.Index, b.Index)))
+                for (var i = 0; i < block.Statements.Count; i++)
+                {
+                    if (block.Statements[i] is not Call { Op.Kind: OpKind.ThrowIf, Op.Operand: "System.InvalidCastException", Arguments: [Compare { Cond: Cond.Ult } depth] } guard
+                        || Value(StripConversionsPass.StripConversions(Register(depth.Left))) is not Load { Width: 8, Address: Binary { Op: BinOp.Add, Right: Const { Value: RuntimeLayout.ClassTypeHierarchyDepth } } actual }
+                        || Value(Register(actual.Left)) != klass
+                        || StripConversionsPass.StripConversions(state.defs.Expand(depth.Right)) is not Load { Width: 8, Address: Binary { Op: BinOp.Add,
+                            Left: Symbol { Kind: SymbolKind.Class, Value: var type }, Right: Const { Value: RuntimeLayout.ClassTypeHierarchyDepth } } }
+                        || !Equals(type, check.Op!.Operand)) continue;
+                    block.Statements[i] = guard with { Arguments = [Expr.C(0, 1)] };
+                    changed = true;
+                }
+        }
         return changed;
     }
 }

@@ -5,7 +5,7 @@ namespace ReSekai.Decompiler.Machine.Ssa;
 
 
 
-/// <summary>常量状态标志经 φ 汇合后，只沿单前驱路径收窄取值，消除异常清理生成的不可达出口。</summary>
+/// <summary>沿已知入边收窄常量状态标志，消除异常清理生成的不可达出口。</summary>
 internal sealed class FiniteConditions(MachineFunction function)
 {
     public static bool Simplify(MachineFunction function)
@@ -84,24 +84,52 @@ internal sealed class FiniteConditions(MachineFunction function)
     private int? Side(Block block, Branch branch)
     {
         if (branch.Condition is not Compare { Cond: Cond.Eq or Cond.Ne, Left: Use use, Right: Const constant }
-            || use.Width != constant.Width || Values(use.Variable, []) is not { } possible) return null;
-        var remaining = possible.Select(v => v & Expr.Mask(use.Width)).Distinct().ToHashSet();
-        var child = block;
-        var seen = new HashSet<Block> { child };
-        // 单前驱说明每次进入 child 必定经过 parent 的该条边；SSA 值在沿途调用后仍不变。
-        while (child.Predecessors.ToArray() is [var parent] && seen.Add(parent))
+            || use.Width != constant.Width) return null;
+        HashSet<ulong> remaining = [];
+        if (definitions.GetValueOrDefault(use.Variable) is Phi phi && block.Statements.Contains(phi))
         {
-            if (parent.Statements.LastOrDefault() is Branch previous
-                && previous.Condition is Compare { Cond: Cond.Eq or Cond.Ne, Left: Use earlier, Right: Const compared } condition
-                && earlier.Variable == use.Variable && earlier.Width == use.Width && compared.Width == use.Width
-                && previous.Target != previous.Fallthrough && (child.Start == previous.Target || child.Start == previous.Fallthrough))
+            for (var i = 0; i < phi.Sources.Length; i++)
             {
-                var truth = child.Start == previous.Target;
-                remaining.RemoveWhere(v => (condition.Cond == Cond.Eq ? v == compared.Value : v != compared.Value) != truth);
+                var source = phi.Sources[i];
+                if (Projected(source, use.Width) is not { } incoming) return null;
+                var parent = block.Predecessors[i];
+                Restrict(incoming, source, use.Width, parent, block);
+                RestrictAlongChain(incoming, source, use.Width, parent);
+                remaining.UnionWith(incoming);
             }
-            child = parent;
+        }
+        else
+        {
+            if (Projected(use.Variable, use.Width) is not { } incoming) return null;
+            remaining = incoming;
+            RestrictAlongChain(remaining, use.Variable, use.Width, block);
         }
         var choices = remaining.Select(v => ((Compare)branch.Condition).Cond == Cond.Eq ? v == constant.Value : v != constant.Value).Distinct().ToArray();
         return choices is [var choice] ? choice ? 0 : 1 : null;
+    }
+
+    private HashSet<ulong>? Projected(Variable variable, int width) =>
+        Values(variable, [])?.Select(v => v & Expr.Mask(width)).ToHashSet();
+
+    private void RestrictAlongChain(HashSet<ulong> remaining, Variable variable, int width, Block child)
+    {
+        if (!definitions.TryGetValue(variable, out var definition)) return;
+        var seen = new HashSet<Block> { child };
+        // 单前驱说明每次进入 child 必定经过 parent 的该条边；SSA 值在沿途调用后仍不变。
+        while (!child.Statements.Contains(definition) && child.Predecessors.ToArray() is [var parent] && seen.Add(parent))
+        {
+            Restrict(remaining, variable, width, parent, child);
+            child = parent;
+        }
+    }
+
+    private static void Restrict(HashSet<ulong> remaining, Variable variable, int width, Block parent, Block child)
+    {
+        if (parent.Handler == child || parent.Statements.LastOrDefault() is not Branch previous
+            || previous.Condition is not Compare { Cond: Cond.Eq or Cond.Ne, Left: Use earlier, Right: Const compared } condition
+            || earlier.Variable != variable || earlier.Width != width || compared.Width != width
+            || previous.Target == previous.Fallthrough || child.Start != previous.Target && child.Start != previous.Fallthrough) return;
+        var truth = child.Start == previous.Target;
+        remaining.RemoveWhere(v => (condition.Cond == Cond.Eq ? v == compared.Value : v != compared.Value) != truth);
     }
 }

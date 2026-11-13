@@ -81,14 +81,18 @@ internal static class ExceptionStackValues
     {
         var definitions = function.Blocks.SelectMany(b => b.Statements).OfType<Define>().ToDictionary(d => d.Target);
         // 读取保留为各自的 SSA 变量：同一位置的两次读取不一定相等。
-        Expr Expand(Expr expression) => ExprMap.Map(expression, e => e is Use use && definitions.TryGetValue(use.Variable, out var d)
-            && !ExprMap.Walk(d.Value).Any(part => part is Load) ? Expand(d.Value) : null);
+        Expr Expand(Expr expression) => Fold.Simplify(ExprMap.Map(expression, e => e is Use use && definitions.TryGetValue(use.Variable, out var d)
+            && !ExprMap.Walk(d.Value).Any(part => part is Load) ? Fold.Extract(Expand(d.Value), 0, use.Width) : null));
         static Expr Strip(Expr value) => value is Convert c ? Strip(c.Operand) : value;
         Expr Index(Expr value)
         {
             value = Strip(value);
             if (value is Binary { Op: BinOp.Sub, Right: Const after } sub
                 && Strip(sub.Left) is Binary { Op: BinOp.Add, Right: Const before } add && before.Value == after.Value) return Index(add.Left);
+            if (value is Binary { Op: BinOp.Add, Right: Const afterAdd } wrapped
+                && Strip(wrapped.Left) is Binary { Op: BinOp.Add, Right: Const beforeAdd } previous
+                && wrapped.Width == previous.Width && Fold.Simplify(new Binary(BinOp.Add, beforeAdd, afterAdd, wrapped.Width)) is Const { Value: 0 })
+                return Index(previous.Left);
             // 长度字段放在栈槽时每次使用都重新读取：同一个槽的读取是同一个下标，前提是两次读取之间没有写它（见下面的回溯）。
             return value is Use use && definitions.TryGetValue(use.Variable, out var read) && Strip(read.Value) is Load { Address: FrameAddress } field ? field : value;
         }
@@ -104,8 +108,14 @@ internal static class ExceptionStackValues
             return expression is FrameAddress frame ? frame.Offset == buffer : ExprMap.Children(expression).Any(e => Exposed(e, buffer));
         }
         // 固定偏移的写入（长度已知时折叠的 push）也只是写入，不暴露基址。
-        bool Private(long buffer) => !function.Blocks.SelectMany(b => b.Statements).Any(s => s is Store store && (Slot(store.Target) is { } slot && slot.Buffer == buffer || store.Target is FrameAddress)
-            ? Exposed(store.Value, buffer) : ExprMap.Operands(s).Any(e => Exposed(e, buffer)));
+        bool Private(long buffer) => !function.Blocks.SelectMany(b => b.Statements).Any(s => s switch
+        {
+            Store store when Slot(store.Target) is { } slot && slot.Buffer == buffer || store.Target is FrameAddress => Exposed(store.Value, buffer),
+            // 调用点的 SP 用于定位栈参数，SP 本身不是被调用方收到的地址。
+            Call call => Exposed(call.Target, buffer) || call.Arguments.Any(e => Exposed(e, buffer))
+                || call.DelegateReceiver is { } receiver && Exposed(receiver, buffer),
+            _ => ExprMap.Operands(s).Any(e => Exposed(e, buffer)),
+        });
         var changed = false;
         var buffers = new HashSet<long>();
         foreach (var block in function.Blocks)
@@ -115,26 +125,7 @@ internal static class ExceptionStackValues
                 foreach (var load in ExprMap.Operands(statement).SelectMany(ExprMap.Walk).OfType<Load>().ToArray())
                 {
                     if (load.Width != 64 || Slot(load.Address) is not { } slot || !Private(slot.Buffer)) continue;
-                    var current = block;
-                    var at = i - 1;
-                    Store? push = null;
-                    var seen = new HashSet<Block>();
-                    var steps = 0;
-                    var stale = false;
-                    while (push is null && !stale && steps < 32 && seen.Add(current))
-                    {
-                        for (; at >= 0 && push is null && !stale; at--, steps++)
-                        {
-                            if (current.Statements[at] is not Store store) continue;
-                            if (Slot(store.Target) is { } candidate && candidate.Buffer == slot.Buffer) push = store;
-                            else if (slot.Index is Load { Address: FrameAddress length } && store.Target is FrameAddress written && written.Offset == length.Offset) stale = true;
-                        }
-                        if (stale) break;
-                        if (push is not null || current.Predecessors is not [var previous] || !previous.NormalSuccessors.Contains(current)) break;
-                        current = previous;
-                        at = current.Statements.Count - 1;
-                    }
-                    if (push is not { Value.Width: 64 } || Slot(push.Target)!.Value.Index != slot.Index
+                    if (ReachingPush(block, i, slot) is not { Value.Width: 64 } push
                         || ExprMap.Walk(push.Value).Any(e => e is Load)) continue;
                     statement = ExprMap.MapOperands(statement, e => ExprMap.Map(e, part => part == load ? push.Value : null));
                     block.Statements[i] = statement;
@@ -144,6 +135,43 @@ internal static class ExceptionStackValues
             }
         changed |= RemoveUnreadPushes(function, Slot);
         return changed;
+
+        Store? ReachingPush(Block block, int end, (long Buffer, Expr Index) slot)
+        {
+            var budget = 512;
+            var found = new Dictionary<(Block, int), Store?>();
+            return Visit(block, end);
+
+            Store? Visit(Block current, int limit)
+            {
+                for (var i = limit - 1; i >= 0 && --budget > 0; i--)
+                {
+                    if (current.Statements[i] is Opaque) return null;
+                    if (current.Statements[i] is not Store store) continue;
+                    if (Slot(store.Target) is { } candidate && candidate.Buffer == slot.Buffer)
+                        return candidate.Index == slot.Index ? store : null;
+                    if (store.Target is FrameAddress written && (written.Offset >= slot.Buffer
+                        || slot.Index is Load { Address: FrameAddress length } && written.Offset == length.Offset)) return null;
+                }
+                if (--budget <= 0 || current.Predecessors.Count == 0) return null;
+                Store? common = null;
+                foreach (var previous in current.Predecessors)
+                {
+                    // 异常边可能在块尾调用完成之前离开；之前的显式写入仍可见。
+                    var end = previous.Handler == current && previous.Statements.LastOrDefault() is Call
+                        ? previous.Statements.Count - 1 : previous.Statements.Count;
+                    var edge = (previous, end);
+                    if (!found.TryGetValue(edge, out var incoming))
+                    {
+                        found.Add(edge, null);
+                        found[edge] = incoming = Visit(previous, end);
+                    }
+                    if (incoming is null || common is not null && !ReferenceEquals(common, incoming)) return null;
+                    common = incoming;
+                }
+                return common;
+            }
+        }
     }
 
     /// <summary>

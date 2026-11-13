@@ -125,13 +125,18 @@ public static partial class SourceReferences
     /// <summary>占位值的类型实参不能是按引用类型：按引用的占位写成 Unrecovered.Ref&lt;T&gt;。</summary>
     private static void AddPlaceholderReference(ModuleDefinition main, HashSet<ModuleDefinition> changed)
     {
-        if (main.GetType("ReSekai.Decompiler", "Unrecovered") is not { } type || type.Methods.FirstOrDefault(m => m.Name == "Value") is not { } value) return;
+        if (main.GetType("ReSekai.Decompiler", "Unrecovered") is not { } type
+            || type.Methods.FirstOrDefault(m => m.Name == "Value") is not { } value
+            || type.Methods.FirstOrDefault(m => m.Name == "Fail") is not { } fail) return;
         var method = new MethodDefinition("Ref", value.Attributes, main.TypeSystem.Void);
         var parameter = new GenericParameter("T", method);
         method.GenericParameters.Add(parameter);
         method.ReturnType = new ByReferenceType(parameter);
         method.Parameters.Add(new ParameterDefinition("address", ParameterAttributes.None, main.TypeSystem.UInt64));
-        Throwing(method);
+        var il = method.Body.GetILProcessor();
+        il.Emit(OpCodes.Ldarg_0);
+        il.Emit(OpCodes.Call, fail);
+        il.Emit(OpCodes.Throw);
         type.Methods.Add(method);
         changed.Add(main);
     }

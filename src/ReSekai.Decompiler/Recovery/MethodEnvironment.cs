@@ -108,9 +108,12 @@ internal sealed class MethodEnvironment(MethodRef method, MachineSignature signa
             foreach (var value in signature.Arguments)
                 foreach (var piece in value.Pieces.Where(p => p.Register.Bank == Bank.Stack))
                 {
-                    Sym content = value.Transfer == Transfer.Value
-                        ? syms.Slice(syms.Arg(value.Index, ValueWidth(value)), piece.Offset * 8, piece.Width)
-                        : syms.Local(LocalSpace.Copy(value.Index), 0);
+                    Sym content = value.Transfer switch
+                    {
+                        Transfer.Value => syms.Slice(syms.Arg(value.Index, ValueWidth(value)), piece.Offset * 8, piece.Width),
+                        Transfer.Reference => syms.Arg(value.Index, 64),
+                        _ => syms.Local(LocalSpace.Copy(value.Index), 0),
+                    };
                     for (var b = 0; b < content.Width / 8; b++)
                     {
                         var at = piece.Register.Index + b - cell.Start;

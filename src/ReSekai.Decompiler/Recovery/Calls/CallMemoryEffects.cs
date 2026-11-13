@@ -23,7 +23,8 @@ internal sealed class CallMemoryEffects(Func<Call, CallShape> shapes, ManagedAbi
             return (rule.Behavior.Kinds & EffectKind.Read) != 0 ? new(-1, MemoryAccess.Read, false) : ArgumentUse.None;
         }
         foreach (var value in shape.Signature?.Indirections ?? [])
-            if (call.ArgumentIndex(value.Pieces[0].Register) == index) return new(value.Size, value.Access, false);
+            if (call.ArgumentIndex(value.Pieces[0].Register) == index)
+                return new(value.Size, value.Access, false) { WritesResult = value.Transfer == Transfer.ResultBuffer };
         // 按引用类型传递的栈地址只能是栈上临时对象：codegen 保证它只在这次调用期间存在，调用不改写它。
         foreach (var value in shape.Signature?.Arguments ?? [])
             if (value.Transfer == Transfer.Value && ManagedTypes.IsReferenceType(value.Type) && call.ArgumentIndex(value.Pieces[0].Register) == index)

@@ -22,8 +22,26 @@ internal sealed class EntryFacts
         public State Copy() => new() { Vars = new(Vars), Known = new(Known), Literals = new(Literals), NonNull = [.. NonNull], Initialized = [.. Initialized] };
 
         /// <summary>v 等于位置 e 此刻的内容：v 的定义就是 e，或 e 已知存着与 v 相同的值。</summary>
-        private bool Holds(Variable variable, ManagedValue location) =>
-            Vars.TryGetValue(variable, out var defined) && (defined.Equals(location) || Known.TryGetValue(location, out var content) && content.Equals(defined));
+        private bool Holds(Variable variable, ManagedValue location) => Vars.TryGetValue(variable, out var defined) && Holds(defined, location);
+
+        private bool Holds(ManagedValue defined, ManagedValue location) => (defined, location) switch
+        {
+            (_, ConversionValue converted) when defined is ConversionValue source && source.Kind == converted.Kind && source.Width == converted.Width
+                => Holds(source.Operand, converted.Operand),
+            (ConstantValue { Bits: 0 }, ConversionValue { Kind: ConvKind.ZeroExtend or ConvKind.SignExtend } extension)
+                => Holds(new ConstantValue(0, extension.Operand.Type, extension.Operand.Width), extension.Operand),
+            (FieldValue a, FieldValue b) when a.Field.Equals(b.Field) && a.Receiver.Equals(b.Receiver) => true,
+            _ => defined.Equals(location) || Known.TryGetValue(location, out var content) && content.Equals(defined)
+                || location is FieldValue field && Known.Any(pair => pair.Key is FieldValue written
+                    && field.Field.Equals(written.Field) && field.Receiver.Equals(written.Receiver) && pair.Value.Equals(defined)),
+        };
+
+        private static bool IsLocation(ManagedValue? value) => value switch
+        {
+            FieldValue or StaticFieldValue or ArrayElementValue => true,
+            ConversionValue { Kind: ConvKind.ZeroExtend or ConvKind.SignExtend } conversion => IsLocation(conversion.Operand),
+            _ => false,
+        };
 
         public bool Narrow(State other)
         {
@@ -32,7 +50,7 @@ internal sealed class EntryFacts
             {
                 if (other.Vars.TryGetValue(k, out var o) && o.Equals(v)) continue;
                 // 两侧定义不同，但都等于同一位置的内容：保留为该位置的读取。
-                var location = o is FieldValue or StaticFieldValue or ArrayElementValue ? o : v is FieldValue or StaticFieldValue or ArrayElementValue ? v : null;
+                var location = IsLocation(o) ? o : IsLocation(v) ? v : null;
                 if (o is not null && location is not null && Holds(k, location) && other.Holds(k, location))
                 {
                     if (!v.Equals(location)) { Vars[k] = location; changed = true; }
@@ -53,19 +71,24 @@ internal sealed class EntryFacts
 
     private readonly Program program;
     private readonly Func<ManagedCall, bool>? readOnly;
+    private readonly Func<ManagedCall, (FieldRef Field, ulong Bits, int Width)[]>? constantWrites;
     private readonly Dictionary<ulong, State> entries = [];
 
     /// <summary>不动点迭代处理的块数（诊断）。</summary>
     public int Visits { get; }
 
-    public EntryFacts(Program program, Func<ManagedCall, bool>? readOnly = null)
+    public EntryFacts(Program program, Func<ManagedCall, bool>? readOnly = null,
+        Func<ManagedCall, (FieldRef Field, ulong Bits, int Width)[]>? constantWrites = null)
     {
         this.program = program;
         this.readOnly = readOnly;
+        this.constantWrites = constantWrites;
         var body = program.Body;
         var handlers = body.Regions.Select(r => r.HandlerEntry).Where(program.Blocks.ContainsKey).ToHashSet();
         var roots = new List<ulong> { body.Blocks[0].Address };
         roots.AddRange(handlers.Where(h => h != body.Blocks[0].Address));
+        var singleIncoming = body.Blocks.SelectMany(b => b.Statements.TakeLast(1)).SelectMany(Outgoing)
+            .GroupBy(o => o.Edge.Target).Where(g => g.Count() == 1).Select(g => g.Key).Except(roots).ToHashSet();
         var rank = ReversePostorder(roots);
         // 按逆后序取块、队列去重：前驱大多先于后继处理，合流处的取交次数少。
         var pending = new SortedSet<(int Rank, ulong Block)>();
@@ -94,7 +117,8 @@ internal sealed class EntryFacts
                         var arriving = facts.Copy();
                         if (literal is var (condition, value) && Evaluable(condition)) arriving.Literals[condition] = value;
                         Copies(edge, arriving);
-                        if (!entries.TryGetValue(edge.Target, out var known))
+                        // 唯一入边重新计算后直接替换旧状态。旧迭代的表达式可能已经被更简洁的等价定义取代。
+                        if (singleIncoming.Contains(edge.Target) || !entries.TryGetValue(edge.Target, out var known))
                         {
                             entries[edge.Target] = arriving;
                             Enqueue(edge.Target);
@@ -282,6 +306,12 @@ internal sealed class EntryFacts
                     // 取址交出的局部可能被改写。
                     foreach (var local in ManagedValues.Of(call.Invocation).SelectMany(ManagedValues.Walk).OfType<AddressValue>().Select(a => a.Target).OfType<LocalValue>())
                         Redefine(facts, local.Variable);
+                    if (call is { Inlined: true, Invocation.Receiver: LocalValue or ArgumentValue } && constantWrites is not null)
+                        foreach (var (field, bits, width) in constantWrites(call))
+                        {
+                            var type = field.Field.Type.Substitute(((DefinitionRef)field.DeclaringType).Arguments, []);
+                            facts.Known[new FieldValue(call.Invocation.Receiver!, field, type, width)] = new ConstantValue(bits, type, width);
+                        }
                     break;
                 }
             default:
