@@ -22,6 +22,13 @@ var reader = new Binary([0, 1, 0, 0, 0, 0, 0, 0], offset: 1);
 Value.Read(new Schema("UInt8", "flag", 1, 0x4000), reader);
 Assert(reader.Position == 4, "必须按文件位置对齐");
 Assert(Output.Safe("CON.txt") == "_CON.txt", "Windows 保留名");
+var prefab = new Document("player", 1, 1, Output.Guid("prefab"), [1, 2, 3, 4, long.MinValue]) { Prefab = true };
+var reordered = new Document("player", 1, 1, prefab.Guid, prefab.Objects.Reverse().ToArray()) { Prefab = true };
+prefab.MapPrefabFileIds();
+reordered.MapPrefabFileIds();
+Assert(prefab.Objects.Select(prefab.FileId).Distinct().Count() == prefab.Objects.Length
+    && prefab.Objects.All(id => prefab.FileId(id) >= 1L << 62 && prefab.FileId(id) == reordered.FileId(id))
+    && prefab.FileId(0) == 0, "Prefab fileID 稳定且不与保留 ID 重叠");
 Console.WriteLine("基础检查通过");
 if (args.Length == 0) return 0;
 using Apk apk = new(args[0]);

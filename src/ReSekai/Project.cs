@@ -19,6 +19,21 @@ sealed class Document(string file, long main, int classId, string guid, long[] o
     public bool Imported => Texture is not null || ClassId is 49 or 48 or 72 or 128 or 83;
     public int RefType => Prefab || Scene || Imported ? 3 : 2;
     public long FileId(long id) => FileIds.TryGetValue(id, out var mapped) ? mapped : Imported ? ClassId * 100000L : id;
+
+    public void MapPrefabFileIds()
+    {
+        // Player 的 PathID 可能是短序号，PrefabImporter 会把部分短 ID 识别为保留 ID。
+        const long highBit = 1L << 62;
+        const long mask = highBit - 1;
+        HashSet<long> used = [];
+        foreach (long id in Objects.Order())
+        {
+            string hash = Output.Guid(FormattableString.Invariant($"prefab:{Guid}:{id}"));
+            long fileId = Convert.ToInt64(hash[..16], 16) & mask;
+            while (!used.Add(fileId | highBit)) fileId = (fileId + 1) & mask;
+            FileIds.Add(id, fileId | highBit);
+        }
+    }
 }
 
 readonly record struct Target(string Guid, long Id, int Type);
@@ -165,7 +180,10 @@ sealed class Project(Output output, Scripts scripts, ScriptLayout layouts, Packa
                 }
             }
             foreach (var document in documents)
+            {
+                if (document.Prefab) document.MapPrefabFileIds();
                 foreach (long id in document.Objects) targets[new(file.Name, id)] = new(document.Guid, document.FileId(id), document.RefType);
+            }
 
             void Add(ObjectInfo main, ObjectInfo[] children, string guid, bool prefab)
             {
