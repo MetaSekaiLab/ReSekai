@@ -93,8 +93,9 @@ internal static class ReadOnlyDataNormalizer
             if (Limit(index, []) is > 0 and var intrinsic) return intrinsic;
             bool SameIndex(Expr compared)
             {
-                var checkedValue = IndexValue(compared, definitions);
-                var loadedValue = IndexValue(index, definitions);
+                // 查表地址已经递归展开；同样展开比较的索引以比较同一个 SSA 值。
+                var checkedValue = Address(IndexValue(compared, definitions));
+                var loadedValue = Address(IndexValue(index, definitions));
                 if (checkedValue == loadedValue) return true;
                 // 无符号检查显式屏蔽高位时，与窄索引观察同一组位；不合并任意不同宽度快照。
                 if (checkedValue is Binary { Op: BinOp.And, Right: Const mask } masked && index.Width is 8 or 16

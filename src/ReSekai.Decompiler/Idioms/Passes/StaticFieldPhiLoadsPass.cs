@@ -28,7 +28,7 @@ internal static class StaticFieldPhiLoadsPass
         foreach (var block in state.function.Blocks)
             foreach (var phi in block.Statements.OfType<Phi>().ToArray())
             {
-                if (block.Predecessors.Any(p => p.NormalSuccessors.Count() != 1 || p.Handler == block))
+                if (block.IsLandingPad || block.Predecessors.Any(p => p.Handler == block))
                     continue;
                 foreach (var statement in block.Statements.Where(s => s is not Phi).ToArray())
                 {
@@ -39,8 +39,8 @@ internal static class StaticFieldPhiLoadsPass
                         var expanded = state.defs.Expand(load);
                         if (!ExprMap.Walk(expanded).OfType<Use>().Any(u => u.Variable == phi.Target))
                             continue;
-                        var values = phi.Sources.Select(v => ResolveMetadata(ExprMap.Map(expanded, part => part is Use use && use.Variable == phi.Target ? state.defs.Expand(new Use(v, v.Width)) : null))).ToArray();
-                        if (values.Any(v => v is not Load l || SplitPass.Split(l.Address).Basis is not (Symbol { Kind: SymbolKind.StaticFields } or Use)))
+                        var values = phi.Sources.Select(v => Distribute(ExprMap.Map(expanded, part => part is Use use && use.Variable == phi.Target ? state.defs.Expand(new Use(v, v.Width)) : null))).ToArray();
+                        if (!values.All(Valid) || values.Where((v, i) => block.Predecessors[i].NormalSuccessors.Count() != 1 && v is not Symbol { Kind: SymbolKind.String }).Any())
                             continue;
                         var target = state.Fresh(load.Width);
                         var incoming = new Variable[values.Length];
@@ -62,5 +62,26 @@ internal static class StaticFieldPhiLoadsPass
             }
 
         return changed;
+
+        Expr Distribute(Expr value)
+        {
+            if (value is Load { Address: Select choice } read)
+            {
+                var taken = ResolveMetadata(read with { Address = choice.True });
+                var fallthrough = ResolveMetadata(read with { Address = choice.False });
+                if (taken is Symbol { Kind: SymbolKind.String } && fallthrough is Load { Address: FrameAddress }
+                    || fallthrough is Symbol { Kind: SymbolKind.String } && taken is Load { Address: FrameAddress })
+                    return new Select(choice.Condition, taken, fallthrough, read.Width);
+            }
+            return ResolveMetadata(value);
+        }
+
+        static bool Valid(Expr value) => value switch
+        {
+            Symbol { Kind: SymbolKind.String } => true,
+            Load l => SplitPass.Split(l.Address).Basis is Symbol { Kind: SymbolKind.StaticFields } or Use or FrameAddress,
+            Select choice => Valid(choice.True) && Valid(choice.False),
+            _ => false,
+        };
     }
 }

@@ -260,6 +260,14 @@ public static partial class Arm64Lifter
                         SetV(Rd, q ? new Insert(V(Rd, 128), narrowed, 64) : narrowed);
                         return;
                     }
+                case (false, 0x12) when size < 3:
+                    {
+                        // xtn/xtn2：取每个宽元素的低位，写入低半或保留低半后写入高半。
+                        var to = 8 << size;
+                        var narrowed = Pack(64, to, i => Field(V(Rn, 128), i * to * 2, to));
+                        SetV(Rd, q ? new Insert(V(Rd, 128), narrowed, 64) : narrowed);
+                        return;
+                    }
                 case (false, 0x0C or 0x0D or 0x0E) or (true, 0x0C or 0x0D) when size >= 2 && !floatReserved:
                     {
                         var cond = (u, opcode) switch

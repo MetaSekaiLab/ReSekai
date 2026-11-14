@@ -304,7 +304,7 @@ internal sealed class RegionProver(ManagedTypes types, InlineEvidence evidence, 
     /// <summary>发现：模板与调用方共同执行；有路径因绑定太晚或形参被常量折叠而失败时，带着绑定与缩窄重试。</summary>
     private List<PathOutcome>? Discover(Attempt attempt, out string? failure) => Discover(attempt, out failure, out _);
 
-    private List<PathOutcome>? Discover(Attempt attempt, out string? failure, out bool anchored)
+    private List<PathOutcome>? Discover(Attempt attempt, out string? failure, out bool anchored, bool optionalDefaults = false)
     {
         anchored = false;
         var seed = new Dictionary<Term, Term>(ReferenceEqualityComparer.Instance);
@@ -317,6 +317,19 @@ internal sealed class RegionProver(ManagedTypes types, InlineEvidence evidence, 
             attempt.Solver.Reset(seed);
             attempt.Solver.Allocations.Clear();
             var path = new JointPath { A = TemplateSide(attempt), B = CallerSide(attempt, attempt.Caller, true), Phi = attempt.Entry.Phi };
+            var constructor = attempt.Candidate.Kind == ReplacementKind.Construct;
+            var parameters = attempt.Candidate.Method.Method.Parameters;
+            if (round == 0 && constructor && optionalDefaults)
+            {
+                // 元数据默认值只提供实参候选；出口与复核仍比较构造的全部效果。
+                for (var i = 0; i < parameters.Count; i++)
+                {
+                    var formal = attempt.Formals[i + 1];
+                    if (parameters[i] is { HasDefault: true } parameter && OptionalBits(parameter.DefaultValue) is { } bits
+                        && formal.IsAtom(AtomKind.Formal)) seed[formal] = attempt.Terms.Constant(bits, formal.Width);
+                }
+                attempt.Solver.Reset(seed);
+            }
             if (round == 0 && WrappedReceiverSeed(attempt) is { } receiver)
             {
                 seed[attempt.Formals[0]] = receiver;
@@ -328,6 +341,8 @@ internal sealed class RegionProver(ManagedTypes types, InlineEvidence evidence, 
                 Settled = p => Exits(attempt, new PathOutcome(p, null), out unsettled, true).Count > 0,
                 Eager = new HashSet<(Program, int, int)>(eager),
                 Formals = attempt.Formals,
+                ConstructorEnumFormals = constructor ? parameters.Select((p, i) => (Type: attempt.Candidate.Method.Concrete(p.Type), Term: attempt.Formals[i + 1]))
+                    .Where(p => p.Type is DefinitionRef { Definition.IsEnum: true }).Select(p => p.Term).ToHashSet() : null,
             };
             // 第一条失败路径就足以推出缩窄；其余路径在重试中再走。
             outcomes = joint.Run(path, true);
@@ -347,6 +362,18 @@ internal sealed class RegionProver(ManagedTypes types, InlineEvidence evidence, 
         }
         return null;
     }
+
+    private static ulong? OptionalBits(object? value) => value switch
+    {
+        bool bit => bit ? 1UL : 0UL,
+        byte number => number, sbyte number => unchecked((ulong)number),
+        ushort number => number, short number => unchecked((ulong)number),
+        uint number => number, int number => unchecked((ulong)number),
+        ulong number => number, long number => unchecked((ulong)number),
+        float number => unchecked((uint)BitConverter.SingleToInt32Bits(number)),
+        double number => unchecked((ulong)BitConverter.DoubleToInt64Bits(number)),
+        _ => null,
+    };
 
     /// <summary>尝试在同布局的单字段包装副本上执行。入口的叶子值按底层字段位置建立，合成后仍须复核全部路径。</summary>
     private Term? WrappedReceiverSeed(Attempt attempt)
@@ -818,7 +845,8 @@ internal sealed class RegionProver(ManagedTypes types, InlineEvidence evidence, 
     /// 证明一次替换：发现、选出口、合成替换程序、复核。progress 是失败时比较走得多远（覆盖的调用方语句数），用于挑选诊断。
     /// </summary>
     /// <param name="useful">替换是否有进展（覆盖了要证的内容）；没有进展的替换不算成立，继续试其他出口与方案。</param>
-    public Outcome Prove(Program caller, EntryFacts facts, ulong block, int index, Candidate candidate, Func<TracePoint, bool> anchor, Func<ManagedBody, bool>? useful = null)
+    public Outcome Prove(Program caller, EntryFacts facts, ulong block, int index, Candidate candidate, Func<TracePoint, bool> anchor, Func<ManagedBody, bool>? useful = null,
+        bool optionalDefaults = false)
     {
         var terms = new TermTable(types);
         var solver = new Solver(terms, types);
@@ -840,7 +868,7 @@ internal sealed class RegionProver(ManagedTypes types, InlineEvidence evidence, 
             Plans = notes.ToImmutableList(),
             Profile = $"发现 {discovered} 出口 {exited - discovered} 合成 {syntheses}/{synthesized} 复核 {validations}/{validated} ms",
         };
-        var outcomes = Discover(attempt, out var failure, out var anchored);
+        var outcomes = Discover(attempt, out var failure, out var anchored, optionalDefaults);
         discovered = exited = clock.ElapsedMilliseconds;
         if (outcomes is null) return Done(new(null, failure ?? "比对失败", 0, "") { AnchorFree = !anchored });
         if (InlineTrace.Sink is not null)

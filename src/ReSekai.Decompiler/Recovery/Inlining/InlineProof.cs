@@ -106,6 +106,13 @@ internal sealed class InlineProof
         if (memo.TryGetValue(key, out var known)) return known with { Steps = 0 };
         var outcome = prover.Prove(program, facts, block, index, candidate, anchor, useful);
         spent += outcome.Steps;
+        if (outcome.Body is null && !Spent && candidate.Kind == ReplacementKind.Construct
+            && candidate.Method.Method.Parameters.Count > 0 && candidate.Method.Method.Parameters.All(p => p.HasDefault))
+        {
+            var retry = prover.Prove(program, facts, block, index, candidate, anchor, useful, optionalDefaults: true);
+            spent += retry.Steps;
+            if (retry.Body is not null) outcome = retry;
+        }
         if (outcome.AnchorFree) memo[key] = outcome;
         return outcome;
     }
@@ -713,7 +720,8 @@ internal sealed class InlineProof
         {
             var definition = method.Method;
             var receiverParameter = definition.IsStatic && !isStatic;
-            var libraryBufferRead = !write && LibraryAccessors.IsNativeArrayBufferRead(method, field) && receiver?.Equals(owner) == true;
+            var libraryBufferRead = !write && LibraryAccessors.IsNativeArrayBufferRead(method, field)
+                && (receiver is ByRefRef reference ? reference.Element : receiver)?.Equals(owner) == true;
             var shape = write
                 ? definition.Parameters.Count == 1 && ManagedTypes.IsVoid(definition.ReturnType) && definition.IsStatic == isStatic
                 : !ManagedTypes.IsVoid(definition.ReturnType) && (receiverParameter
@@ -755,10 +763,21 @@ internal sealed class InlineProof
         ManagedValue Resolve(ManagedValue value, bool target)
         {
             value = ManagedValues.Map(value, child => Resolve(child, false));
+            // 无检查 NativeArray 缓冲区访问器按值接收。被引用的接收者在这一点读取快照，仍只取同一个缓冲区地址。
+            if (!target && value is FieldValue { Pending: { Write: false }, Field.Field: { Name: "m_Buffer", Owner.FullName: "Unity.Collections.NativeArray" },
+                    Receiver: { Type: ByRefRef reference } receiver } buffer
+                && reference.Element.Equals(buffer.Field.DeclaringType)
+                && Accessor(buffer.Field, buffer.Type, false, reference.Element) is { ReceiverParameter: true } access)
+                return buffer with { Receiver = new IndirectValue(receiver, reference.Element, types.ValueWidth(reference.Element)), Accessor = access, Pending = null };
             return value switch
             {
                 FieldValue { Pending: { } pending } field when pending.Write == target =>
-                    Accessor(field.Field, field.Type, pending.Write, field.Receiver.Type) is { } accessor ? field with { Accessor = accessor, Pending = null }
+                    Accessor(field.Field, field.Type, pending.Write, field.Receiver.Type) is { } accessor ? field with
+                        {
+                            Accessor = accessor, Pending = null,
+                            Receiver = accessor.ReceiverParameter && field.Receiver.Type is ByRefRef fieldReference
+                                ? new IndirectValue(field.Receiver, fieldReference.Element, types.ValueWidth(fieldReference.Element)) : field.Receiver,
+                        }
                         : field with { Pending = WithAccessorFailure(pending, field.Field, field.Type, field.Receiver.Type) },
                 StaticFieldValue { Pending: { } pending } field when pending.Write == target =>
                     Accessor(field.Field, field.Type, pending.Write, null) is { } accessor ? field with { Accessor = accessor, Pending = null }

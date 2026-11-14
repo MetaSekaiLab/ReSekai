@@ -205,10 +205,11 @@ internal sealed class DelegateCallNormalizer
             || DelegateFacts.Invoke(type) is not { } invoke || abi.Classify(invoke, out _) is not { } signature
             // 参数占满寄存器时 MethodInfo 在栈上，没有寄存器见证；目标与 x0 同根已经指名这个委托。
             || signature.MethodInfo is { } info && !Field(registers.GetValueOrDefault(info.Register), 0x28)) return null;
-        if (signature.Parameters.Any(a => a.Passing == Passing.Stack)) return null;
+        if (signature.Parameters.Any(a => a.Passing == Passing.Stack) && call.StackPointer is not FrameAddress) return null;
         if (call.Memory.Length > 0 && !invoke.Equals(call.Resolved)) return null;
         // 经指针访问的局部单元属于这次调用，随调用保留。
         var sources = signature.Parameters.SelectMany(a => a.Pieces).Select(p => p.Register)
+            .Where(r => r.Bank != Bank.Stack)
             .Concat(signature.Return is { Passing: Passing.Indirect } indirect ? indirect.Pieces.Select(p => p.Register) : [])
             .Concat(call.Sources.Where(r => r.Bank == Bank.Local)).Distinct().ToArray();
         if (sources.Any(r => !registers.ContainsKey(r))) return null;

@@ -230,7 +230,7 @@ internal sealed class Interpreter(ManagedTypes types, Solver solver, InlineEvide
             {
                 var value = part.Kind == TermKind.Tuple ? (j < part.Args.Length ? part.Args[j] : null) : j == 0 ? part : null;
                 if (value is null) return null;
-                args[i] = value;
+                args[i] = Fit(value, all[i].Width);
                 j++;
             }
         if (j == 0 || part.Kind == TermKind.Tuple && j != part.Args.Length) return null;
@@ -984,6 +984,17 @@ internal sealed class Interpreter(ManagedTypes types, Solver solver, InlineEvide
             return;
         }
         Finish(side, side.Top, result);
+    }
+
+    /// <summary>对应的值类型构造在各自的局部单元内生成相同的新值，单元地址不跨过托管调用。</summary>
+    public void CompleteValueConstructor(SideState side, EventInfo evt, Term result, TypeRef type)
+    {
+        foreach (var argument in evt.Arguments) Escape(side, argument);
+        Barrier(side);
+        side.Events++;
+        Write(side, evt.Receiver!.Location, result, type);
+        side.Stop = null;
+        Finish(side, side.Top, null);
     }
 
     /// <summary>展开构造：引用类型先停在分配事件上，分配完成后压入构造函数的帧；值类型直接压帧。</summary>

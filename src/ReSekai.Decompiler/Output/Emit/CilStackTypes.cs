@@ -435,6 +435,11 @@ internal static class CilStackTypes
                 case Code.Ldvirtftn: PopOneOf("对象", Kind.Object); Push(I); break;
                 case Code.Sizeof: Push(I4); break;
                 case Code.Localloc: PopOneOf("大小", Kind.Int32, Kind.NativeInt); Push(I); break;
+                case Code.Initblk:
+                    PopOneOf("大小", Kind.Int32, Kind.NativeInt);
+                    PopOneOf("填充值", Kind.Int32);
+                    PopOneOf("地址", Kind.Reference, Kind.NativeInt);
+                    break;
                 case Code.Throw: PopOneOf("异常", Kind.Object); return ([], false);
                 case Code.Rethrow: return ([], false);
                 case Code.Endfinally: stack.Clear(); return ([], false);

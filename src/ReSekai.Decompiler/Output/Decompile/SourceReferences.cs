@@ -166,7 +166,7 @@ public static partial class SourceReferences
         }
     }
 
-    /// <summary>按主程序集方法体的用法放宽它自己的声明，放宽到够用为止：写成 internal，虚方法族写成 public。</summary>
+    /// <summary>按主程序集方法体的用法放宽它自己的声明，保留已有的程序集外访问路径。虚方法族需要放宽时一起写成 public。</summary>
     private sealed class Declarations(ModuleDefinition main, HashSet<ModuleDefinition> changed)
     {
         private readonly HashSet<FieldDefinition> demoted = [];
@@ -263,8 +263,9 @@ public static partial class SourceReferences
                 var attributes = field.DeclaringType.CustomAttributes;
                 foreach (var attribute in attributes.Where(a => a.AttributeType.FullName == "System.Runtime.CompilerServices.IsReadOnlyAttribute").ToArray()) attributes.Remove(attribute);
             }
-            if (Accessible(field.Attributes & FieldAttributes.FieldAccessMask, field.DeclaringType, field.IsStatic, instruction, method)) return;
-            field.Attributes = field.Attributes & ~FieldAttributes.FieldAccessMask | FieldAttributes.Assembly;
+            var access = field.Attributes & FieldAttributes.FieldAccessMask;
+            if (Accessible(access, field.DeclaringType, field.IsStatic, instruction, method)) return;
+            field.Attributes = field.Attributes & ~FieldAttributes.FieldAccessMask | WithAssemblyAccess(access);
             changed.Add(field.Module);
             Raise(field.FieldType, false);
         }
@@ -327,10 +328,14 @@ public static partial class SourceReferences
         {
             if (target.Module != main) return;
             var isFunctionPointer = instruction.OpCode.Code is Code.Ldftn or Code.Ldvirtftn;
-            if (Accessible((FieldAttributes)(target.Attributes & MethodAttributes.MemberAccessMask), target.DeclaringType, target.IsStatic || isFunctionPointer, instruction, method)) return;
+            var access = (FieldAttributes)(target.Attributes & MethodAttributes.MemberAccessMask);
+            if (Accessible(access, target.DeclaringType, target.IsStatic || isFunctionPointer, instruction, method)) return;
             if (target.IsVirtual) Family(target);
-            else Widen(target, MethodAttributes.Assembly);
+            else Widen(target, (MethodAttributes)WithAssemblyAccess(access));
         }
+
+        private static FieldAttributes WithAssemblyAccess(FieldAttributes access) =>
+            access is FieldAttributes.Family or FieldAttributes.FamORAssem ? FieldAttributes.FamORAssem : FieldAttributes.Assembly;
 
         private void Widen(MethodDefinition method, MethodAttributes access)
         {

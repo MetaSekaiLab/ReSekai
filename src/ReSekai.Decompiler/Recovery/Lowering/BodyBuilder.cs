@@ -108,6 +108,7 @@ internal sealed partial class BodyBuilder
         var done = new HashSet<PhiSym>();
         var copies = new Dictionary<(Block From, Block To, int Index), List<ManagedCopy>>();
         var doneStructs = new HashSet<StructPhiPlan>();
+        var doneChoices = 0;
         var outputs = lowered.ToDictionary(l => l.Block, l => l.Statements);
         // 入边上的值需要语句时写在前驱末尾（终结语句尚未加入）；异常边的赋值另有位置，不接受语句。
         void OnEdge(Block from, Block to)
@@ -119,7 +120,7 @@ internal sealed partial class BodyBuilder
         {
             var pending = phis.Except(done).ToArray();
             var pendingStructs = structPhis.Values.Except(doneStructs).ToArray();
-            if (pending.Length == 0 && pendingStructs.Length == 0) break;
+            if (pending.Length == 0 && pendingStructs.Length == 0 && doneChoices == delegateChoices.Count) break;
             foreach (var phi in pending)
             {
                 done.Add(phi);
@@ -142,6 +143,18 @@ internal sealed partial class BodyBuilder
                     OnEdge(from, plan.Block);
                     if (!copies.TryGetValue((from, plan.Block, j), out var list)) copies[(from, plan.Block, j)] = list = [];
                     list.Add(new ManagedCopy(plan.Local, StructPhiSource(plan, j, from.End)));
+                }
+            }
+            // 边上只合流已知方法的编号，委托仍在原构造位置创建。
+            while (doneChoices < delegateChoices.Count)
+            {
+                var choice = delegateChoices[doneChoices++];
+                for (var j = 0; j < choice.Phi.Block.Predecessors.Count; j++)
+                {
+                    var from = choice.Phi.Block.Predecessors[j];
+                    OnEdge(from, choice.Phi.Block);
+                    if (!copies.TryGetValue((from, choice.Phi.Block, j), out var list)) copies[(from, choice.Phi.Block, j)] = list = [];
+                    list.Add(new ManagedCopy(choice.Local, DelegateChoiceValue(choice.Sources[j], choice.Methods, from.End)));
                 }
             }
         }
@@ -185,9 +198,37 @@ internal sealed partial class BodyBuilder
             r.Try.Where(reachable.Contains).Select(b => b.Start).ToArray(), r.Pad.Start, r.Handler.Where(reachable.Contains).Select(b => b.Start).ToArray(),
             r.BeginCatch is { } begin ? exceptions[begin] : null, r.IsCatch ? ManagedRegionKind.Catch : ManagedRegionKind.Fault)).ToArray();
         var body = VerifyNullableProjections(new ManagedBody(analysis.Method, blocks) { Regions = managedRegions });
+        FoldConstructorFieldStores(body);
         body = ExceptionEntries.Run(body, () => NewLocal(types.Int32));
         return new(body, holes.DistinctBy(h => (h.Address, h.Reason)).ToArray(), new Dictionary<Variable, PendingConstruction>(pendingConstructions), nextLocal)
             { Unfolded = unfolded.DistinctBy(u => (u.Site, u.Detail)).ToArray() };
+    }
+
+    /// <summary>构造函数中一次性的本类字段地址直接写成字段赋值。</summary>
+    private static void FoldConstructorFieldStores(ManagedBody body)
+    {
+        var method = body.Method.Method;
+        if (method.Name != ".ctor" || method.IsStatic) return;
+        var statements = body.Blocks.SelectMany(b => b.Statements).ToArray();
+        var counts = statements.SelectMany(s => ManagedValues.Of(s).Concat(ManagedValues.CopiedValues(s)))
+            .SelectMany(ManagedValues.Walk).OfType<LocalValue>()
+            .Concat(statements.OfType<ManagedCall>().Select(c => c.Result).OfType<LocalValue>())
+            .Concat(statements.SelectMany(ManagedValues.Edges).SelectMany(e => e.Copies).Select(c => c.Target))
+            .GroupBy(l => l.Variable).ToDictionary(g => g.Key, g => g.Count());
+        foreach (var block in body.Blocks)
+        {
+            if (block.Statements is not List<ManagedStatement> list) continue;
+            for (var i = 0; i + 1 < list.Count; i++)
+            {
+                if (list[i] is not ManagedAssignment { ExceptionArrival: false, Target: var address, Value: AddressValue
+                        { Target: FieldValue { Receiver: ArgumentValue { Index: -1 }, Accessor: null, Pending: null } field } }
+                    || field.Field.Field.Owner != method.Owner || counts[address.Variable] != 2
+                    || list[i + 1] is not ManagedStore { Target: IndirectValue { Address: LocalValue local } } store
+                    || local.Variable != address.Variable || !field.Type.Equals(store.Target.Type)) continue;
+                list[i + 1] = store with { Target = field };
+                list.RemoveAt(i--);
+            }
+        }
     }
 
     /// <summary>沿托管终结语句的出边与区域的处理入口可达的块。</summary>

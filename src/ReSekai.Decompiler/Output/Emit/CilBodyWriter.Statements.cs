@@ -147,13 +147,13 @@ internal sealed partial class CilBodyWriter
 
         void ExceptionFactory(MethodDefinition method, string exceptionType, string prefix)
         {
-            var text = module.TypeSystem.String;
-            var format = new MethodReference("ToString", text, module.TypeSystem.UInt64) { HasThis = true };
+            var text = TypeReference(types.String);
+            var format = new MethodReference("ToString", text, TypeReference(types.UInt64)) { HasThis = true };
             format.Parameters.Add(new ParameterDefinition(text));
             var concat = new MethodReference("Concat", text, text);
             concat.Parameters.Add(new ParameterDefinition(text));
             concat.Parameters.Add(new ParameterDefinition(text));
-            var ctor = new MethodReference(".ctor", module.TypeSystem.Void, TypeReference(types.Corlib(exceptionType))) { HasThis = true };
+            var ctor = new MethodReference(".ctor", TypeReference(types.Corlib("System.Void")), TypeReference(types.Corlib(exceptionType))) { HasThis = true };
             ctor.Parameters.Add(new ParameterDefinition(text));
             var processor = method.Body.GetILProcessor();
             processor.Emit(OpCodes.Ldstr, prefix);
@@ -244,6 +244,7 @@ internal sealed partial class CilBodyWriter
         // 虚调用的接收者是类型参数的值时走受约束调用（ECMA-335 III.2.1），CIL 才合法，C# 也不必转换。值在局部或参数里才有地址可取。
         // 非虚调用不改：受约束调用要判空，原生的这类调用不判空。
         var through = ThroughConstraint(invocation);
+        var explicitImplementation = ExplicitValueTypeImplementation(invocation);
         var parameter = through?.Parameter
             ?? (invocation is { Virtual: true, Constraint: null, Receiver: { Type: GenericParameterRef open } and (LocalValue or ArgumentValue) } ? open : null);
         if (parameter is not null && invocation.Receiver!.Type is GenericParameterRef) Address(invocation.Receiver);
@@ -258,10 +259,31 @@ internal sealed partial class CilBodyWriter
                 && ManagedTypes.IsReferenceType(formal))
                 il.Emit(OpCodes.Box, TypeReference(argumentType));
         }
-        if ((invocation.Constraint ?? parameter) is { } constraint) il.Emit(OpCodes.Constrained, TypeReference(constraint));
-        var call = Instruction.Create(invocation.Virtual || through is not null ? OpCodes.Callvirt : OpCodes.Call, MethodReference(through?.Method ?? OnReceiverInstance(invocation)));
+        if (((invocation.Constraint ?? parameter) ?? explicitImplementation?.Type) is { } constraint) il.Emit(OpCodes.Constrained, TypeReference(constraint));
+        var call = Instruction.Create(invocation.Virtual || through is not null || explicitImplementation is not null ? OpCodes.Callvirt : OpCodes.Call,
+            MethodReference(through?.Method ?? explicitImplementation?.Method ?? OnReceiverInstance(invocation)));
         il.Append(call);
         return call;
+    }
+
+    /// <summary>结构体的显式接口实现只能经接口从外部调用；保留原地址与同一个 vtable 实现，生成 constrained. 调用。</summary>
+    private static (DefinitionRef Type, MethodRef Method)? ExplicitValueTypeImplementation(ManagedInvocation invocation)
+    {
+        var method = invocation.Method.Method;
+        if (invocation is not { Virtual: false, Constraint: null, Receiver.Type: ByRefRef { Element: DefinitionRef type } }
+            || !type.Definition.IsValueType || type.Definition != method.Owner || !method.IsVirtual || !method.Name.Contains('.')) return null;
+        foreach (var (@interface, offset) in method.Owner.InterfaceOffsets)
+        {
+            if (@interface.Substitute(type.Arguments, []) is not DefinitionRef implemented) continue;
+            foreach (var member in implemented.Definition.Methods)
+            {
+                var slot = offset + member.Slot;
+                if (member.Slot >= 0 && slot >= 0 && slot < method.Owner.VTable.Count && method.Owner.VTable[slot]?.Method == method
+                    && method.Name.EndsWith("." + member.Name, StringComparison.Ordinal))
+                    return (type, new MethodRef(member, implemented.Arguments, invocation.Method.MethodArguments));
+            }
+        }
+        return null;
     }
 
     /// <summary>

@@ -15,7 +15,11 @@ internal sealed partial class CilBodyWriter
             il.Emit(OpCodes.Ldloca, local);
             for (var i = 0; i + 1 < path.Count; i++) il.Emit(OpCodes.Ldflda, FieldReference(path[i]));
             Value(leaf);
-            il.Emit(OpCodes.Stfld, FieldReference(path[^1]));
+            var field = path[^1];
+            var fieldType = field.Field.Type.Substitute(((DefinitionRef)field.DeclaringType).Arguments, []);
+            if (types.Kind(leaf.Type) == TypeKind.Int && types.Kind(fieldType) is TypeKind.Float or TypeKind.Double
+                && leaf.Width == types.StorageBits(fieldType)) Reinterpret(leaf.Type, fieldType);
+            il.Emit(OpCodes.Stfld, FieldReference(field));
         }
         il.Emit(OpCodes.Ldloc, local);
     }

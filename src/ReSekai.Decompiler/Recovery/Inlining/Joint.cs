@@ -54,6 +54,8 @@ internal sealed class Joint(Interpreter interpreter, Func<MethodRef, Program?> t
     public bool ConsultedSettled { get; private set; }
     /// <summary>发现：模板的形参（下标 0 为 this，i + 1 为第 i 个形参）。</summary>
     public Term[]? Formals { get; init; }
+    /// <summary>构造模板的枚举实参，可以按调用方相同常量的分支条件试探绑定。</summary>
+    public IReadOnlySet<Term>? ConstructorEnumFormals { get; init; }
     /// <summary>发现：模板中按“调用方内联了它”立即展开的调用点（前几轮失败在这些调用点上等待）。</summary>
     public IReadOnlySet<(Program, int, int)> Eager { get; init; } = new HashSet<(Program, int, int)>();
     private Solver Solver => interpreter.Solver;
@@ -290,8 +292,10 @@ internal sealed class Joint(Interpreter interpreter, Func<MethodRef, Program?> t
                 var candidate = Solver.Apply(alternative);
                 if (known.HasFormal == candidate.HasFormal) continue;
                 var (pattern, target) = known.HasFormal ? (known, candidate) : (candidate, known);
-                // 形参整体与常量比较（判空、判零）的文字与任何同形的文字都能匹配，不说明两侧是同一个检查。
-                if (Bare(pattern)) continue;
+                // 一般的判空、判零不足以绑定形参；枚举构造只试探与同一常量的比较，最终仍完整复核。
+                if (Bare(pattern) && !(pattern.IsOp(OpCode.Compare) && target.IsOp(OpCode.Compare)
+                    && pattern.Cond == target.Cond && pattern.Args[1].IsConstant && ReferenceEquals(pattern.Args[1], target.Args[1])
+                    && ConstructorEnumFormals?.Contains(pattern.Args[0]) == true)) continue;
                 var trial = new Dictionary<Term, Term>(ReferenceEqualityComparer.Instance);
                 if (Solver.Match(pattern, target, trial) && trial.Count > 0)
                 {
@@ -350,16 +354,17 @@ internal sealed class Joint(Interpreter interpreter, Func<MethodRef, Program?> t
         if (a.Kind != b.Kind || !SameIdentity(a, b)) return $"{Describe(new Stop(StopKind.Event) { Event = a })} 对应 {Describe(new Stop(StopKind.Event) { Event = b })}";
         if (a.Identity is MethodRef method && method.Method.IsOverridable && a.Virtual != b.Virtual) return "调用的分派方式不同";
         if ((a.Receiver is null) != (b.Receiver is null) || a.Arguments.Length != b.Arguments.Length) return "事件的操作数个数不同";
+        var separateConstructors = PrivateValueConstructor(path, a, b);
         var trial = new Dictionary<Term, Term>(ReferenceEqualityComparer.Instance);
-        var pairs = a.Operands.Zip(b.Operands).ToArray();
+        var pairs = separateConstructors ? a.Arguments.Zip(b.Arguments) : a.Operands.Zip(b.Operands);
         foreach (var (x, y) in pairs)
             if (!Solver.MatchUnder(path.Phi, x, y, trial)) return $"事件的操作数不同（{Solver.Apply(x)} 与 {y}）";
         // 比较失败时撤回绑定与逃逸：之后还可能改为展开调用。
         var binding = Solver.Snapshot();
         var saved = (path.A.Fresh, path.A.Exposed, path.B.Fresh, path.B.Exposed);
         if (trial.Count > 0) Solver.Bind(trial);
-        foreach (var operand in a.Operands) interpreter.Escape(path.A, operand);
-        foreach (var operand in b.Operands) interpreter.Escape(path.B, operand);
+        foreach (var operand in separateConstructors ? a.Arguments : a.Operands) interpreter.Escape(path.A, operand);
+        foreach (var operand in separateConstructors ? b.Arguments : b.Operands) interpreter.Escape(path.B, operand);
         // 处理上下文只在可能抛出的点上要求相同（5.6）：不可能抛出的调用不是异常点。
         if ((SameHeap(path, false) ?? (CannotThrow(a) ? null : SameContext(path) is { } context ? $"在{Describe(new Stop(StopKind.Event) { Event = a })}处{context}" : null)) is { } different)
         {
@@ -368,10 +373,37 @@ internal sealed class Joint(Interpreter interpreter, Func<MethodRef, Program?> t
             return different;
         }
         var serial = ++path.Serial;
-        var result = interpreter.Result(b.ResultType is not null ? b : a, serial);
-        interpreter.Complete(path.A, a, result);
-        interpreter.Complete(path.B, b, result);
+        if (separateConstructors && a.Identity is MethodRef constructor)
+        {
+            var type = constructor.DeclaringType;
+            var constructed = interpreter.Result(a with { ResultType = type }, serial)!;
+            interpreter.CompleteValueConstructor(path.A, a, constructed, type);
+            interpreter.CompleteValueConstructor(path.B, b, constructed, type);
+        }
+        else
+        {
+            var result = interpreter.Result(b.ResultType is not null ? b : a, serial);
+            interpreter.Complete(path.A, a, result);
+            interpreter.Complete(path.B, b, result);
+        }
         return null;
+    }
+
+    private bool PrivateValueConstructor(JointPath path, EventInfo a, EventInfo b)
+    {
+        if (a is not { Kind: EventKind.Call, Virtual: false, Receiver: { Kind: TermKind.Address } left,
+                Identity: MethodRef constructor }
+            || b is not { Virtual: false, Receiver: { Kind: TermKind.Address } right, Identity: MethodRef other }
+            || !constructor.Equals(other) || ReferenceEquals(left, right) || left.Location.Root != RootKind.Cell || right.Location.Root != RootKind.Cell
+            || TermTable.PathOf(left.Location).Count != 0 || TermTable.PathOf(right.Location).Count != 0
+            || !LibraryAccessors.ProducesTransformAccessArray(constructor, interpreter.Types)) return false;
+        if (!interpreter.Private(path.A, left.Location) || !interpreter.Private(path.B, right.Location)) return false;
+        var type = constructor.DeclaringType;
+        var zero = Solver.Fold(path.Phi, interpreter.Zero(type));
+        return ZeroAt(path.A, left) && ZeroAt(path.B, right);
+
+        bool ZeroAt(SideState side, Term cell) => interpreter.ReadValue(side, cell.Location, type, false) is { } initial
+            && ReferenceEquals(Solver.Fold(path.Phi, initial), zero);
     }
 
     /// <summary>

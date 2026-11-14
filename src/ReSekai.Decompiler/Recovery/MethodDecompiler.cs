@@ -78,7 +78,9 @@ public sealed partial class MethodDecompiler
         var request = new MethodRequest(method, entry, RecoveryMode.Instance);
         if (finished.TryGetValue(request, out var known)) return known;
         var before = cuts;
-        var result = Declaration(method, entry) ?? PlatformInvoke(method, entry) ?? Run(method, entry);
+        var result = Declaration(method, entry) ?? PlatformInvoke(method, entry)
+            ?? RestoreHammersley(method, entry) ?? RestoreUrpInsertionSort(method, entry)
+            ?? RestoreUrpPackageMethod(method, entry) ?? Run(method, entry);
         if (cuts == before) finished.TryAdd(request, result);
         return result;
     }
@@ -156,7 +158,13 @@ public sealed partial class MethodDecompiler
     public MethodRecoveryResult SourceForm(MethodRecoveryResult result)
     {
         RecoveryCancellation.Check();
-        if (result.Body is null && RestoreReferenceSource(result) is { } restored) return restored;
+        if (result.Body is null && (RestoreReferenceSource(result) ?? RestoreVolumeParameterInterp(result)
+            ?? RestoreRenderGraphRegisterFrameAllocation(result) ?? RestoreProbeSourceLocations(result) ?? RestoreHaveDuplicates(result)
+            ?? RestoreProbeScenario(result) ?? RestorePerSceneSerialization(result) ?? RestoreSceneSerialization(result)) is { } restored) return restored;
+        if (RestoreArrayCopyTo(result) is { } arrayCopy) return arrayCopy;
+        if (RestoreCombineHashes(result) is { } hashes) return hashes;
+        if (RestoreCompareHashes(result) is { } comparison) return comparison;
+        if (RestoreGenericSort(result) is { } sort) return sort;
         var formed = ControlForm(result);
         if (formed.Body is not { } body) return formed;
         var shared = SharedValues.Run(body, types, out var extracted);

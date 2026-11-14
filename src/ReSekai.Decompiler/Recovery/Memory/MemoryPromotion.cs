@@ -9,6 +9,7 @@ namespace ReSekai.Decompiler.Recovery.Memory;
 /// <summary>局部内存的一个单元：重叠访问的并集。Escape 不为 null 时地址流向了无法确定访问范围的用途，单元不提升。</summary>
 public sealed record Cell(int Id, LocalSpace Space, long Start, int Size, string? Escape)
 {
+    public DefinitionRef? TypedStorage { get; init; }
     public bool Promoted => Escape is null;
     public long End => Start + Size;
     public Storage Storage => Storage.Local(Id, Size * 8);
@@ -45,6 +46,7 @@ internal sealed class MemoryPromotion
     private readonly Dictionary<Storage, LocalSpace> pointers = [];
     private readonly Dictionary<long, LocalSpace> stackPointers = [];
     private readonly List<Access> accesses = [];
+    private readonly Dictionary<long, (int Size, DefinitionRef Type)> typedFrame = [];
 
     private MemoryPromotion(MachineFunction function, MachineSignature signature, Func<Call, CallShape> shapes, ManagedAbi abi)
     {
@@ -75,6 +77,8 @@ internal sealed class MemoryPromotion
         promotion.TrimUnusedCallInputs();
         promotion.BindStackAddresses();
         if (Machine.Storage.FrameForwarding.Run(function, new CallMemoryEffects(shapes, abi, settled: true))) Propagate.Run(function, Dominators.Compute(function));
+        promotion.FindTypedFrameCopies();
+        promotion.SplitPairedLocalZeros();
         var layout = promotion.Partition();
         if (layout.Cells.Count == 0) return layout;
         if (signature.Return is { Transfer: Transfer.ResultBuffer, Size: > 0 } && layout.Cells.Any(c => c.Space == LocalSpace.Result && !c.Promoted))
@@ -88,6 +92,67 @@ internal sealed class MemoryPromotion
             return RecoveryDiagnostics.Fail(function.Entry, $"内存 单元 SSA：{error}", rule: "Memory");
         Propagate.Run(function, dominators);
         return layout;
+    }
+
+    /// <summary>经固定缓冲区游标寻址的值保留为一个有类型的栈局部，逐段复制仍属于同一存储。</summary>
+    private void FindTypedFrameCopies()
+    {
+        var candidates = new Dictionary<long, HashSet<(int Size, DefinitionRef Type)>>();
+        void Note(long offset, int size, DefinitionRef type)
+        {
+            if (!type.Definition.Fields.Any(f => f.CustomAttributes.Any(a =>
+                    a.Constructor.Owner.FullName == "System.Runtime.CompilerServices.FixedBufferAttribute"))) return;
+            if (!candidates.TryGetValue(offset, out var choices)) candidates[offset] = choices = [];
+            choices.Add((size, type));
+        }
+        var blocks = function.Blocks;
+        foreach (var block in blocks)
+            foreach (var call in block.Statements.OfType<Call>())
+            {
+                var shape = shapes(call);
+                if (shape.Signature is not { } signature || shape.Candidates is not [var method]) continue;
+                foreach (var value in signature.Indirections)
+                {
+                    var index = call.ArgumentIndex(value.Pieces[0].Register);
+                    if (index < 0 || call.Arguments[index] is not FrameAddress frame || value.Size <= 0) continue;
+                    var type = value.Index == MachineSignature.ReturnIndex ? method.Concrete(method.Method.ReturnType)
+                        : value.Index >= 0 ? method.Concrete(method.Method.Parameters[value.Index].Type) : null;
+                    if (type is ByRefRef byRef) type = byRef.Element;
+                    if (type is DefinitionRef definition && abi.Size(definition) == value.Size)
+                        Note(frame.Offset, value.Size, definition);
+                }
+            }
+        if (candidates.Count == 0) return;
+        var definitions = blocks.SelectMany(b => b.Statements).OfType<Define>().ToDictionary(d => d.Target, d => d.Value);
+        foreach (var group in blocks.SelectMany(b => b.Statements).OfType<Store>().GroupBy(s => s.Address))
+        {
+            var transfers = group.Select(s => s is { Target: FrameAddress target, Value: Use use }
+                && definitions.GetValueOrDefault(use.Variable) is Load { Address: FrameAddress source } load
+                && load.Width == s.Value.Width ? ((long Dest, long Source, int Size)?)(target.Offset, source.Offset, load.Width / 8) : null).ToArray();
+            if (transfers.Length < 2 || transfers.Any(t => t is null)) continue;
+            var ordered = transfers.Select(t => t!.Value).OrderBy(t => t.Source).ToArray();
+            var first = ordered[0];
+            if (!candidates.TryGetValue(first.Source, out var types) || types.Count != 1) continue;
+            var (size, type) = types.Single();
+            var end = first.Source;
+            foreach (var transfer in ordered)
+            {
+                if (transfer.Source != end || transfer.Dest - first.Dest != transfer.Source - first.Source) break;
+                end += transfer.Size;
+            }
+            if (end == first.Source + size) Note(first.Dest, size, type);
+        }
+        CollectAccesses();
+        foreach (var (start, choices) in candidates)
+        {
+            if (choices.Count != 1) continue;
+            var (size, type) = choices.Single();
+            if (!accesses.Any(a => a.Space == LocalSpace.Frame && a.Escape is not null && a.Offset >= start && a.Offset < start + size)
+                || accesses.Any(a => a.Space == LocalSpace.Frame && a.Size > 0 && a.Offset < start + size && start < a.Offset + a.Size
+                    && (a.Offset < start || a.Offset + a.Size > start + size))) continue;
+            if (candidates.Keys.Any(other => other != start && candidates[other].Any(c => other < start + size && start < other + c.Size))) continue;
+            typedFrame[start] = (size, type);
+        }
     }
 
     private void BindStackAddresses()
@@ -184,7 +249,7 @@ internal sealed class MemoryPromotion
 
     // ---- 收集 ----
 
-    private MemoryLayout Partition()
+    private void CollectAccesses()
     {
         accesses.Clear();
         definitions.Clear();
@@ -194,6 +259,40 @@ internal sealed class MemoryPromotion
         foreach (var block in function.Blocks)
             foreach (var statement in block.Statements)
                 Collect(statement);
+    }
+
+    /// <summary>合并写零不能把两个分别经 ref 访问的局部绑成同一存储单元。</summary>
+    private void SplitPairedLocalZeros()
+    {
+        var zeroes = function.Blocks.SelectMany(b => b.Statements.OfType<Store>()
+            .Where(s => s is { Target: FrameAddress, Value: Const { Value: 0, Width: 64 } })
+            .Select(s => (Block: b, Store: s, Offset: ((FrameAddress)s.Target).Offset))).ToArray();
+        if (zeroes.Length == 0) return;
+        CollectAccesses();
+        var references = function.Blocks.SelectMany(b => b.Statements).OfType<Call>()
+            .SelectMany(c => Effects(c).Where(e => e is { Space.Kind: LocalKind.Frame, Size: 4 }
+                && shapes(c).Signature?.Arguments.Any(a => a.Index == e.Value && a.Transfer == Transfer.Reference) == true))
+            .Select(e => e.Offset).ToHashSet();
+        foreach (var group in zeroes.GroupBy(z => z.Offset))
+        {
+            var at = group.Key;
+            if (!references.Contains(at) || !references.Contains(at + 4)) continue;
+            var crossing = accesses.Where(a => a.Space == LocalSpace.Frame && a.Offset < at + 4 && a.Offset + a.Size > at + 4).ToArray();
+            if (crossing.Length != group.Count() || crossing.Any(a => a.Offset != at || a.Size != 8 || a.Escape is not null)) continue;
+            foreach (var (block, store, _) in group)
+            {
+                var position = block.Statements.IndexOf(store);
+                block.Statements[position] = store with { Value = new Const(0, 32) };
+                block.Statements.Insert(position + 1, new Store(store.Address, new FrameAddress(at + 4), new Const(0, 32)));
+            }
+        }
+    }
+
+    private MemoryLayout Partition()
+    {
+        CollectAccesses();
+        foreach (var (start, storage) in typedFrame)
+            Add(LocalSpace.Frame, start, storage.Size);
         var cells = new List<Cell>();
         foreach (var group in accesses.GroupBy(a => a.Space))
         {
@@ -221,7 +320,9 @@ internal sealed class MemoryPromotion
             }
             cells.Add(Make(cells.Count, group.Key, start, end, escape));
         }
-        return new MemoryLayout(cells);
+        return new MemoryLayout(cells.Select(cell => cell.Space == LocalSpace.Frame
+            && typedFrame.TryGetValue(cell.Start, out var storage) && storage.Size == cell.Size
+                ? cell with { TypedStorage = storage.Type } : cell).ToArray());
     }
 
     /// <summary>空间所代表对象的字节数；范围不由访问决定的空间（实参副本、结果缓冲区）才有。</summary>

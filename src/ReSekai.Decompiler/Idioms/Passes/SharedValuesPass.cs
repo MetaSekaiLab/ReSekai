@@ -228,10 +228,15 @@ internal static class SharedValuesPass
         foreach (var block in state.function.Blocks)
             for (var i = 0; i < block.Statements.Count; i++)
             {
-                if (block.Statements[i] is not Call { Op: null, Target: Const target, Kind: CallKind.Direct or CallKind.Tail } call
-                    || SharedFieldTemplates.WriteWidth(state.facts, target.Value) is not (var width and not 0)) continue;
+                if (block.Statements[i] is not Call { Op: null, Target: Const target, Kind: CallKind.Direct or CallKind.Tail } call) continue;
+                var width = SharedFieldTemplates.WriteWidth(state.facts, target.Value);
+                var floating = width == 0 && SharedFieldTemplates.WritesDouble(state.facts, target.Value);
+                if (floating) width = 64;
+                if (width == 0) continue;
                 Expr? Argument(int register) => call.ArgumentIndex(Storage.Gpr(register)) is >= 0 and var at ? call.Arguments[at] : null;
-                if (Argument(0) is not { } receiver || Argument(1) is not { } field || Argument(2) is not { } value) continue;
+                var valueRegister = floating ? Storage.Vec(0) : Storage.Gpr(2);
+                var payload = call.ArgumentIndex(valueRegister) is >= 0 and var at ? call.Arguments[at] : null;
+                if (Argument(0) is not { } receiver || Argument(1) is not { } field || payload is not { } value) continue;
                 var address = state.Fresh();
                 var writes = new List<Stmt>
                 {

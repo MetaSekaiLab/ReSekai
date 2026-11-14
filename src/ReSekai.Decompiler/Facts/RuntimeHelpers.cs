@@ -261,6 +261,14 @@ public sealed partial class RuntimeHelpers
         var wrapper = chain.FirstOrDefault(h => map.Word(h) is not { } w0 || !A64.IsB(w0), body);
         var wrapperWords = Words(wrapper, 64).Select(x => x.Word).ToArray();
         var wrapperCalls = CallsOf(wrapper).ToArray();
+        // 快速路径读取 initialized_and_no_error，失败才尾调用完整的类初始化包装。
+        if (wrapperWords is [var flag, 0x37000048u, var tail, 0xD65F03C0u]
+            && flag == (0x39400008u | (uint)RuntimeLayout.ClassBitflags1 << 10) && A64.IsB(tail)
+            && wrapperCalls is [var slowInit] && slowInit == A64.Imm26Target(tail, wrapper + 8)
+            && LoadsOffset(slowInit, RuntimeLayout.ClassInitializationExceptionGCHandle, 12)
+            && CallsOf(slowInit).FirstOrDefault() is var implementation && implementation != 0
+            && LoadsOffset(implementation, RuntimeLayout.ClassBitflags1, 8))
+            return (HelperKind.InitializedTypeInfo, null, "检查 initialized_and_no_error；未初始化时尾调用已核对的类初始化实现");
         if (wrapperWords.Length <= 32 && wrapperCalls.Length >= 1)
         {
             if (LoadsOffset(wrapper, RuntimeLayout.ClassInitializationExceptionGCHandle, 12)

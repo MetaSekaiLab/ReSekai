@@ -64,6 +64,24 @@ internal sealed partial class CilBodyWriter
             case StringValue text: il.Emit(OpCodes.Ldstr, text.Text); break;
             case TypeHandleValue handle: il.Emit(OpCodes.Ldtoken, TypeReference(handle.Target)); break;
             case SizeOfValue size: il.Emit(OpCodes.Sizeof, TypeReference(size.Target)); break;
+            case ZeroedStackBufferValue allocation:
+                var bytes = Temp(types.UInt32);
+                var buffer = Temp(new PointerRef(types.Integer(8, false)));
+                Value(allocation.Count);
+                il.Emit(OpCodes.Ldc_I4, allocation.ElementSize);
+                il.Emit(OpCodes.Mul);
+                il.Emit(OpCodes.Stloc, bytes);
+                il.Emit(OpCodes.Ldloc, bytes);
+                il.Emit(OpCodes.Conv_U);
+                il.Emit(OpCodes.Localloc);
+                il.Emit(OpCodes.Stloc, buffer);
+                il.Emit(OpCodes.Ldloc, buffer);
+                il.Emit(OpCodes.Ldc_I4_0);
+                il.Emit(OpCodes.Ldloc, bytes);
+                il.Emit(OpCodes.Initblk);
+                il.Emit(OpCodes.Ldloc, buffer);
+                il.Emit(OpCodes.Conv_U);
+                break;
             case FieldHandleValue handle: il.Emit(OpCodes.Ldtoken, FieldReference(handle.Field)); break;
             case StaticCallValue call:
                 var factory = Instruction.Create(OpCodes.Call, MethodReference(call.Method));
@@ -95,6 +113,8 @@ internal sealed partial class CilBodyWriter
                 EmitDelegate(delegated); break;
             case NewArrayValue array:
                 Value(array.Length); il.Emit(OpCodes.Newarr, TypeReference(array.ArrayType.Element)); break;
+            case StackBytesValue allocation:
+                Value(allocation.Length); il.Emit(OpCodes.Conv_U); il.Emit(OpCodes.Localloc); break;
             case NewMultiArrayValue array:
                 foreach (var length in array.Lengths) Value(length);
                 il.Emit(OpCodes.Newobj, ArrayMethod(array.ArrayType, ".ctor")); break;
@@ -297,6 +317,12 @@ internal sealed partial class CilBodyWriter
             }
             Reference(c.Left); Reference(c.Right);
         }
+        else if (c.Condition is Cond.Eq or Cond.Ne
+            && (c.Left.Type is PointerRef && c.Right is ConstantValue { Bits: 0, Type: PointerRef }
+                || c.Right.Type is PointerRef && c.Left is ConstantValue { Bits: 0, Type: PointerRef }))
+        {
+            Value(c.Left); Value(c.Right);
+        }
         else if (floating) { Floating(c.Left); Floating(c.Right); }
         else
         {
@@ -338,7 +364,8 @@ internal sealed partial class CilBodyWriter
 
     private void Reinterpret(TypeRef from, TypeRef to)
     {
-        if ((ManagedTypes.IsNativePointer(from) || from is ByRefRef) && ManagedTypes.IsNativePointer(to))
+        if ((types.Kind(from) == TypeKind.Pointer || from is ByRefRef || types.Kind(from) == TypeKind.Int && types.ValueWidth(from) == 64)
+            && ManagedTypes.IsNativePointer(to))
         {
             il.Emit(ManagedTypes.IsSigned(to) ? OpCodes.Conv_I : OpCodes.Conv_U);
             return;

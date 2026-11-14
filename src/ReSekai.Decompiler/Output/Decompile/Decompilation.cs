@@ -140,6 +140,7 @@ public static partial class Decompilation
                 Name: groupByName && g.Key.Namespace.Length > 0 ? g.Key.Namespace + "." + g.Key.Name : g.Key.Name))
             .ToArray();
         var results = new ConcurrentBag<(int Index, SourceFile File)>();
+        var foldedTypes = new ConcurrentDictionary<TypeDefinitionHandle, SyntaxTree>();
         var failed = new ConcurrentBag<(string Namespace, string Name, string Reason)>();
         void DecompileType(int i)
         {
@@ -153,7 +154,20 @@ public static partial class Decompilation
                     selected.AnonymousTypes = false;
                 }
                 var tree = CreateDecompiler(typeSystem, selected, transforms).DecompileTypes(handles);
-                results.Add((i, new SourceFile(name, ns, Print(tree, selected))));
+                // ILSpy 可能把同一个局部函数重复声明在同一块。重新反编译该类型，保留原来的辅助方法和调用。
+                if (selected.LocalFunctions && tree.Descendants.OfType<BlockStatement>().Any(block => block.Statements
+                    .OfType<LocalFunctionDeclarationStatement>().GroupBy(local => local.Declaration.Name).Any(group => group.Skip(1).Any())))
+                {
+                    selected = selected.Clone();
+                    selected.LocalFunctions = false;
+                    tree = CreateDecompiler(typeSystem, selected, transforms).DecompileTypes(handles);
+                }
+                var source = Print(tree, selected);
+                // 大类型在补出隐藏成员时直接复用同一份语法树，避免用相同设置重复反编译。
+                if (ReferenceEquals(selected, settings) && source.Length >= 128 * 1024
+                    && HiddenMembers(source) is (true, _) or (_, true))
+                    foldedTypes[handles[0]] = tree;
+                results.Add((i, new SourceFile(name, ns, source)));
             }
             // 只有调用方提供了占位程序集才继续（--keep-going）；否则照常中断。
             catch (Exception e) when (stubs is not null)
@@ -167,7 +181,7 @@ public static partial class Decompilation
             Parallel.ForEach(Partitioner.Create(Enumerable.Range(0, types.Length), EnumerablePartitionerOptions.NoBuffering),
                 new ParallelOptions { MaxDegreeOfParallelism = jobs }, DecompileType);
         var files = results.OrderBy(r => r.Index).Select(r => r.File).ToList();
-        ReferencedHiddenTypes(files, types, typeSystem, settings, transforms);
+        ReferencedHiddenTypes(files, types, typeSystem, settings, transforms, foldedTypes);
         if (!failed.IsEmpty)
         {
             // 反编译失败的类型退回成占位体，工程的结构仍然完整。
@@ -197,7 +211,8 @@ public static partial class Decompilation
     /// 没还原的地方仍按名字引用它们：这时单独写出被引用的声明；引用闭包的成员不折叠闭包，否则 lambda 和闭包类型对不上。
     /// </summary>
     private static void ReferencedHiddenTypes(List<SourceFile> files, (TypeDefinitionHandle[] Handles, string Namespace, string Name)[] types,
-        DecompilerTypeSystem typeSystem, DecompilerSettings settings, IDecompileTransformProvider? transforms)
+        DecompilerTypeSystem typeSystem, DecompilerSettings settings, IDecompileTransformProvider? transforms,
+        IReadOnlyDictionary<TypeDefinitionHandle, SyntaxTree> foldedTypes)
     {
         void Redo((TypeDefinitionHandle[] Handles, string Namespace, string Name) type, Action<DecompilerSettings> configure)
         {
@@ -212,7 +227,8 @@ public static partial class Decompilation
         // 迭代器同理：带 try 的 MoveNext 没有还原成 Roslyn 的形态，提升出来的 yield 丢了语义，这些成员保留状态机。
         void Expose((TypeDefinitionHandle[] Handles, string Namespace, string Name) type, bool closures, bool iterators)
         {
-            var folded = CreateDecompiler(typeSystem, settings, transforms).DecompileTypes(type.Handles);
+            var folded = foldedTypes.TryGetValue(type.Handles[0], out var saved)
+                ? saved : CreateDecompiler(typeSystem, settings, transforms).DecompileTypes(type.Handles);
             if (closures)
             {
                 var visible = settings.Clone();
@@ -235,11 +251,7 @@ public static partial class Decompilation
         {
             var file = files.Find(f => f.TypeName == type.Name && f.Namespace == type.Namespace);
             if (file is null) continue;
-            var closures = ClosureReference.Matches(file.Source).Select(m => m.Value).Distinct();
-            var declared = DeclaredLambdaMethod.Matches(file.Source).Select(m => m.Groups[1].Value).ToHashSet();
-            var hiddenClosures = closures.Any(c => !file.Source.Contains("class " + c, StringComparison.Ordinal)) || ClosureThis.IsMatch(file.Source)
-                || !LambdaMethod.Matches(file.Source).All(m => declared.Contains(m.Value));
-            var brokenIterators = BrokenIterator.IsMatch(file.Source);
+            var (hiddenClosures, brokenIterators) = HiddenMembers(file.Source);
             if (!hiddenClosures && !brokenIterators) continue;
             Expose(type, hiddenClosures, brokenIterators);
             if (hiddenClosures) visibleClosures.Add(type.Handles[0]);
@@ -258,6 +270,14 @@ public static partial class Decompilation
             if (type.Name.StartsWith("<>f__AnonymousType", StringComparison.Ordinal) && used.Contains(escaped)) Redo(type, s => s.AnonymousTypes = false);
             else if (type.Name == "<PrivateImplementationDetails>" && used.Contains(escaped)) Redo(type, s => s.ArrayInitializers = false);
         }
+    }
+
+    private static (bool Closures, bool Iterators) HiddenMembers(string source)
+    {
+        var closures = ClosureReference.Matches(source).Select(m => m.Value).Distinct();
+        var declared = DeclaredLambdaMethod.Matches(source).Select(m => m.Groups[1].Value).ToHashSet();
+        return (closures.Any(c => !source.Contains("class " + c, StringComparison.Ordinal)) || ClosureThis.IsMatch(source)
+            || !LambdaMethod.Matches(source).All(m => declared.Contains(m.Value)), BrokenIterator.IsMatch(source));
     }
 
     /// <summary>

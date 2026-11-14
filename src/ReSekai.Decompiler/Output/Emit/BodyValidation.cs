@@ -149,14 +149,21 @@ internal sealed class BodyValidation(ManagedTypes types, EmissionPolicy policy, 
             case NewArrayValue array:
                 if (!array.ArrayType.IsVector) return new(EmissionProblemKind.Unsupported, "数组 分配需要一维向量类型");
                 break;
+            case StackBytesValue allocation:
+                if (!allocation.Element.Equals(types.Corlib("System.Byte")) || !allocation.Length.Type.Equals(types.Int32))
+                    return new(EmissionProblemKind.Unsupported, "栈分配需要字节元素及 int 长度");
+                break;
             case BoxValue box:
                 if (!CanAccess(box.Boxed)) return new(EmissionProblemKind.AccessDenied, $"访问权限 类型 {box.Boxed}");
                 if (box.Boxed is not GenericParameterRef && !Boxable(box.Boxed)) return new(EmissionProblemKind.Unsupported, $"装箱 类型 {box.Boxed}");
                 break;
             case UnboxAddressValue unbox:
                 if (!CanAccess(unbox.Target)) return new(EmissionProblemKind.AccessDenied, $"访问权限 类型 {unbox.Target}");
-                if (!Boxable(unbox.Target)
-                    && unbox.Target is not GenericParameterRef { NativeScalar: not null }) return new(EmissionProblemKind.Unsupported, $"拆箱 类型 {unbox.Target} 尚未支持");
+                var valueConstraint = unbox.Target is GenericParameterRef { Parameter: { } parameter }
+                    && ((parameter.Attributes & System.Reflection.GenericParameterAttributes.NotNullableValueTypeConstraint) != 0
+                        || parameter.Constraints.OfType<DefinitionRef>().Any(c => c.Definition.FullName == "System.Enum"));
+                if (!Boxable(unbox.Target) && unbox.Target is not GenericParameterRef { NativeScalar: not null } && !valueConstraint)
+                    return new(EmissionProblemKind.Unsupported, $"拆箱 类型 {unbox.Target} 尚未支持");
                 break;
             case UnboxValue unbox:
                 if (!ManagedTypes.IsReferenceType(unbox.Operand.Type)) return new(EmissionProblemKind.Unsupported, "拆箱值需要对象来源");
@@ -298,8 +305,11 @@ internal sealed class BodyValidation(ManagedTypes types, EmissionPolicy policy, 
     }
 
     // IntPtr/UIntPtr 是可装箱的 CLR 值类型；裸指针与托管地址仍不可装箱。
-    private bool Boxable(TypeRef type) => types.Kind(type) is TypeKind.Int or TypeKind.Bool or TypeKind.Float or TypeKind.Double or TypeKind.Struct
-        || type.Equals(types.IntPtr) || type.Equals(types.Corlib("System.UIntPtr"));
+    private bool Boxable(TypeRef type) => type is DefinitionRef { Definition.IsValueType: true } definition
+        ? !ManagedTypes.IsVoid(type) && !definition.Definition.CustomAttributes.Any(a =>
+            a.Constructor.Owner.FullName == "System.Runtime.CompilerServices.IsByRefLikeAttribute")
+        : types.Kind(type) is TypeKind.Int or TypeKind.Bool or TypeKind.Float or TypeKind.Double or TypeKind.Struct
+            || type.Equals(types.IntPtr) || type.Equals(types.Corlib("System.UIntPtr"));
 
     private EmissionProblem? DelegateProblem(DelegateValue value)
     {

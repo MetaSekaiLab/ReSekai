@@ -33,19 +33,20 @@ public sealed partial class ManagedTypes
         });
     }
 
-    /// <summary>保留 sincosf 的单次调用和两个 float 出参。</summary>
-    public MethodRef? SinCosImport()
+    /// <summary>保留 sincosf/sincos 的单次调用和两个同精度出参。</summary>
+    public MethodRef? SinCosImport(string? symbol)
     {
-        if (MathImport("sinf") is not { } scalar) return null;
-        return mathImports.GetOrAdd("sincosf", _ =>
+        if (symbol is not ("sincosf" or "sincos") || MathImport(symbol == "sincosf" ? "sinf" : "sin") is not { } scalar) return null;
+        var valueType = scalar.Method.ReturnType;
+        return mathImports.GetOrAdd(symbol, name =>
         {
             var method = new MethodDef
             {
-                Index = -1, Owner = scalar.Method.Owner, Name = "sincosf", Token = 0, Slot = -1,
+                Index = -1, Owner = scalar.Method.Owner, Name = name, Token = 0, Slot = -1,
                 Attributes = scalar.Method.Attributes, ImplAttributes = scalar.Method.ImplAttributes,
-                NativeImport = new(scalar.Method.NativeImport!.Library, "sincosf"), ReturnType = Corlib("System.Void"),
-                Parameters = [new("value", Single, 0, null, false), new("sine", new ByRefRef(Single), 0, null, false),
-                    new("cosine", new ByRefRef(Single), 0, null, false)],
+                NativeImport = new(scalar.Method.NativeImport!.Library, name), ReturnType = Corlib("System.Void"),
+                Parameters = [new("value", valueType, 0, null, false), new("sine", new ByRefRef(valueType), 0, null, false),
+                    new("cosine", new ByRefRef(valueType), 0, null, false)],
             };
             return new(method, [], []);
         });

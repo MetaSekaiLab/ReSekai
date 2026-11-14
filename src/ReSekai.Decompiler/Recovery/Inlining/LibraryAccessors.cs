@@ -42,4 +42,14 @@ internal static class LibraryAccessors
             Parameters: [var parameter] }
         && method.Method.Owner.Assembly == owner.Definition.Assembly
         && method.Concrete(parameter.Type).Equals(owner);
+
+    /// <summary>Unity 的数组构造调用 Allocate 写入新句柄，然后把句柄和输入数组交给 SetTransforms。单元地址不传给引擎。</summary>
+    public static bool ProducesTransformAccessArray(MethodRef method, ManagedTypes types) =>
+        method.Method is { Name: ".ctor", IsStatic: false, NativeImport: null,
+            Owner: { Assembly: "UnityEngine.CoreModule.dll", FullName: "UnityEngine.Jobs.TransformAccessArray", IsValueType: true },
+            Parameters: [var array, var jobs] }
+        && array.Type is ArrayRef { IsVector: true, Element: DefinitionRef { Definition.FullName: "UnityEngine.Transform" } }
+        && jobs.Type.Equals(types.Int32) && method.DeclaringType is DefinitionRef owner
+        && types.Fields(owner).ToArray() is [{ Path: [{ Field.Name: "m_TransformArray" }], Bit: 0, Width: 64, Type: var handle }]
+        && handle.Equals(types.IntPtr);
 }

@@ -73,7 +73,7 @@ public sealed class FactsCallModel : ICallModel
             "memcpy" or "memmove" or "memset" => new([X(0), X(1), X(2)], [X(0)], "libc"),
             "__stack_chk_fail" => new([], [], "libc"),
             "modf" => new([X(0), Storage.Vec(0)], [Storage.Vec(0)], "libm"),
-            "sincosf" => new([X(0), X(1), Storage.Vec(0)], [], "libm"),
+            "sincosf" or "sincos" => new([X(0), X(1), Storage.Vec(0)], [], "libm"),
             var symbol when MathImportSignature.Find(symbol) is { } signature =>
                 new(Enumerable.Range(0, signature.Parameters.Length).Select(signature.Register).ToArray(), [Storage.Vec(0)], "libm"),
             "__cxa_begin_catch" => new([X(0)], [X(0)], "libc++abi"),

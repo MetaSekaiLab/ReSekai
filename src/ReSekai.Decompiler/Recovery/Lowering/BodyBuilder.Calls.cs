@@ -13,6 +13,11 @@ namespace ReSekai.Decompiler.Recovery.Lowering;
 /// <summary>调用的下降：按机器签名重组实参、构造与内联证明、运行时操作。</summary>
 internal sealed partial class BodyBuilder
 {
+    private sealed record DelegateChoice(PhiSym Phi, LocalValue Local, IReadOnlyList<DelegateTarget> Sources,
+        IReadOnlyDictionary<BoundDelegateTarget, int> Methods);
+
+    private readonly List<DelegateChoice> delegateChoices = [];
+
     private Terminator? LowerCall(Block block, int index, Call call, IReadOnlyList<Sym> operands, List<ManagedStatement> output)
     {
         var arguments = operands.Skip(1).Take(call.Arguments.Length).ToArray();
@@ -60,7 +65,7 @@ internal sealed partial class BodyBuilder
                 if (oracle.DelegateTargetOf(contents[i], contents[Array.FindIndex(signature.Arguments, a => a.Index == 0)]) is { } target)
                 {
                     var instance = managed[0];
-                    if (target is SelectedDelegateTarget && instance is not (LocalValue or ArgumentValue or ConstantValue))
+                    if (target is not BoundDelegateTarget && instance is not (LocalValue or ArgumentValue or ConstantValue))
                     {
                         var saved = NewLocal(instance.Type);
                         output.Add(new ManagedAssignment(call.Address, saved, instance));
@@ -71,8 +76,21 @@ internal sealed partial class BodyBuilder
                         BoundDelegateTarget bound => new DelegateValue((DefinitionRef)callee.DeclaringType, instance, bound.Method, bound.Binding),
                         SelectedDelegateTarget selected => new ChoiceValue(View(selected.Condition, types.Boolean, call.Address),
                             Create(selected.True), Create(selected.False), callee.DeclaringType, 64),
+                        MergedDelegateTarget merged => CreateMerged(merged),
                         _ => throw new NotSupportedException(binding.ToString()),
                     };
+                    ManagedValue CreateMerged(MergedDelegateTarget merged)
+                    {
+                        var methods = BoundMethods(merged).Distinct().ToArray();
+                        if (methods.Length == 1) return Create(methods[0]);
+                        var ids = methods.Select((m, i) => (m, i)).ToDictionary(p => p.m, p => p.i);
+                        var index = DelegateChoiceValue(merged, ids, call.Address);
+                        var result = Create(methods[^1]);
+                        for (var n = methods.Length - 2; n >= 0; n--)
+                            result = new ChoiceValue(new ComparisonValue(Cond.Eq, index, new ConstantValue((ulong)n, types.Int32, 32), types.Boolean),
+                                Create(methods[n]), result, callee.DeclaringType, 64);
+                        return result;
+                    }
                     var created = Create(target);
                     output.Add(new ManagedAssignment(call.Address, Local(construction, callee.DeclaringType), created));
                     return call.Kind == CallKind.Tail ? new Statement(new ManagedReturn(call.Address, null)) : null;
@@ -82,10 +100,13 @@ internal sealed partial class BodyBuilder
                 ? View(operands[1 + call.Arguments.Length], type, call.Address)
                 // 被吸收的判空要求接收者就是判过的值：换成默认值后 callvirt 必然抛出。
                 : value.Index < 0 && absorbedChecks.Contains(contents[i]) ? Argument(call, value, type, contents[i], arguments, output)
-                : UnusedReceiver(block, index, shape, callee, value, type, contents[i], contents)
+                : UnusedValueReceiver(shape, callee, value, type, contents[i])
+                    ?? UnusedReceiver(block, index, shape, callee, value, type, contents[i], contents)
+                    ?? UnusedTailArgument(shape, callee, value, type, contents[i])
                     ?? UnusedScalar(shape, callee, value, type, contents[i]) ?? Unconstrained(shape, value, type, contents[i])
                     ?? UnusedStackArgument(call, callee, value, type, contents[i])
                     ?? UnusedCopyArgument(shape, callee, value, type, contents[i])
+                    ?? (oracle.ArgumentCopy(shape, value, type, contents[i]) is { } whole ? View(whole, type, call.Address) : null)
                     ?? UnusedReference(shape, callee, value, type, contents[i], output)
                     ?? Argument(call, value, type, contents[i], arguments, output);
             if (value.Index < 0) receiver = argument;
@@ -144,6 +165,32 @@ internal sealed partial class BodyBuilder
         return null;
     }
 
+    private static IEnumerable<BoundDelegateTarget> BoundMethods(DelegateTarget target) => target switch
+    {
+        BoundDelegateTarget method => [method],
+        SelectedDelegateTarget selected => BoundMethods(selected.True).Concat(BoundMethods(selected.False)),
+        MergedDelegateTarget merged => merged.Sources.SelectMany(BoundMethods),
+        _ => throw new NotSupportedException(target.ToString()),
+    };
+
+    private ManagedValue DelegateChoiceValue(DelegateTarget target, IReadOnlyDictionary<BoundDelegateTarget, int> methods, ulong address)
+    {
+        switch (target)
+        {
+            case BoundDelegateTarget bound:
+                return new ConstantValue((ulong)methods[bound], types.Int32, 32);
+            case SelectedDelegateTarget selected:
+                return new ChoiceValue(View(selected.Condition, types.Boolean, address), DelegateChoiceValue(selected.True, methods, address),
+                    DelegateChoiceValue(selected.False, methods, address), types.Int32, 32);
+            case MergedDelegateTarget merged:
+                var local = NewLocal(types.Int32);
+                delegateChoices.Add(new DelegateChoice(merged.Phi, local, merged.Sources, methods));
+                return local;
+            default:
+                throw new NotSupportedException(target.ToString());
+        }
+    }
+
     /// <summary>
     /// 被调方不读取的按值实参：原生代码不维护这些寄存器，内容与参数类型不兼容时，接收者取类型兼容的 this，其他取默认值。
     /// 这是推断：被调方的行为与该实参无关，任何类型正确的值都等价。
@@ -179,32 +226,70 @@ internal sealed partial class BodyBuilder
         return View(checkedReceiver, type, call.Address);
     }
 
+    /// <summary>直接调用同类型值方法时，未使用的 this 可以留在被覆盖的寄存器中。</summary>
+    private ManagedValue? UnusedValueReceiver(CallShape shape, MethodRef callee, MachineValue value, TypeRef type, Sym content)
+    {
+        if (shape.Call is not { Kind: CallKind.Direct, Op: null, Target: Const target }
+            || value is not { Index: -1, Transfer: Transfer.Reference, Pieces: [var piece] }
+            || type is not ByRefRef || oracle.Parameter(-1)?.Equals(type) != true || !shape.Unused.Contains(piece.Register)
+            || oracle.TypeOf(content)?.Equals(type) == true || !templates.UnusedParameter(callee, target.Value, -1)) return null;
+        return new ArgumentValue(-1, type, Width(type));
+    }
+
     private ManagedValue? UnusedScalar(CallShape shape, MethodRef callee, MachineValue value, TypeRef type, Sym content)
     {
         if (shape.Call is not { Kind: CallKind.Direct, Target: Const target } || shape.IsDispatch
-            || value is not { Transfer: Transfer.Value, Index: >= 0, Pieces: [var piece] } || !shape.Unused.Contains(piece.Register))
+            || value is not { Transfer: Transfer.Value, Index: >= 0, Pieces: [var piece] })
             return null;
         var scalar = piece.Register.Bank == Bank.Gpr && piece.Width <= 32 && types.Kind(type) is TypeKind.Int or TypeKind.Bool
             || piece.Register.Bank == Bank.Vec && piece.Width is 32 or 64 && types.Kind(type) is TypeKind.Float or TypeKind.Double;
         if (!scalar) return null;
         while (SymTable.Resolve(content) is SliceSym { Low: 0 } slice)
             content = slice.Base;
-        return OmittedRegister(SymTable.Resolve(content)) && templates.UnusedParameter(callee, target.Value, value.Index)
-            ? new ConstantValue(0, type, Width(type)) : null;
+        if (!OmittedRegister(SymTable.Resolve(content)) || !templates.UnusedParameter(callee, target.Value, value.Index)) return null;
+        var parameter = MatchingParameter(callee, value.Index, type);
+        return parameter >= 0 ? new ArgumentValue(parameter, type, Width(type))
+            : shape.Unused.Contains(piece.Register) ? new ConstantValue(0, type, Width(type)) : null;
     }
 
     private static bool OmittedRegister(Sym source) => source is UndefSym || source is UnknownSym { Reason: var reason }
-        && reason.EndsWith("被调用破坏", StringComparison.Ordinal);
+        && (reason.EndsWith("被调用破坏", StringComparison.Ordinal) || reason == "原生被调方未用的输入");
+
+    /// <summary>尾调用可以省去不读取的按值形参。被上一次调用破坏的槽可由同名同类型的入口形参补齐。</summary>
+    private ManagedValue? UnusedTailArgument(CallShape shape, MethodRef callee, MachineValue value, TypeRef type, Sym content)
+    {
+        if (shape.Call is not { Kind: CallKind.Tail, Op: null, Target: Const target }
+            || value is not { Index: >= 0, Transfer: Transfer.Value, Pieces.Length: > 0 }
+            || !value.Pieces.Any(p => shape.Unused.Contains(p.Register)) || !SymTable.Segments(content).All(Clobbered)) return null;
+        var index = MatchingParameter(callee, value.Index, type);
+        return index >= 0 && templates.UnusedParameter(callee, target.Value, value.Index) ? new ArgumentValue(index, type, Width(type)) : null;
+
+        bool Clobbered(Sym segment)
+        {
+            while (SymTable.Resolve(segment) is SliceSym { Low: 0 } slice)
+                segment = slice.Base;
+            if (OmittedRegister(SymTable.Resolve(segment))) return true;
+            // 未清理的机器结果中，签名不返回的寄存器只有调用破坏留下的值。
+            return SymTable.Resolve(segment) is ResultSym { Site: var producer, Index: > 0 } result
+                && analysis.Environment.Shape(producer) is { IsRuntime: false, Signature: { } signature }
+                && (signature.Return?.Pieces.All(p => p.Register != producer.Results[result.Index - 1]) ?? true);
+        }
+    }
 
     /// <summary>直接转发时，原生代码可省略被调方不读取的栈实参。用已证明未读的同名形参补齐调用。</summary>
     private ManagedValue? UnusedStackArgument(Call call, MethodRef callee, MachineValue value, TypeRef type, Sym content)
     {
         if (call is not { Kind: CallKind.Direct, Target: Const target } || value is not { Index: >= 0, Transfer: Transfer.Value, Pieces.Length: > 0 }
             || value.Pieces.Any(p => p.Register.Bank != Bank.Stack) || SymTable.Resolve(content) is not UndefSym) return null;
-        var name = callee.Method.Parameters[value.Index].Name;
-        var parameters = analysis.Method.Method.Parameters;
-        var index = Enumerable.Range(0, parameters.Count).FirstOrDefault(i => parameters[i].Name == name && oracle.Parameter(i)?.Equals(type) == true, -1);
+        var index = MatchingParameter(callee, value.Index, type);
         return index >= 0 && templates.UnusedParameter(callee, target.Value, value.Index) ? new ArgumentValue(index, type, Width(type)) : null;
+    }
+
+    private int MatchingParameter(MethodRef callee, int index, TypeRef type)
+    {
+        var name = callee.Method.Parameters[index].Name;
+        var parameters = analysis.Method.Method.Parameters;
+        return Enumerable.Range(0, parameters.Count).FirstOrDefault(i => parameters[i].Name == name && oracle.Parameter(i)?.Equals(type) == true, -1);
     }
 
     /// <summary>编译器可省略被调方从不读取的值类型副本。</summary>
@@ -229,6 +314,11 @@ internal sealed partial class BodyBuilder
             && analysis.Signature.MethodInfo?.Register == piece.Register
             && source is EntitySym { Symbol: { Kind: SymbolKind.Method, Value: MethodRef hidden } } && hidden.Equals(analysis.Method);
         if ((!omitted && !forwarded) || !templates.UnusedParameter(callee, target.Value, value.Index)) return null;
+
+        // 同一类型的 ref 实参已在当前签名中，直接传递原存储。
+        var parameters = analysis.Method.Method.Parameters.Select((_, index) => index)
+            .Where(index => oracle.Parameter(index)?.Equals(type) == true).ToArray();
+        if (omitted && parameters is [var parameter]) return new ArgumentValue(parameter, type, Width(type));
 
         var local = NewLocal(element);
         var initial = types.Kind(element) == TypeKind.Struct ? (ManagedValue)new ComposedValue(element, [])
@@ -314,16 +404,17 @@ internal sealed partial class BodyBuilder
         public ManagedValue Input(int index)
         {
             var input = RuntimeOps.Of(op.Kind)!.Inputs!(call, Arguments, owner.oracle)[index];
-            if (input.Kind == RuntimeInputKind.Value) return owner.View(input.Value, input.Type, call.Address);
+            if (input.Kind == RuntimeInputKind.Value)
+                return owner.View(input.Width > 0 ? owner.values.Syms.Slice(input.Value, input.Low, input.Width) : input.Value, input.Type, call.Address);
             if (input.Kind == RuntimeInputKind.Pointee && owner.values.CellContent(call, input.Pointee, arguments, false) is { } content)
                 return owner.View(input.Width > 0 ? owner.values.Syms.Slice(content, input.Low, input.Width) : content, input.Type, call.Address);
-            return input.Type is { } type && owner.oracle.Locate(input.Value, owner.types.StorageBits(type)) is { } location
+            return input.Type is { } type && (owner.oracle.Locate(input.Value, owner.types.StorageBits(type)) ?? owner.oracle.TypedPointerAddress(input.Value, type)) is { } location
                 ? owner.LocationValue(location, call.Address) : owner.Hole(call.Address, "运行时 输入位置未知", input.Type);
         }
         public void Assign(int index, ManagedValue value)
         {
             var input = RuntimeOps.Of(op.Kind)!.Inputs!(call, Arguments, owner.oracle)[index];
-            if (input.Type is not { } type || owner.oracle.Locate(input.Value, owner.types.StorageBits(type)) is not { } location)
+            if (input.Type is not { } type || (owner.oracle.Locate(input.Value, owner.types.StorageBits(type)) ?? owner.oracle.TypedPointerAddress(input.Value, type)) is not { } location)
             {
                 output.Add(new ManagedHole(call.Address, "运行时 输出位置未知", false));
                 owner.holes.Add(new(call.Address, "运行时 输出位置未知"));

@@ -5,6 +5,8 @@ using ICSharpCode.Decompiler.CSharp.Transforms;
 using ILInstruction = ICSharpCode.Decompiler.IL.ILInstruction;
 using ICSharpCode.Decompiler.Semantics;
 using ICSharpCode.Decompiler.TypeSystem;
+using System.Reflection;
+using System.Reflection.Metadata;
 using TypeKind = ICSharpCode.Decompiler.TypeSystem.TypeKind;
 
 namespace ReSekai.Decompiler.Output;
@@ -26,16 +28,19 @@ public static partial class Decompilation
             foreach (var cast in rootNode.Descendants.OfType<CastExpression>().Reverse().ToArray()) GenericCast(cast);
             foreach (var cast in rootNode.Descendants.OfType<CastExpression>().Reverse().ToArray()) FirstFieldCast(cast);
             foreach (var cast in rootNode.Descendants.OfType<CastExpression>().Reverse().ToArray()) UnrelatedCast(cast);
+            foreach (var dereference in rootNode.Descendants.OfType<UnaryOperatorExpression>().Reverse().ToArray()) GenericPointerDereference(dereference);
             foreach (var cast in rootNode.Descendants.OfType<CastExpression>().Where(c => c.Expression is NullReferenceExpression).ToArray()) GuardedReceiver(cast);
             foreach (var cast in rootNode.Descendants.OfType<CastExpression>().Where(c => c.Expression is NullReferenceExpression).ToArray()) NullReceiver(cast);
             foreach (var binary in rootNode.Descendants.OfType<BinaryOperatorExpression>().Reverse().ToArray()) FloatNegation(binary);
             foreach (var call in rootNode.Descendants.OfType<InvocationExpression>().Reverse().ToArray())
             {
+                FixedBufferFirstElement(call);
                 ConstrainedCall(call);
                 NamedArgumentOrder(call);
                 Placeholder(call);
                 DecimalMinMax(call);
                 SharedTypeArguments(call);
+                TypedExternalNullArguments(call, context);
                 DelegateArguments(call, context);
                 AmbiguousNamedArguments(call);
                 SkipLevelCall(call, context);
@@ -90,8 +95,11 @@ public static partial class Decompilation
             {
                 var values = evaluated.OrderBy(e => e.Parameter).Select(e => e.Value.Annotation<ResolveResult>()).ToArray();
                 var conversions = CSharpConversions.Get(method.Compilation);
-                var overloaded = values.Contains(null) || method.DeclaringType.GetMethods(m => m.Name == method.Name && m.Parameters.Count == method.Parameters.Count && !m.Equals(method))
-                    .Any(m => m.TypeParameters.Count > 0 || !values.Where((v, i) => !conversions.ImplicitConversion(v!, m.Parameters[i].Type).IsValid).Any());
+                var localFunction = call.Annotations.OfType<ICSharpCode.Decompiler.IL.CallInstruction>()
+                    .Any(i => i.Method.Name.Contains(">g__", StringComparison.Ordinal));
+                var overloaded = !localFunction
+                    && (values.Contains(null) || method.DeclaringType.GetMethods(m => m.Name == method.Name && m.Parameters.Count == method.Parameters.Count && !m.Equals(method))
+                        .Any(m => m.TypeParameters.Count > 0 || !values.Where((v, i) => !conversions.ImplicitConversion(v!, m.Parameters[i].Type).IsValid).Any()));
                 foreach (var argument in arguments) argument.Remove();
                 foreach (var entry in evaluated.OrderBy(e => e.Parameter))
                 {
@@ -130,6 +138,8 @@ public static partial class Decompilation
                 case IdentifierExpression identifier:
                     return identifier.GetILVariable() is not null ? EvaluationKind.Stable
                         : identifier.Annotation<MemberResolveResult>()?.Member is IField ? EvaluationKind.Read : EvaluationKind.Effect;
+                case DirectionExpression { Expression: IdentifierExpression local } when local.GetILVariable() is not null:
+                    return EvaluationKind.Stable;
                 case MemberReferenceExpression member when member.Annotation<MemberResolveResult>()?.Member is IField:
                     return Max(EvaluationKind.Read, Evaluation(member.Target));
                 case ParenthesizedExpression or CastExpression or AsExpression or IsExpression:
@@ -286,6 +296,31 @@ public static partial class Decompilation
             ? variable.Type
             : expression.Annotation<ResolveResult>()?.Type;
 
+        /// <summary>固定缓冲区的首元素可用下标取引用；反编译器给出的 ref *buffer 要求先固定缓冲区。</summary>
+        private static void FixedBufferFirstElement(InvocationExpression call)
+        {
+            if (call.Target is not MemberReferenceExpression { MemberName: "AsPointer", Target: TypeReferenceExpression declaring }
+                || declaring.Type.ToString() is not ("System.Runtime.CompilerServices.Unsafe" or "global::System.Runtime.CompilerServices.Unsafe")
+                || call.Arguments.SingleOrDefault() is not DirectionExpression { FieldDirection: FieldDirection.Ref,
+                    Expression: UnaryOperatorExpression { Operator: UnaryOperatorType.Dereference, Expression: IdentifierExpression name } first }
+                || name.GetILVariable() is not null) return;
+            var owner = call.GetParent<TypeDeclaration>();
+            if (owner is null || !owner.Members.OfType<FixedFieldDeclaration>().SelectMany(f => f.Variables).Any(v => v.Name == name.Identifier)) return;
+            first.ReplaceWith(new IndexerExpression(first.Expression.Clone(), new PrimitiveExpression(0)));
+        }
+
+        /// <summary>对泛型指针取引用用 Unsafe.AsRef，保留实际地址，也保留原方法的泛型约束。</summary>
+        private static void GenericPointerDereference(UnaryOperatorExpression dereference)
+        {
+            if (dereference is not { Operator: UnaryOperatorType.Dereference, Expression: CastExpression { Type: ComposedType { PointerRank: 1 } pointer } cast }
+                || (cast.Type.Annotation<ResolveResult>()?.Type ?? cast.Annotation<ResolveResult>()?.Type) is not PointerType { ElementType: ITypeParameter }) return;
+            var address = cast.Expression;
+            address.Remove();
+            dereference.ReplaceWith(new InvocationExpression(
+                new MemberReferenceExpression(new TypeReferenceExpression(GlobalType("System", "Runtime", "CompilerServices", "Unsafe")),
+                    "AsRef", pointer.BaseType.Clone()), address));
+        }
+
         private static bool IsSharedInstance(IType type) => type.TypeArguments.Any(a => a.IsKnownType(KnownTypeCode.Object) || IsSharedInstance(a));
 
         private static bool RestrictsObject(ITypeParameter parameter) =>
@@ -322,11 +357,38 @@ public static partial class Decompilation
         /// <summary>M&lt;object&gt;((object)x) 违反 M 的约束时同样是共享泛型：去掉转换，由 x 的类型推断实参。</summary>
         private static void SharedTypeArguments(InvocationExpression call)
         {
-            if (call.Target is not MemberReferenceExpression member || member.TypeArguments.Count == 0 || !member.TypeArguments.All(a => a is PrimitiveType { Keyword: "object" })) return;
+            var arguments = call.Target switch
+            {
+                MemberReferenceExpression member => member.TypeArguments,
+                IdentifierExpression identifier => identifier.TypeArguments,
+                _ => null,
+            };
+            if (arguments is null || arguments.Count == 0 || !arguments.All(a => a is PrimitiveType { Keyword: "object" })) return;
             if (call.Annotation<ResolveResult>() is not InvocationResolveResult { Member: IMethod method } || !method.TypeParameters.Any(RestrictsObject)) return;
             foreach (var argument in call.Arguments.OfType<CastExpression>().ToArray())
-                if (argument.Type is PrimitiveType { Keyword: "object" } || argument.Type.DescendantsAndSelf.OfType<PrimitiveType>().Any(t => t.Keyword == "object")) argument.ReplaceWith(argument.Expression.Clone());
-            member.TypeArguments.Clear();
+                if (argument.Type.DescendantsAndSelf.OfType<PrimitiveType>().Any(t => t.Keyword == "object"))
+                {
+                    var value = argument.Expression is CastExpression { Type: PrimitiveType { Keyword: "object" }, Expression: var inner } ? inner : argument.Expression;
+                    argument.ReplaceWith(value.Clone());
+                }
+            arguments.Clear();
+        }
+
+        // 裁剪的引用只保留实际被调用的重载。Unity 编辑器里其余重载也参与绑定，null 需要保留 CIL 选中的形参类型。
+        private static void TypedExternalNullArguments(InvocationExpression call, TransformContext context)
+        {
+            if (call.Annotation<ResolveResult>() is not InvocationResolveResult { Member: IMethod { IsStatic: true } method }
+                || ReferenceEquals(method.ParentModule, context.TypeSystem.MainModule)
+                || method.ParentModule?.AssemblyName.StartsWith("UnityEngine.", StringComparison.Ordinal) != true
+                || method.Parameters.Count != call.Arguments.Count) return;
+            foreach (var (argument, index) in call.Arguments.Select((a, i) => (a, i)).ToArray())
+            {
+                var name = (argument as NamedArgumentExpression)?.Name;
+                var parameter = name is null ? method.Parameters[index] : method.Parameters.FirstOrDefault(p => p.Name == name);
+                var value = (argument as NamedArgumentExpression)?.Expression ?? argument;
+                if (value is NullReferenceExpression && parameter?.Type is { IsReferenceType: true, Kind: not TypeKind.TypeParameter } type && !type.IsKnownType(KnownTypeCode.Object))
+                    value.ReplaceWith(new CastExpression(QualifiedTypes.ConvertType(type), value.Clone()));
+            }
         }
 
         /// <summary>
@@ -455,10 +517,24 @@ public static partial class Decompilation
             if (cast.Expression is not ThisReferenceExpression) return;
             if (cast.GetParent<TypeDeclaration>()?.Annotation<TypeResolveResult>()?.Type.GetDefinition() is not { Kind: TypeKind.Struct } owner) return;
             var target = cast.Annotation<ResolveResult>()?.Type ?? cast.Type.Annotation<ResolveResult>()?.Type;
-            if (target is null || owner.Fields.FirstOrDefault(f => !f.IsStatic) is not { } first || !first.ReturnType.Equals(target)) return;
+            if (target is null) return;
             const string backing = ">k__BackingField";
-            var name = first.Name.EndsWith(backing, StringComparison.Ordinal) ? first.Name[1..^backing.Length] : first.Name;
-            cast.ReplaceWith(new MemberReferenceExpression(new ThisReferenceExpression(), name));
+            Expression member = new ThisReferenceExpression();
+            var visited = new HashSet<ITypeDefinition>();
+            for (ITypeDefinition? type = owner; type is { Kind: TypeKind.Struct } && visited.Add(type);)
+            {
+                if (type.ParentModule?.MetadataFile?.Metadata is not { } metadata || type.MetadataToken.Kind != HandleKind.TypeDefinition
+                    || (metadata.GetTypeDefinition((TypeDefinitionHandle)type.MetadataToken).Attributes & TypeAttributes.LayoutMask) != TypeAttributes.SequentialLayout
+                    || type.Fields.FirstOrDefault(f => !f.IsStatic) is not { } field || type != owner && field.Accessibility != Accessibility.Public) return;
+                var name = field.Name.EndsWith(backing, StringComparison.Ordinal) ? field.Name[1..^backing.Length] : field.Name;
+                member = new MemberReferenceExpression(member, name);
+                if (field.ReturnType.Equals(target))
+                {
+                    cast.ReplaceWith(member);
+                    return;
+                }
+                type = field.ReturnType.GetDefinition();
+            }
         }
 
         /// <summary>

@@ -1,12 +1,14 @@
 using ReSekai.Decompiler.Facts;
 using ReSekai.Decompiler.Ir;
+using ReSekai.Decompiler.Machine.Flow;
+using ReSekai.Decompiler.Machine.Ssa;
 using ReSekai.Decompiler.Recovery.Calls;
 using ReSekai.Decompiler.Recovery.Memory;
 using ReSekai.Decompiler.Recovery.Values;
 
 namespace ReSekai.Decompiler.Recovery.Typing;
 
-public enum LocationKind : byte { Instance, Reference, Static, ThreadStatic, Element, Length, StringLength, StringChar, Local, Argument, MultiElement, Dimension, LowerBound }
+public enum LocationKind : byte { Instance, Reference, Static, ThreadStatic, Element, Length, StringLength, StringChar, Local, Argument, MultiElement, Dimension, LowerBound, SpanElement }
 
 /// <summary>
 /// 一次读写指向的 IL 位置。Base：实例字段的对象、经引用访问的指针、数组或字符串，可寻址局部为单元起点的局部地址；
@@ -19,6 +21,7 @@ public sealed record AccessPart(Location Leaf, int Bit, int FieldBit, int Width)
 public sealed record Location(LocationKind Kind, Sym? Base, Sym? Index, long ConstantIndex, TypeRef? Owner, IReadOnlyList<FieldRef> Path, TypeRef Type)
 {
     public Sym? ByteOffset { get; init; }
+    public bool FixedBuffer { get; init; }
     /// <summary>无类型指针上的元素：字节偏移是 Index 乘以 sizeof(Type)（Kind 为 Reference）；访问元素的字段时按 sizeof(Element)，Path 从元素进入字段。</summary>
     public bool Strided { get; init; }
     /// <summary>Strided 访问元素中的字段时元素的类型（Type 是字段的类型）。</summary>
@@ -64,12 +67,13 @@ public sealed partial class TypeOracle : Runtime.IRuntimeTyping
     /// </summary>
     public TypeRef? CellType(Cell cell)
     {
+        if (cell.TypedStorage is { } typed) return typed;
         // 不透明局部的类型由分配点给出；不透明返回值存放在调用者的缓冲区。
         if (cell.Space.Element is { } element) return element;
         if (cell.Space == LocalSpace.Result && ManagedAbi.SharedValue(ReturnType)) return ReturnType;
         // 实参副本就是形参的值：单元覆盖整个对象时，类型由签名给出，不靠用法推断。
         if (cell.Space.Kind == LocalKind.Argument && cell.Start == 0 && Parameter(cell.Space.Argument) is { } parameter
-            && types.Kind(parameter) == TypeKind.Struct && types.Size(parameter) == cell.Size) return parameter;
+            && (ManagedAbi.SharedValue(parameter) || types.Kind(parameter) == TypeKind.Struct && types.Size(parameter) == cell.Size)) return parameter;
         if (cellTypes is null)
         {
             cellTypes = [];
@@ -202,18 +206,22 @@ public sealed partial class TypeOracle : Runtime.IRuntimeTyping
         Sym? StackInfo() => call.Memory.FirstOrDefault(m => !m.Write && m.Value == MachineSignature.MethodInfoIndex) is { } access
             && call.ArgumentIndex(access.Cell) is var cell and >= 0 && cell + 1 < operands.Count
             ? values.Syms.Slice(operands[1 + cell], access.CellBit, access.Width) : null;
+        var receiver = shape.Signature?.This is { } self && self.Pieces[0].Register.Bank == Bank.Gpr ? Register(self.Pieces[0].Register) : null;
+        var receiverType = receiver is not null && call.Op?.Kind != OpKind.CallDelegate ? TypeOf(receiver) : null;
+        if (receiverType is ByRefRef byRef) receiverType = byRef.Element;
         if (shape.Signature?.MethodInfo is { } info && (info.Register.Bank == Bank.Stack ? StackInfo() : Register(info.Register)) is { } infoSym
             && SymTable.Resolve(infoSym) is EntitySym { Symbol: { Kind: SymbolKind.Method, Value: MethodRef exact } }
             && candidates.Any(c => c.Method == exact.Method))
-            return callees[call] = InContext(exact);
+        {
+            var target = InContext(exact);
+            // RGCTX 的类型可能已按当前入口展开。实例接收者仍决定声明类型的类型实参，避免再次替换其外层泛型参数。
+            return callees[call] = !target.Method.IsStatic && receiverType is DefinitionRef declaring ? Specialize(target, declaring) : target;
+        }
         // 约束调用的 RGCTX 项指名接收者的确切类型，折叠的候选里取声明在该类型上的方法。
         if (shape.Signature?.MethodInfo is { Register.Bank: not Bank.Stack } constrainedInfo && Register(constrainedInfo.Register) is { } constrainedSym
             && SymTable.Resolve(constrainedSym) is EntitySym { Symbol: { Kind: SymbolKind.Constrained, Value: ValueTuple<TypeRef, MethodRef> { Item1: DefinitionRef constrained } } }
             && candidates.FirstOrDefault(c => c.Method.Owner == constrained.Definition) is { } implementation)
             return callees[call] = InContext(implementation with { TypeArguments = constrained.Arguments });
-        var receiver = shape.Signature?.This is { } self && self.Pieces[0].Register.Bank == Bank.Gpr ? Register(self.Pieces[0].Register) : null;
-        var receiverType = receiver is not null && call.Op?.Kind != OpKind.CallDelegate ? TypeOf(receiver) : null;
-        if (receiverType is ByRefRef byRef) receiverType = byRef.Element;
         var arguments = shape.Signature?.Arguments.Select(a => a.Transfer == Transfer.Value && a.Pieces.Length == 1 && a.Pieces[0].Register.Bank != Bank.Stack
             ? Register(a.Pieces[0].Register) : null).ToArray() ?? [];
         // 兼容的候选中取声明类型离接收者最近的（折叠的候选机器码相同，最派生的声明对接收者一定可用）。
@@ -310,6 +318,8 @@ public sealed partial class TypeOracle : Runtime.IRuntimeTyping
         {
             case ArgSym arg:
                 return Parameter(arg.Index);
+            case SizeOfSym:
+                return types.Int32;
             case LocalSym local when memory.Find(local.Space, local.Offset, 1) is { Promoted: false } cell
                 && cell.Start == local.Offset && CellType(cell) is { } cellType:
                 return new ByRefRef(cellType);
@@ -328,7 +338,8 @@ public sealed partial class TypeOracle : Runtime.IRuntimeTyping
             case ReadSym read when Decompose(read.Address) is (ResultSym { Site.Op.Kind: OpKind.BeginCatch }, 0, null, _):
                 return types.Corlib("System.Exception");
             case ReadSym read:
-                return Locate(read.Address, read.Width)?.Type ?? (NarrowRead(read) is not null ? types.Integer(read.Width, true) : null);
+                return Locate(read.Address, read.Width)?.Type ?? BooleanAddress(read.Address, read.Width)?.Yes.Type
+                    ?? (NarrowRead(read) is not null ? types.Integer(read.Width, true) : null);
             case ConcatSym concat when CompositeRead(concat) is { } whole:
                 return TypeOf(whole);
             case PhiSym phi:
@@ -482,8 +493,10 @@ public sealed partial class TypeOracle : Runtime.IRuntimeTyping
                     // 只有带符号或无符号语义的运算给出类型。
                     var operand = TypeOf(op.Args[0]);
                     if (operand is not null && types.Kind(operand) is TypeKind.Int && types.Bits(operand) == op.Width) return operand;
-                    // 指针加减常量还是指针。
-                    if (operand is PointerRef && op.Op is { Kind: OperatorKind.Binary, Binary: BinOp.Add or BinOp.Sub } && SymTable.Resolve(op.Args[1]) is ConstSym) return operand;
+                    // 指针加减字节偏移仍是指针。偏移须为整数，排除指针间的减法。
+                    if (operand is PointerRef && op.Width == 64 && op.Op is { Kind: OperatorKind.Binary, Binary: BinOp.Add or BinOp.Sub }
+                        && PointerDisplacement(op.Args[1]))
+                        return operand;
                     if (op.Width is not (8 or 16 or 32 or 64) || op.Op.Kind != OperatorKind.Binary) return null;
                     return op.Op.Binary switch
                     {
@@ -502,6 +515,14 @@ public sealed partial class TypeOracle : Runtime.IRuntimeTyping
                 };
         }
         return null;
+    }
+
+    internal bool PointerDisplacement(Sym value)
+    {
+        value = SymTable.Resolve(value);
+        return value is ConstSym or ConcatSym { Parts: [ConstSym { Value: 0 }, ..] }
+            || TypeOf(value) is { } type && types.Kind(type) == TypeKind.Int
+            || Scaled(value) is { Index: var index } && TypeOf(index) is { } indexType && types.Kind(indexType) == TypeKind.Int;
     }
 
     /// <summary>
@@ -613,7 +634,7 @@ public sealed partial class TypeOracle : Runtime.IRuntimeTyping
     {
         var terms = AddressTerms(address);
         if (terms.Root is PhiSym phi && terms.Index is null && Cursor(phi) is { } cursor)
-            return (cursor.Array!, terms.Offset + cursor.Offset, cursor.Index, cursor.Size);
+            return (cursor.Base!, terms.Offset + cursor.Offset, cursor.Index, cursor.Size);
         if (terms.Index is PhiSym bytes && terms.Scale == 1 && ArrayView(terms.Root) is { } array
             && ElementSize(array.Element) is var size
             && (OffsetCursor(bytes, size) ?? (terms.Offset >= RuntimeLayout.ArrayData ? OffsetCursor(bytes, size, 0) : null)) is { } walked)
@@ -722,6 +743,8 @@ public sealed partial class TypeOracle : Runtime.IRuntimeTyping
                 case ConcatSym { Parts: [ConstSym { Value: 0 } low, ..] }: return low.Width;
                 case OpSym { Op.Kind: OperatorKind.Binary, Args: [var left, var right] } sum when sum.Op.Binary is BinOp.Add or BinOp.Sub:
                     return Math.Min(Zeros(left), Zeros(right));
+                case OpSym { Op.Kind: OperatorKind.Binary, Op.Binary: BinOp.Mul, Args: [var left, ConstSym right] } product:
+                    return Math.Min(product.Width, Math.Min(product.Width, Zeros(left)) + Zeros(right));
                 case PhiSym phi:
                     if (!active.Add(phi)) return int.MaxValue;
                     return active.Count > 32 ? 0 : phi.Sources.Select(Zeros).DefaultIfEmpty(0).Min();
@@ -743,16 +766,54 @@ public sealed partial class TypeOracle : Runtime.IRuntimeTyping
     /// <summary>两个下标是同一个值的低位截断（移位前先截到不同宽度），按模运算相同。</summary>
     private static bool SameIndex(Sym left, Sym right)
     {
-        static Sym Untruncated(Sym sym) => SymTable.Resolve(sym) is SliceSym { Low: 0 } slice ? Untruncated(slice.Base) : SymTable.Resolve(sym);
+        static Sym Untruncated(Sym sym) => SymTable.Resolve(sym) switch
+        {
+            SliceSym { Low: 0 } slice => Untruncated(slice.Base),
+            PhiSym { Projection: { Low: 0 } projection } => Untruncated(projection.Whole),
+            var whole => whole,
+        };
         return Untruncated(left).Equals(Untruncated(right));
     }
 
-    private bool IsAddressRoot(Sym term) => term is EntitySym or LocalSym || TypeOf(term) is { } t && (ManagedTypes.IsReferenceType(t) || t is ByRefRef or PointerRef);
+    private bool IsAddressRoot(Sym term) => term is EntitySym or LocalSym || TypeOf(term) is { } t
+        && (ManagedTypes.IsReferenceType(t) || t is ByRefRef or PointerRef || ArrayView(term) is not null || SpanSource(term) is not null);
+
+    public (Sym Condition, Location Yes, Location No)? BooleanAddress(Sym address, int width)
+    {
+        var (root, offset, index, step) = Decompose(address);
+        Sym At(long delta) => values.Syms.Binary(BinOp.Add, root, values.Syms.Const(unchecked((ulong)delta), 64), 64);
+        if (root is EntitySym { Symbol.Kind: SymbolKind.StaticFields or SymbolKind.ThreadStaticFields }
+            && index is PhiSym { Sources.Length: 2 } phi && phi.Sources[0] is { } firstSource && phi.Sources[1] is { } secondSource
+            && SymTable.Resolve(firstSource) is ConstSym first && SymTable.Resolve(secondSource) is ConstSym second && first.Signed != second.Signed
+            && Locate(At(offset + first.Signed * step), width) is { } firstField
+            && Locate(At(offset + second.Signed * step), width) is { } secondField && firstField.Type.Equals(secondField.Type))
+        {
+            // 合流的常量只选择静态字段，仍在原访存点读取选中的字段。
+            var choice = values.Syms.Phi(phi.Block, (phi.Origin, nameof(BooleanAddress)), 1);
+            values.Syms.SetSource(choice, 0, values.Syms.Const(1, 1));
+            values.Syms.SetSource(choice, 1, values.Syms.Const(0, 1));
+            return (choice, firstField, secondField);
+        }
+        var condition = index is null ? null : SymTable.Bit(index);
+        if (condition is null || step <= 0
+            || TypeOf(root) is not ByRefRef && root is not LocalSym) return null;
+        if (Locate(At(offset + step), width) is not { } yes || Locate(At(offset), width) is not { } no
+            || !yes.Type.Equals(no.Type) || types.Kind(yes.Type) is not (TypeKind.Int or TypeKind.Float or TypeKind.Double)) return null;
+        return (condition, yes, no);
+    }
 
     public Location? Locate(Sym address, int width)
     {
         if (pointerElements.TryGetValue((SymTable.Resolve(address), width), out var viewed)) return viewed;
         var (root, offset, index, scale) = Decompose(address);
+        if (root is PhiSym cursor && index is null && BufferCursor(cursor) is { Base: { } buffer } walked)
+            (root, offset, index, scale) = (buffer, offset + walked.Offset, walked.Index, walked.Size);
+        if (root is PhiSym selection && index is null && BufferIndexPhi(selection) is { } chosen)
+            (root, index, scale) = (chosen.Buffer, chosen.Index, chosen.Stride);
+        if (root is PhiSym fixedCursor && index is null && FixedBufferCursor(fixedCursor) is { } walkedFixed
+            && Locate(values.Syms.Binary(BinOp.Add, walkedFixed.Root, values.Syms.Binary(BinOp.Add,
+                values.Syms.Const(unchecked((ulong)(offset + walkedFixed.Offset)), 64), walkedFixed.Index, 64), 64), width) is { } cursorLocation)
+            return cursorLocation;
         // 不透明值没有固定位宽，只按位置访问。
         if (width < 0 && root is LocalSym opaque && opaque.Offset == 0 && offset == 0 && index is null)
         {
@@ -761,6 +822,9 @@ public sealed partial class TypeOracle : Runtime.IRuntimeTyping
             if (memory.Find(opaque.Space, 0, 1) is { Promoted: false } home && CellType(home) is { } homeType)
                 return new(LocationKind.Local, values.Syms.Local(home.Space, home.Start), null, 0, null, [], homeType);
         }
+        if (root is LocalSym frame && memory.Find(frame.Space, frame.Offset, 1) is { Promoted: false, TypedStorage: not null } fixedCell
+            && FixedBufferLocation(values.Syms.Local(frame.Space, fixedCell.Start), frame.Offset - fixedCell.Start + offset, index, scale, width) is { } bufferLocation)
+            return bufferLocation;
         if (root is LocalSym local && index is null && memory.Find(local.Space, local.Offset + offset, width / 8) is { Promoted: false } cell && CellType(cell) is { } cellType)
         {
             var at = (int)(local.Offset + offset - cell.Start);
@@ -786,20 +850,60 @@ public sealed partial class TypeOracle : Runtime.IRuntimeTyping
             };
         }
         var rootType = TypeOf(root);
+        if (FixedBufferLocation(root, offset, index, scale, width) is { } fixedLocation) return fixedLocation;
         // 只包住一个数组引用的结构体值：它的位就是这个引用，内联的取值化简后直接按数组访问。
         TypeRef? through = null;
         if (rootType is not ArrayRef && ArrayView(root) is { } wrappedArray) rootType = through = wrappedArray;
         Location? Through(Location? located) => located is null || through is null ? located : located with { Through = through };
+        if (SpanSource(root) is var (span, spanType) && spanType.Arguments[0] is var spanElement
+            && ElementSize(spanElement) is > 0 and var spanSize && BufferIndex(offset, index, scale, spanSize) is { } spanAccess)
+        {
+            if (spanAccess.FieldOffset == 0 && width == StorageBits(spanElement))
+                return new Location(LocationKind.SpanElement, span, spanAccess.Index, 0, spanType, [], spanElement);
+            if (types.Kind(spanElement) == TypeKind.Struct
+                && FieldAt(spanElement, spanAccess.FieldOffset + RuntimeLayout.ObjectHeaderSize, width, false, false) is var (path, fieldType))
+                return new Location(LocationKind.SpanElement, span, spanAccess.Index, 0, spanType, path, fieldType);
+            return null;
+        }
+        if (rootType is PointerRef { Element: var pointed } && ManagedTypes.IsVoid(pointed) && BufferElementOf(root) is { } buffered
+            && BufferElementSize(buffered) is > 0 and var stride)
+        {
+            if (BufferIndex(offset, index, scale, stride) is { } access)
+            {
+                if (access.FieldOffset == 0 && width == stride * 8)
+                    return new Location(LocationKind.Reference, root, access.Index, 0, null, [], buffered) { Strided = true };
+                if (types.Kind(buffered) == TypeKind.Struct
+                    && FieldAt(buffered, access.FieldOffset + RuntimeLayout.ObjectHeaderSize, width, false, false) is var (path, fieldType))
+                    return new Location(LocationKind.Reference, root, access.Index, 0, null, path, fieldType) { Strided = true, Element = buffered };
+            }
+            // 布局已知时，跨字段的访问交给 Split，不能退回 void 的单值读取。
+            return null;
+        }
+        if (rootType is PointerRef { Element: var opaqueElement } && ManagedTypes.IsVoid(opaqueElement)
+            && width is 8 or 16 or 32 or 64
+            && method.Method is { GenericParameters.Count: 0, Owner.GenericParameters.Count: 0 })
+        {
+            // 具体方法的 void* 标量访存按机器宽度保留位型。开放泛型的宽度可能来自实例，须有元素布局证明。
+            var displacement = values.Syms.Const(unchecked((ulong)offset), 64);
+            if (index is not null)
+                displacement = values.Syms.Binary(BinOp.Add, displacement,
+                    values.Syms.Binary(BinOp.Mul, values.Syms.ZeroExtend(index, 64), values.Syms.Const((ulong)scale, 64), 64), 64);
+            return new Location(LocationKind.Reference, root, null, 0, null, [], types.Integer(width, false))
+                { ByteOffset = SymTable.IsZero(displacement) ? null : displacement };
+        }
         switch (rootType)
         {
             case ArrayRef array:
                 {
                     if (index is null && offset == RuntimeLayout.ArrayMaxLength && width is 32 or 64) return Through(new(LocationKind.Length, root, null, 0, null, [], types.Int32));
-                    if (!array.IsVector) return Through(MultiElement(root, array, offset, index, scale, width));
+                    if (!array.IsVector) return Through(MultiElement(root, array, offset, index, scale, width, address));
                     // 可变大小的元素：codegen 按数组类的 element_size 计算下标，只按位置访问。
-                    if (width < 0 && ManagedAbi.SharedValue(array.Element) && offset == RuntimeLayout.ArrayData && scale == 1
-                        && RuntimeScaledIndex(root, index) is { } scaledIndex)
-                        return Through(new(LocationKind.Element, root, scaledIndex, 0, null, [], array.Element));
+                    if (width < 0 && ManagedAbi.SharedValue(array.Element) && offset == RuntimeLayout.ArrayData)
+                    {
+                        if (index is null) return Through(new(LocationKind.Element, root, null, 0, null, [], array.Element));
+                        if (scale == 1 && RuntimeScaledIndex(root, index) is { } scaledIndex)
+                            return Through(new(LocationKind.Element, root, scaledIndex, 0, null, [], array.Element));
+                    }
                     var size = ElementSize(array.Element);
                     if (size > 0 && index is not null) (index, scale) = Rescaled(index, scale, size);
                     if (size <= 0 || index is null && offset < RuntimeLayout.ArrayData || index is not null && scale != size) return null;
@@ -841,10 +945,16 @@ public sealed partial class TypeOracle : Runtime.IRuntimeTyping
             case PointerRef pointer when index is not null || offset != 0:
                 {
                     var size = ElementSize(pointer.Element);
-                    var byteStorage = size == 1 && width is 16 or 32 or 64
-                        && root is PhiSym pinned && PinnedArray(pinned) is not null;
-                    if (size > 0 && offset % size == 0 && (width == StorageBits(pointer.Element) || byteStorage)
-                        && (index is null || scale >= size && scale % size == 0))
+                    if (index is PhiSym bytes && scale == 1 && size > 1
+                        && OffsetCursor(bytes, size, 0) is { } pointerCursor && pointerCursor.Offset % size == 0)
+                        (offset, index, scale) = (offset + pointerCursor.Offset, pointerCursor.Index, pointerCursor.Size);
+                    var alignedBytes = index is not null && scale == 1 && size > 1
+                        && System.Numerics.BitOperations.IsPow2((uint)size)
+                        && LowZeros(index) >= System.Numerics.BitOperations.TrailingZeroCount((uint)size);
+                    var bitStorage = root is PhiSym pinned && PinnedArray(pinned) is not null
+                        && (size == 1 && width is 16 or 32 or 64 || types.Kind(pointer.Element) == TypeKind.Float && width == 32);
+                    if (size > 0 && offset % size == 0 && (width == StorageBits(pointer.Element) || bitStorage)
+                        && (index is null || scale >= size && scale % size == 0 || alignedBytes))
                     {
                         // 比例下标可能只保留低位；先零扩展再乘原比例，保留模 2^64 的字节地址。
                         // 截掉的高位乘比例后都会溢出时，直接用未截断的值。
@@ -856,7 +966,7 @@ public sealed partial class TypeOracle : Runtime.IRuntimeTyping
                             displacement = values.Syms.Binary(BinOp.Add,
                                 values.Syms.Binary(BinOp.Mul, values.Syms.ZeroExtend(bits, 64), values.Syms.Const((ulong)scale, 64), 64), displacement, 64);
                         }
-                        var element = byteStorage ? types.Integer(width, false) : pointer.Element;
+                        var element = bitStorage ? types.Integer(width, false) : pointer.Element;
                         return new Location(LocationKind.Reference, root, null, 0, null, [], element) { ByteOffset = displacement };
                     }
                     return index is null && types.Kind(pointer.Element) == TypeKind.Struct
@@ -866,6 +976,10 @@ public sealed partial class TypeOracle : Runtime.IRuntimeTyping
             case ByRefRef or PointerRef when index is null:
                 {
                     var element = rootType is ByRefRef r ? r.Element : ((PointerRef)rootType).Element;
+                    // 裸整数指针允许显式转成同地址的另一种整数指针；读写宽度取自机器指令。
+                    if (rootType is PointerRef && offset == 0 && width is 8 or 16 or 32 or 64
+                        && types.Kind(element) is TypeKind.Int or TypeKind.Bool && StorageBits(element) != width)
+                        return new(LocationKind.Reference, root, null, 0, null, [], types.Integer(width, false));
                     // 合流的托管指针只按被指类型的宽度访问，其他宽度不是这个位置。
                     if (root is PhiSym && offset == 0 && types.Kind(element) != TypeKind.Struct && width > 1 && width != StorageBits(element)) return null;
                     // 只有一个引用字段的结构体：机器读取得到的引用就是这个字段，它随后被当作对象指针使用。
@@ -896,7 +1010,15 @@ public sealed partial class TypeOracle : Runtime.IRuntimeTyping
         // 缓冲区上单独递推的字节偏移（ptr + φ，φ 从 0 起按元素大小步进）按元素下标解释。
         if (index is PhiSym bytes && scale == 1 && OffsetCursor(bytes, size, 0) is { } walked)
             (offset, index, scale) = (offset + walked.Offset, walked.Index, walked.Size);
-        if (TypeOf(root) is not PointerRef { Element: var pointee } || !ManagedTypes.IsVoid(pointee) || index is null || offset != 0) return null;
+        if (TypeOf(root) is not PointerRef { Element: var pointee } || !ManagedTypes.IsVoid(pointee) || offset != 0) return null;
+        if (index is null)
+        {
+            // NativeArray 已证明缓冲区的元素类型时，首元素与其他元素一样可以整值读写。
+            if (BufferElement(address)?.Equals(element) != true) return null;
+            var first = new Location(LocationKind.Reference, root, null, 0, null, [], element);
+            pointerElements[(SymTable.Resolve(address), size * 8)] = first;
+            return first;
+        }
         (index, scale) = Rescaled(index, scale, size);
         if (scale != size) return null;
         var location = new Location(LocationKind.Reference, root, index, 0, null, [], element) { Strided = true };
@@ -925,17 +1047,86 @@ public sealed partial class TypeOracle : Runtime.IRuntimeTyping
     /// 无类型指针按库的约定确定的元素类型：Unity.Collections.NativeArray&lt;T&gt; 的 m_Buffer 只经 UnsafeUtility.ReadArrayElement/WriteArrayElement&lt;T&gt;
     /// 按 T 步进访问。指针是这个字段的读取或结构体值里这个字段的片时为 T。
     /// </summary>
-    public TypeRef? BufferElement(Sym address)
+    public TypeRef? BufferElement(Sym address) => BufferElementOf(Decompose(address).Root);
+
+    private readonly Dictionary<PhiSym, (Sym Buffer, PhiSym Index, int Stride)?> bufferIndexPhis = [];
+
+    /// <summary>原生数组缓冲区不变时，按入边合流元素下标，保留同一缓冲区的有类型访问。</summary>
+    private (Sym Buffer, PhiSym Index, int Stride)? BufferIndexPhi(PhiSym phi)
     {
-        var (field, holder) = SymTable.Resolve(Decompose(address).Root) switch
+        if (bufferIndexPhis.TryGetValue(phi, out var known)) return known;
+        bufferIndexPhis[phi] = null;
+        if (phi.Width != 64 || phi.Projection is not null || phi.Sources.Any(s => s is null)) return null;
+        var edges = phi.Sources.Select(s => AddressTerms(s!)).ToArray();
+        if (edges.Length < 2 || BufferElementOf(edges[0].Root) is not { } element
+            || BufferElementSize(element) is not (> 0 and var stride)
+            || edges.Any(e => !ReferenceEquals(e.Root, edges[0].Root) || e.Offset % stride != 0)) return null;
+        var indices = edges.Select(e => BufferIndex(e.Offset, e.Index, e.Scale, stride)).ToArray();
+        if (indices.Any(e => e is null || e.Value.FieldOffset != 0)) return null;
+        var joined = values.Syms.Phi(phi.Block, (phi.Origin, nameof(BufferIndexPhi)), 64);
+        for (var i = 0; i < indices.Length; i++) values.Syms.SetSource(joined, i, values.Syms.ZeroExtend(indices[i]!.Value.Index, 64));
+        return bufferIndexPhis[phi] = (edges[0].Root, joined, stride);
+    }
+
+    private TypeRef? BufferElementOf(Sym root) => BufferElementOf(root, []);
+
+    private TypeRef? BufferElementOf(Sym root, HashSet<Sym> path)
+    {
+        root = SymTable.Resolve(root);
+        if (root is PhiSym phi)
+        {
+            if (!path.Add(phi)) return null;
+            TypeRef? joined = null;
+            foreach (var source in phi.Sources)
+            {
+                if (source is null || BufferElementOf(source, path) is not { } incoming || joined is not null && !joined.Equals(incoming))
+                {
+                    path.Remove(phi);
+                    return null;
+                }
+                joined = incoming;
+            }
+            path.Remove(phi);
+            return joined;
+        }
+        var (field, holder) = root switch
         {
             ReadSym read when Locate(read.Address, read.Width) is { Path: [.., var last] } => (last, last.DeclaringType),
             SliceSym { Low: var low, Width: var width } slice when TypeOf(slice.Base) is DefinitionRef owner && types.Kind(owner) == TypeKind.Struct
-                && types.Project(owner, low, width) is { Path: [var only] } => (only, owner),
+                && types.Project(owner, low, width) is { Path: [.., var last] } => (last, last.DeclaringType),
             _ => ((FieldRef?)null, (TypeRef?)null),
         };
         return field is { Field.Name: "m_Buffer" } && holder is DefinitionRef { Definition.FullName: "Unity.Collections.NativeArray", Arguments: [var element] }
-            && element is not GenericParameterRef ? element : null;
+            && (element is not GenericParameterRef || element is GenericParameterRef { Binding.Kind: NativeBindingKind.Scalar or NativeBindingKind.Aggregate })
+            ? element : null;
+    }
+
+    private (Sym Index, int FieldOffset)? BufferIndex(long offset, Sym? index, int scale, int stride)
+    {
+        if (index is PhiSym bytes && scale == 1 && OffsetCursor(bytes, stride, 0) is { } walked)
+            (offset, index, scale) = (offset + walked.Offset, walked.Index, walked.Size);
+        var elementOffset = Math.DivRem(offset, stride, out var fieldOffset);
+        if (fieldOffset < 0) { elementOffset--; fieldOffset += stride; }
+        if (index is null) return (values.Syms.Const(unchecked((ulong)elementOffset), 64), (int)fieldOffset);
+        (index, scale) = Rescaled(index, scale, stride);
+        if (scale != stride) return null;
+        if (elementOffset != 0)
+        {
+            // 按原比例丢弃的高位不影响模 2^64 的字节地址。先扩展再移动到相邻元素，避免低位进位被截断。
+            index = values.Syms.Binary(BinOp.Add, values.Syms.ZeroExtend(index, 64), values.Syms.Const(unchecked((ulong)elementOffset), 64), 64);
+        }
+        return (index, (int)fieldOffset);
+    }
+
+    /// <summary>库的 Span 布局以 ByReference&lt;T&gt; 保存起始托管引用。</summary>
+    private (Sym Value, DefinitionRef Type)? SpanSource(Sym address)
+    {
+        if (SymTable.Resolve(address) is not SliceSym { Low: 0, Width: 64 } slice
+            || TypeOf(slice.Base) is not DefinitionRef { Definition.Assembly: "mscorlib.dll", Definition.FullName: "System.Span" or "System.ReadOnlySpan", Arguments: [var element] } span
+            || types.Project(span, 0, 64) is not { Path: [{ Field.Name: "_pointer" }], Type: DefinitionRef
+                { Definition.FullName: "System.ByReference", Arguments: [var pointerElement] } }
+            || !element.Equals(pointerElement)) return null;
+        return (slice.Base, span);
     }
 
     /// <summary>步进访问的比例恰等于元素大小（不经比例换算）。</summary>
@@ -951,7 +1142,7 @@ public sealed partial class TypeOracle : Runtime.IRuntimeTyping
     /// 多维数组的元素：元素按行优先存放，codegen 的 GetAt/SetAt 不减下界，线性下标为 ((i0·n1 + i1)·n2 + i2)…，
     /// 每层的乘数是同一数组下一维长度的读取。逐层拆出各维下标，都要是 int32（或其扩展）。
     /// </summary>
-    private Location? MultiElement(Sym root, ArrayRef array, long offset, Sym? index, int scale, int width)
+    private Location? MultiElement(Sym root, ArrayRef array, long offset, Sym? index, int scale, int width, Sym address)
     {
         if (index is null) return null;
         Sym linear;
@@ -968,6 +1159,9 @@ public sealed partial class TypeOracle : Runtime.IRuntimeTyping
             if (scale != size || offset < RuntimeLayout.ArrayData) return null;
             var within = offset - RuntimeLayout.ArrayData;
             var inside = (int)(within % size);
+            if (index is SliceSym { Low: 0, Base: { Width: 64 } whole } kept
+                && System.Numerics.BitOperations.TrailingZeroCount((uint)scale) >= 64 - kept.Width)
+                index = SymTable.Resolve(whole);
             linear = within / size == 0 ? index : values.Syms.Binary(BinOp.Add, index, values.Syms.Const(unchecked((ulong)(within / size)), index.Width), index.Width);
             if (inside != 0 || types.Kind(array.Element) == TypeKind.Struct && width != size * 8)
             {
@@ -983,10 +1177,56 @@ public sealed partial class TypeOracle : Runtime.IRuntimeTyping
             if (dimension == 0) at = linear;
             else if (OuterIndex(root, linear, dimension) is var (inner, outer)) (at, linear) = (inner, outer);
             else return null;
-            if (Index32(at) is not { } narrow) return null;
+            var narrow = Index32(at);
+            if (narrow is null)
+            {
+                // 外层循环的回边有时经判空块，无法只从 φ 的回边推导范围。
+                if (at is SliceSym { Low: 0, Width: >= 32, Base: { Width: 64 } source }) at = source;
+                if (at is PhiSym { Projection: ({ Width: 64 } full, 0), Width: >= 32 }) at = full;
+                if (at.Width != 64 || !CheckedDimensionIndex(root, at, dimension, address)) return null;
+                narrow = values.Syms.Slice(at, 0, 32);
+            }
             indices[dimension] = narrow;
         }
         return new Location(LocationKind.MultiElement, root, null, 0, null, path, type) { Indices = indices };
+    }
+
+    private Dictionary<Sym, List<Stmt>>? memoryAccesses;
+
+    private bool CheckedDimensionIndex(Sym array, Sym index, int dimension, Sym address)
+    {
+        // 原生以 64 位做地址计算。只在该地址的所有读取和写入均经同数组、同维的完整下标检查时截取低 32 位。
+        if (memoryAccesses is null)
+        {
+            memoryAccesses = [];
+            foreach (var statement in values.Function.Blocks.SelectMany(b => b.Statements))
+            {
+                foreach (var read in values.ReadsAt(statement)) Add(read.Address, statement);
+                if (statement is Store && values.Operands(statement) is [var destination, _]) Add(destination, statement);
+            }
+            void Add(Sym key, Stmt statement)
+            {
+                key = SymTable.Resolve(key);
+                if (!memoryAccesses.TryGetValue(key, out var uses)) memoryAccesses[key] = uses = [];
+                uses.Add(statement);
+            }
+        }
+        if (!memoryAccesses.TryGetValue(SymTable.Resolve(address), out var accesses)) return false;
+        viewDominators ??= Dominators.Compute(values.Function);
+        return values.Function.Blocks.SelectMany(b => b.Statements).OfType<Call>().Any(call =>
+            call.Op?.Kind == OpKind.BoundsCheck && values.Operands(call).Skip(1).Take(2).ToArray() is [var candidate, var length]
+            && ReferenceEquals(SymTable.Resolve(candidate), SymTable.Resolve(index))
+            && DimensionRead(length) is { } read && Locate(read.Address, read.Width) is { Kind: LocationKind.Dimension } bound
+            && ReferenceEquals(SymTable.Resolve(bound.Base!), SymTable.Resolve(array)) && bound.ConstantIndex == dimension
+            && accesses.All(site => After(call, site)));
+
+        bool After(Call check, Stmt site)
+        {
+            var before = values.BlockOf(check);
+            var after = values.BlockOf(site);
+            if (before == after) return before.Statements.IndexOf(check) < before.Statements.IndexOf(site);
+            return before.Handler is null && viewDominators.Dominates(before.Index, after.Index);
+        }
     }
 
     /// <summary>linear = i + n·rest，n 是数组第 dimension 维长度的读取：给出 (i, rest)；没有其他加数时 i 为 0。</summary>
@@ -1055,13 +1295,37 @@ public sealed partial class TypeOracle : Runtime.IRuntimeTyping
             if (value is not OpSym { Op.Kind: OperatorKind.Binary, Args: [var self, ConstSym { Value: 1 }] } next || next.Op.Binary != BinOp.Add
                 || !ReferenceEquals(SymTable.Resolve(self), phi)) return false;
             var latch = phi.Block.Predecessors[edge];
-            if (latch.Statements.LastOrDefault() is not Branch branch || branch.Target != phi.Block.Start || branch.Fallthrough == phi.Block.Start
-                || SymTable.Resolve(values.Operands(branch)[0]) is not OpSym { Op.Kind: OperatorKind.Compare, Args: [var left, var right] } test
-                || test.Op.Cond != Cond.Slt || !ReferenceEquals(SymTable.Resolve(left), value)
-                || SymTable.Resolve(right) is not OpSym { Op: { Kind: OperatorKind.Convert, Conversion: ConvKind.SignExtend }, Args: [{ Width: 32 }] }) return false;
+            if (latch.Statements.LastOrDefault() is Branch branch && branch.Target == phi.Block.Start && branch.Fallthrough != phi.Block.Start
+                && SymTable.Resolve(values.Operands(branch)[0]) is OpSym { Op.Kind: OperatorKind.Compare, Args: [var left, var right] } test
+                && test.Op.Cond == Cond.Slt && ReferenceEquals(SymTable.Resolve(left), value)
+                && SymTable.Resolve(right) is OpSym { Op: { Kind: OperatorKind.Convert, Conversion: ConvKind.SignExtend }, Args: [{ Width: 32 }] })
+            {
+                stepped = true;
+                continue;
+            }
+            if (!CounterCheckedAtHeader(phi, latch)) return false;
             stepped = true;
         }
         return stepped;
+    }
+
+    private bool CounterCheckedAtHeader(PhiSym phi, Block latch)
+    {
+        // 宽计数器也可在头部比较后进入循环。回边允许到达上界，但不能超过该 int32 上界。
+        return phi.Block.Statements.LastOrDefault() is Branch branch
+            && values.Operands(branch) is [OpSym { Op.Kind: OperatorKind.Compare, Args: [var left, var right] } test]
+            && test.Op.Cond is Cond.Slt or Cond.Sge
+            && (ReferenceEquals(SymTable.Resolve(left), phi)
+                && SymTable.Resolve(right) is OpSym { Op: { Kind: OperatorKind.Convert, Conversion: ConvKind.SignExtend }, Args: [{ Width: 32 }] }
+                || left.Width == 32 && ReferenceEquals(SymTable.Resolve(left), values.Syms.Slice(phi, 0, 32)) && right.Width == 32)
+            && phi.Block.Successors.FirstOrDefault(b => b.Start == (test.Op.Cond == Cond.Slt ? branch.Target : branch.Fallthrough))
+                is { } enter && enter.Predecessors.Count == 1 && Dominates(enter, latch);
+
+        bool Dominates(Block before, Block after)
+        {
+            viewDominators ??= Dominators.Compute(values.Function);
+            return viewDominators.Dominates(before.Index, after.Index);
+        }
     }
 
     private (Sym Index, int Scale) Rescaled(Sym index, int scale, int size) =>
@@ -1088,7 +1352,7 @@ public sealed partial class TypeOracle : Runtime.IRuntimeTyping
     /// <summary>较窄的机器读取完全位于一个整数字段内；按小端位偏移读取后截断。</summary>
     public AccessPart? NarrowRead(ReadSym read) => read.Width is 8 or 16 or 32
         && Split(read.Address, read.Width) is [{ Bit: 0 } part] && part.Width == read.Width
-        && types.Kind(part.Leaf.Type) == TypeKind.Int && read.Width < StorageBits(part.Leaf.Type) ? part : null;
+        && types.Kind(part.Leaf.Type) is TypeKind.Int or TypeKind.Pointer && read.Width < StorageBits(part.Leaf.Type) ? part : null;
 
     /// <summary>不能整体定位的读取（相邻字段合并的读取）按布局拆成的整字段段；含部分段时不拆。</summary>
     public IReadOnlyList<AccessPart>? Parts(ReadSym read)
@@ -1165,6 +1429,8 @@ public sealed partial class TypeOracle : Runtime.IRuntimeTyping
     public bool Padding(Sym address)
     {
         var (root, offset, index, scale) = Decompose(address);
+        if (root is PhiSym cursor && index is null && BufferCursor(cursor) is { Base: { } buffer } walked)
+            (root, offset, index, scale) = (buffer, offset + walked.Offset, walked.Index, walked.Size);
         (TypeRef Owner, long Offset, bool Statics, bool Thread)? container = null;
         if (root is LocalSym local && index is null && memory.Find(local.Space, local.Offset + offset, 1) is { Promoted: false } cell
             && CellType(cell) is { } cellType && types.Kind(cellType) == TypeKind.Struct)
@@ -1173,6 +1439,11 @@ public sealed partial class TypeOracle : Runtime.IRuntimeTyping
             container = (owner, offset, true, entity.Kind == SymbolKind.ThreadStaticFields);
         else switch (TypeOf(root))
         {
+            case PointerRef { Element: var pointed } when ManagedTypes.IsVoid(pointed) && BufferElementOf(root) is { } element
+                && types.Kind(element) == TypeKind.Struct && ElementSize(element) is > 0 and var stride
+                && BufferIndex(offset, index, scale, stride) is { FieldOffset: var fieldOffset }:
+                container = (element, fieldOffset + RuntimeLayout.ObjectHeaderSize, false, false);
+                break;
             case ArrayRef array when types.Kind(array.Element) == TypeKind.Struct && ElementSize(array.Element) is var size and > 0 && offset >= RuntimeLayout.ArrayData
                 && (index is null || scale % size == 0):
                 container = (array.Element, (offset - RuntimeLayout.ArrayData) % size + RuntimeLayout.ObjectHeaderSize, false, false);
@@ -1206,6 +1477,10 @@ public sealed partial class TypeOracle : Runtime.IRuntimeTyping
     }
 
     private int ElementSize(TypeRef element) => ManagedTypes.IsReferenceType(element) ? 8 : types.Size(element);
+
+    // 布局见证只用于确认原生步长，托管元素仍用开放类型参数表示。
+    private int BufferElementSize(TypeRef element) => ElementSize(element is GenericParameterRef parameter
+        ? parameter.NativeScalar ?? parameter.NativeAggregate ?? element : element);
 
     /// <summary>
     /// 类型中 offset 处宽 width 位的字段链。offset 含对象头（值类型同样按装箱布局）；实例字段沿基类链查找。

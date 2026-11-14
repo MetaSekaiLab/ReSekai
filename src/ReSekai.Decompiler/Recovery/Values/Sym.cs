@@ -65,6 +65,15 @@ public sealed class EntitySym(Symbol symbol) : Sym(64)
     public override string ToString() => Symbol.ToString();
 }
 
+/// <summary>IL2CPP 值类型的 stack_slot_size，即不含对象头的托管值大小。</summary>
+public sealed class SizeOfSym(TypeRef type) : Sym(32)
+{
+    public TypeRef Type { get; } = type;
+    public override bool Equals(object? obj) => obj is SizeOfSym other && Type.Equals(other.Type);
+    public override int GetHashCode() => Type.GetHashCode();
+    public override string ToString() => $"sizeof({Type})";
+}
+
 /// <summary>方法私有内存中的地址：栈帧、结果缓冲区或实参副本内的字节偏移。</summary>
 public sealed class LocalSym(LocalSpace space, long offset) : Sym(64)
 {

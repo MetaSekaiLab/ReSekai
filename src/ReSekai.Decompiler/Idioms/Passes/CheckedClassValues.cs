@@ -53,10 +53,13 @@ internal static class CheckedClassValues
                 continue;
             }
             if (success.Predecessors.Count != 1) continue;
-            for (var index = 0; index < success.Statements.Count; index++)
-                if (success.Statements[index] is Call { Op: { Kind: OpKind.Unbox, Operand: null } op, Arguments: [var obj, ..] } unbox && obj == value)
+            // 类型检查通过后可能还要检查数组边界；所有经过成功边、使用同一 SSA 对象的拆箱共享此类型证明。
+            foreach (var dominated in function.Blocks.Where(b => dominators.Dominates(success.Index, b.Index)))
+                for (var index = 0; index < dominated.Statements.Count; index++)
                 {
-                    success.Statements[index] = unbox with { Op = op with { Operand = type } };
+                    if (dominated.Statements[index] is not Call { Op: { Kind: OpKind.Unbox, Operand: null } op, Arguments: [var obj, ..] } unbox
+                        || obj != value) continue;
+                    dominated.Statements[index] = unbox with { Op = op with { Operand = type } };
                     changed = true;
                 }
         }

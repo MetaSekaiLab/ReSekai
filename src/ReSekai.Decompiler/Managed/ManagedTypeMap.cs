@@ -36,6 +36,8 @@ public static class ManagedTypeMap
             MethodHandleValue v => v with { Method = Method(v.Method) },
             StaticCallValue v => v with { Method = Method(v.Method) },
             NewArrayValue v => new NewArrayValue((ArrayRef)map(v.ArrayType), Value(v.Length)),
+            ZeroedStackBufferValue v => new ZeroedStackBufferValue(Value(v.Count), (PointerRef)map(v.PointerType), v.ElementSize),
+            StackBytesValue v => new StackBytesValue(map(v.Element), Value(v.Length)),
             NewObjectValue v => new NewObjectValue(Method(v.Constructor), v.Arguments.Select(Value).ToArray()) { Transparent = v.Transparent },
             DelegateValue v => new DelegateValue((DefinitionRef)map(v.DelegateType), Value(v.Target), Method(v.Method), v.Binding),
             BoxValue v => new BoxValue(Value(v.Operand), map(v.Boxed), map(v.ObjectType)),

@@ -1,3 +1,4 @@
+using System.Reflection;
 using ReSekai.Decompiler.Facts;
 using ReSekai.Decompiler.Ir;
 using ReSekai.Decompiler.Machine.Flow;
@@ -12,9 +13,12 @@ namespace ReSekai.Decompiler.Recovery.Lowering;
 /// <summary>位置与局部：读取、字段链、可寻址局部与局部的分配。</summary>
 internal sealed partial class BodyBuilder
 {
-    /// <summary>地址逃逸的单元对应的可寻址局部。</summary>
-    private LocalValue CellLocal(LocalSym root)
+    /// <summary>地址逃逸的单元对应可寻址局部，入口副本仍使用按值形参自己的存储。</summary>
+    private ManagedValue CellLocal(LocalSym root)
     {
+        if (root is { Offset: 0, Space: { Kind: LocalKind.Argument, Argument: var argument } }
+            && oracle.Parameter(argument) is { } type)
+            return new ArgumentValue(argument, type, Width(type));
         if (!locals.TryGetValue(root, out var local))
         {
             var cell = analysis.Memory.Find(root.Space, root.Offset, 1)!;
@@ -78,6 +82,9 @@ internal sealed partial class BodyBuilder
         if (CaughtFieldRead(read, address) is { } caught) return caught;
         if ((oracle.Locate(read.Address, read.Width) ?? oracle.ViewLocate(read.Address, read.Width, read.Site)) is not { } location)
         {
+            if (oracle.BooleanAddress(read.Address, read.Width) is var (condition, yes, no))
+                return new ChoiceValue(View(condition, types.Boolean, address), LocationValue(yes, address),
+                    LocationValue(no, address), yes.Type, Width(yes.Type));
             if (oracle.NarrowRead(read) is not { } part) return Hole(address, $"内存 读取位置 {read.Address}", null);
             var value = LocationValue(part.Leaf, address);
             if (part.FieldBit != 0)
@@ -112,6 +119,13 @@ internal sealed partial class BodyBuilder
             case LocationKind.Reference:
                 {
                     var pointer = View(location.Base!, location.Through ?? oracle.TypeOf(location.Base!), address);
+                    if (location.FixedBuffer)
+                    {
+                        var first = new AddressValue(Nest(pointer, path, location.Type, store: true, address));
+                        pointer = new ConversionValue(ConvKind.Bitcast, first, new PointerRef(location.Type), 64);
+                        return new IndirectValue(new PointerOffsetValue(pointer, View(location.ByteOffset!, types.Int64, address)),
+                            location.Type, Width(location.Type));
+                    }
                     if (location.ByteOffset is { } offset)
                         pointer = new PointerOffsetValue(pointer, View(offset, types.Int64, address));
                     if (location is { Strided: true, Index: { } stride })
@@ -123,7 +137,10 @@ internal sealed partial class BodyBuilder
                         ManagedValue item = new IndirectValue(pointer, element, Width(element));
                         return Nest(store ? new AddressValue(item) : item, path, location.Type, store, address);
                     }
-                    return path.Count == 0 ? new IndirectValue(pointer, location.Type, Width(location.Type)) : Nest(pointer, path, location.Type, store, address);
+                    if (path.Count != 0) return Nest(pointer, path, location.Type, store, address);
+                    if (pointer.Type is PointerRef { Element: var pointee } && !pointee.Equals(location.Type) && !ManagedTypes.IsVoid(location.Type))
+                        pointer = new ConversionValue(ConvKind.Bitcast, pointer, new PointerRef(location.Type), 64);
+                    return new IndirectValue(pointer, location.Type, Width(location.Type));
                 }
             case LocationKind.Element:
                 {
@@ -141,6 +158,8 @@ internal sealed partial class BodyBuilder
                     ManagedValue value = new MultiArrayElementValue(array, indices, element, Width(element));
                     return path.Count == 0 ? value : Nest(store ? new AddressValue(value) : value, path, location.Type, store, address);
                 }
+            case LocationKind.SpanElement:
+                return SpanElement(location, address, store);
             case LocationKind.Dimension or LocationKind.LowerBound:
                 return new ArrayBoundValue(View(location.Base!, location.Through ?? oracle.TypeOf(location.Base!), address), (int)location.ConstantIndex,
                     location.Kind == LocationKind.LowerBound, types.Int32);
@@ -151,10 +170,45 @@ internal sealed partial class BodyBuilder
             case LocationKind.Local:
                 {
                     var local = CellLocal((LocalSym)location.Base!);
-                    return path.Count == 0 ? local : Nest(store ? new AddressValue(local) : local, path, location.Type, store, address);
+                    return path.Count == 0 ? store && local is ArgumentValue ? new IndirectValue(new AddressValue(local), location.Type, Width(location.Type)) : local
+                        : Nest(store ? new AddressValue(local) : local, path, location.Type, store, address);
                 }
         }
         return Hole(address, $"内存 位置 {location.Kind} 尚未接入", location.Type);
+    }
+
+    /// <summary>用托管引用重建 Span 的裸起点与元素偏移，保留机器代码已有的边界检查。</summary>
+    private ManagedValue SpanElement(Location location, ulong address, bool store)
+    {
+        var spanType = (DefinitionRef)location.Owner!;
+        var element = spanType.Arguments[0];
+        var referenceType = new ByRefRef(element);
+        var getReference = types.CorlibDefinition("System.Runtime.InteropServices.MemoryMarshal")?.Methods
+            .Where(m => m.Name == "GetReference" && m.IsStatic && (m.Attributes & MethodAttributes.MemberAccessMask) == MethodAttributes.Public
+                && m.GenericParameters.Count == 1 && m.Parameters.Count == 1)
+            .Select(m => new MethodRef(m, [], [element]))
+            .SingleOrDefault(m => m.Concrete(m.Method.Parameters[0].Type).Equals(spanType)
+                && m.Concrete(m.Method.ReturnType).Equals(referenceType));
+        var add = types.CorlibDefinition("System.Runtime.CompilerServices.Unsafe")?.Methods
+            .Where(m => m.Name == "Add" && m.IsStatic && (m.Attributes & MethodAttributes.MemberAccessMask) == MethodAttributes.Public
+                && m.GenericParameters.Count == 1 && m.Parameters.Count == 2)
+            .Select(m => new MethodRef(m, [], [element]))
+            .SingleOrDefault(m => m.Concrete(m.Method.Parameters[0].Type).Equals(referenceType)
+                && m.Concrete(m.Method.Parameters[1].Type).Equals(types.IntPtr) && m.Concrete(m.Method.ReturnType).Equals(referenceType));
+        if (getReference is null || add is null || currentOutput is null || sharedEdge)
+            return Hole(address, "内存 Span 起点或步进不可写出", location.Type);
+        var span = View(location.Base!, spanType, address);
+        var reference = NewLocal(referenceType);
+        currentOutput.Add(new ManagedCall(address, new ManagedInvocation(getReference, null, [span], false), reference));
+        if (location.Index is { } index && !SymTable.IsZero(index))
+        {
+            var offset = new ConversionValue(ConvKind.Bitcast, View(index, types.Int64, address), types.IntPtr, 64);
+            var indexed = NewLocal(referenceType);
+            currentOutput.Add(new ManagedCall(address, new ManagedInvocation(add, null, [reference, offset], false), indexed));
+            reference = indexed;
+        }
+        ManagedValue value = new IndirectValue(reference, element, Width(element));
+        return location.Path.Count == 0 ? value : Nest(store ? new AddressValue(value) : value, location.Path, location.Type, store, address);
     }
 
     /// <summary>

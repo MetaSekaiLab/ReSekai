@@ -41,10 +41,32 @@ public sealed class MethodEntries
     internal static NativeMethodEntry SelectDefinition(IEnumerable<NativeMethodEntry> candidates) => candidates
         .OrderBy(e => e.Instance.TypeArguments.Concat(e.Instance.MethodArguments)
             .Any(a => !ManagedTypes.IsReferenceType(a) || FieldLayouts.IsFullyShared(a)))
+        .ThenBy(e => CopiesNativeArrayIntoView(e.Instance.Method) && !e.Instance.TypeArguments.Any(FieldLayouts.IsFullyShared)
+            || SortsGenericPointerElements(e.Instance.Method) && !e.Instance.MethodArguments.All(FieldLayouts.IsFullyShared))
         .ThenBy(e => e.Instance.Method.Owner.GenericParameters.Concat(e.Instance.Method.GenericParameters)
             .Any(p => (p.Attributes & System.Reflection.GenericParameterAttributes.NotNullableValueTypeConstraint) != 0)
             || e.Instance.TypeArguments.Concat(e.Instance.MethodArguments).Any(a => !FieldLayouts.IsFullyShared(a) && !ManagedTypes.IsReferenceType(a)))
         .ThenBy(e => e.Address).ThenBy(e => NativeBindings.Key(e.Instance), StringComparer.Ordinal).First();
+
+    /// <summary>从 NativeArray&lt;T&gt; 建立值类型视图时，完整共享实现保留 sizeof(T) 的来源。</summary>
+    private static bool CopiesNativeArrayIntoView(MethodDef method) => method is
+        {
+            Name: ".ctor", Owner: { IsValueType: true, GenericParameters.Count: 1 },
+            Parameters: [_, _, _]
+        } && method.Parameters[0].Type is DefinitionRef
+        {
+            Definition.FullName: "Unity.Collections.NativeArray",
+            Arguments: [GenericParameterRef { IsMethod: false, Position: 0 }]
+        } && method.Parameters.Skip(1).All(p => ManagedTypes.PrimitiveName(p.Type) == "Int32");
+
+    /// <summary>按泛型比较器操作无类型指针时，共享实现保留元素布局和比较器分派。</summary>
+    private static bool SortsGenericPointerElements(MethodDef method) => method is
+    {
+        IsStatic: true, Parameters: [{ Type: PointerRef { Element: var pointed } }, _, _, { Type: GenericParameterRef { IsMethod: true, Position: 1 } }],
+        GenericParameters: [_, var comparer]
+    } && ManagedTypes.IsVoid(pointed)
+        && comparer.Constraints.Any(c => c is DefinitionRef { Definition.FullName: "System.Collections.Generic.IComparer",
+            Arguments: [GenericParameterRef { IsMethod: true, Position: 0 }] });
 
     /// <summary>方法实例的原生入口；没有时为 0。</summary>
     public ulong Of(MethodRef method) => Lookup(method) is var address and not 0 ? address : Witnessed(method) is { } witnessed ? Lookup(witnessed) : 0;

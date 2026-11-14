@@ -35,26 +35,26 @@ internal static class MathImportNormalizer
                     changed = true;
                     continue;
                 }
-                // Bionic math.h：void sincosf(float, float* sin, float* cos)。原导入保留，不拆成近似表达式。
+                // Bionic math.h：sincosf/sincos 写入两块同精度的输出。
                 if (block.Statements[i] is Call
                     {
-                        Kind: CallKind.Direct, Op: { Kind: OpKind.Import, Operand: "sincosf" },
-                        Arguments: [FrameAddress { Offset: <= -4 } sine, FrameAddress { Offset: <= -4 } cosine, var angle],
+                        Kind: CallKind.Direct, Op: { Kind: OpKind.Import, Operand: string pairName },
+                        Arguments: [FrameAddress sine, FrameAddress cosine, var angle],
                         Results.Length: 0, Defines.Length: 0
-                    } pair && angle.Width >= 32
-                    && Math.Abs(sine.Offset - cosine.Offset) >= 4)
+                    } pair && pairName is "sincosf" or "sincos" && (pairName == "sincosf" ? 32 : 64) is var width && angle.Width >= width
+                    && sine.Offset <= -width / 8 && cosine.Offset <= -width / 8 && Math.Abs(sine.Offset - cosine.Offset) >= width / 8)
                 {
                     var sin = fresh(); var cos = fresh();
                     block.Statements[i] = pair with
                     {
-                        Op = new(OpKind.ImportOutPair, "sincosf"),
-                        Arguments = [Fold.Convert(ConvKind.Truncate, angle, 32)],
+                        Op = new(OpKind.ImportOutPair, pairName),
+                        Arguments = [Fold.Convert(ConvKind.Truncate, angle, width)],
                         Sources = [Storage.Vec(0)],
                         Results = [sin.Storage, cos.Storage],
                         Defines = [sin, cos]
                     };
-                    block.Statements.InsertRange(i + 1, [new Store(pair.Address, sine, new Use(sin, 32)),
-                        new Store(pair.Address, cosine, new Use(cos, 32))]);
+                    block.Statements.InsertRange(i + 1, [new Store(pair.Address, sine, new Use(sin, width)),
+                        new Store(pair.Address, cosine, new Use(cos, width))]);
                     i += 2;
                     changed = true;
                     continue;

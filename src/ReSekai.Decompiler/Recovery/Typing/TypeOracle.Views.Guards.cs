@@ -18,6 +18,29 @@ public sealed partial class TypeOracle
     private Dominators? viewDominators;
     private Dictionary<Sym, List<Call>>? typeViews;
 
+    /// <summary>Span.Slice 的两个无符号检查必须都支配组合后的引用。</summary>
+    public bool SpanSliceChecked(Block block, Sym source, DefinitionRef span, Sym start, Sym length)
+    {
+        viewDominators ??= Dominators.Compute(values.Function);
+        bool Same(Sym a, Sym b) => ReferenceEquals(SymTable.Resolve(a), SymTable.Resolve(b));
+        bool SpanLength(Sym operand) => SymTable.Resolve(operand) is SliceSym { Base: var whole, Low: var low, Width: 32 }
+            && Same(whole, source) && types.Project(span, low, 32) is { Path: [{ Field.Name: "_length" }] };
+        var guards = values.Function.Blocks.Where(test => test.Statements.LastOrDefault() is Branch
+            && test.NormalSuccessors.Count() == 2).Select(test => (test, branch: (Branch)test.Statements[^1]));
+        var startChecked = false;
+        var lengthChecked = false;
+        foreach (var (test, branch) in guards)
+        {
+            if (values.Operands(branch) is not [OpSym { Op.Kind: OperatorKind.Compare, Op.Cond: var cond, Args: [var left, var right] }]) continue;
+            var accepted = test.NormalSuccessors.SingleOrDefault(next => next.Predecessors.Count == 1 && viewDominators.Dominates(next.Index, block.Index));
+            if (accepted is null || (accepted.Start == branch.Target ? cond != Cond.Uge : cond != Cond.Ult)) continue;
+            startChecked |= SpanLength(left) && Same(right, start);
+            lengthChecked |= Same(right, length) && SymTable.Resolve(left) is OpSym { Op.Binary: BinOp.Sub, Args: [var total, var offset] }
+                && SpanLength(total) && Same(offset, start);
+        }
+        return startChecked && lengthChecked;
+    }
+
     /// <summary>经类型判断的视图定位访问；没有判断或按判断类型也定位不到时为 null。</summary>
     public Location? ViewLocate(Sym address, int width, Stmt site)
     {
@@ -33,6 +56,20 @@ public sealed partial class TypeOracle
         root = SymTable.Resolve(root);
         if (RepeatedCast(root, block, position) is { } cast)
             return Locate(values.Syms.Binary(BinOp.Add, cast, values.Syms.Const(unchecked((ulong)offset), 64), 64), width);
+        // 同一对象先被判断为基类、再判断为派生类时，后续读取可能仍经第一个 isinst 的结果。
+        if (root is ResultSym { Site: { Op.Kind: OpKind.IsInst } baseCast }
+            && values.Operands(baseCast) is [_, var original] && ClassOperand(baseCast) is { } baseType)
+        {
+            foreach (var (type, result) in Guards(SymTable.Resolve(original), block, position))
+            {
+                if (type.Equals(baseType) || !types.IsAssignable(type, baseType) || result is not ResultSym { Site: { } derivedCast }) continue;
+                // 必须由成功分支证明原对象兼容派生类型，避免把可能为 null 的基类转换替换掉。
+                var derivedBlock = values.BlockOf(derivedCast);
+                if (derivedBlock.Predecessors is not [var predecessor]
+                    || Checked(predecessor, derivedBlock, SymTable.Resolve(original)) is not { } checkedType || !checkedType.Equals(type)) continue;
+                if (Locate(values.Syms.Binary(BinOp.Add, result, values.Syms.Const(unchecked((ulong)offset), 64), 64), width) is { } located) return located;
+            }
+        }
         foreach (var (type, result) in Guards(root, block, position))
         {
             if (result is not null)

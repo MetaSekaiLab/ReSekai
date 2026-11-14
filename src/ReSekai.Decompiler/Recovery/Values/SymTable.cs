@@ -51,6 +51,7 @@ public sealed partial class SymTable
     public Sym Unknown(string reason, int width) => Intern(new UnknownSym(reason, width));
     public Sym Arg(int index, int width) => Intern(new ArgSym(index, width));
     public Sym Entity(Symbol symbol) => Intern(new EntitySym(symbol));
+    public Sym SizeOf(TypeRef type) => Intern(new SizeOfSym(type));
     public Sym Local(LocalSpace space, long offset) => Intern(new LocalSym(space, offset));
 
     public ResultSym Result(Call site, int index, int width)
@@ -148,6 +149,10 @@ public sealed partial class SymTable
             case OpSym { Op: { Kind: OperatorKind.Binary } op } carryless when low > 0 && op.Binary is BinOp.Add or BinOp.Sub
                 && (LowZeros(carryless.Args[1]) >= low || op.Binary == BinOp.Add && LowZeros(carryless.Args[0]) >= low):
                 return Binary(op.Binary, Slice(carryless.Args[0], low, width), Slice(carryless.Args[1], low, width), width);
+            // 常量乘数包含被截掉的 2 的幂时，高段是缩放后的整数积，仍按该片宽度回绕。
+            case OpSym { Op: { Kind: OperatorKind.Binary, Binary: BinOp.Mul }, Args: [var factor, ConstSym { Value: not 0 } multiplier] }
+                when low > 0 && low <= System.Numerics.BitOperations.TrailingZeroCount(multiplier.Value):
+                return Binary(BinOp.Mul, Slice(factor, 0, width), Const(multiplier.Value >> low, width), width);
             // 乘 2 的幂等于左移：低位为零，其上是乘数的低段；不在最低位开始的片按这个拼接取。
             case OpSym { Op: { Kind: OperatorKind.Binary } op, Args: [var factor, ConstSym { Value: not 0 } power] } product when low > 0 && op.Binary == BinOp.Mul
                 && System.Numerics.BitOperations.IsPow2(power.Value) && System.Numerics.BitOperations.TrailingZeroCount(power.Value) is var shift && shift < product.Width:
@@ -156,8 +161,9 @@ public sealed partial class SymTable
                 return Unary(op.Unary, Slice(unary.Args[0], low, width), width);
             case PhiSym phi when ProjectPhi(phi, low, width) is { } projected:
                 return projected;
-            // 选择逐位取一侧：片取两侧的同一段。只用于两侧都是常量的选择（按位打包的结构体由几个这样的选择按位或成），切片后仍是常量。
-            case OpSym { Op.Kind: OperatorKind.Select, Args: [var condition, var whenTrue, var whenFalse] } when Resolve(whenTrue) is ConstSym && Resolve(whenFalse) is ConstSym:
+            // 选择逐位取一侧：单个位可从两侧直接取得；宽片只处理两侧都是常量的情况。
+            case OpSym { Op.Kind: OperatorKind.Select, Args: [var condition, var whenTrue, var whenFalse] }
+                when width == 1 || Resolve(whenTrue) is ConstSym && Resolve(whenFalse) is ConstSym:
                 return Select(condition, Slice(whenTrue, low, width), Slice(whenFalse, low, width), width);
         }
         return Intern(new SliceSym(sym, low, width));
@@ -292,6 +298,16 @@ public sealed partial class SymTable
             return Const(folded.Value, width);
         if (left is ConstSym && op is BinOp.Add or BinOp.Mul or BinOp.And or BinOp.Or or BinOp.Xor)
             (left, right) = (right, left);
+        // 零乘数的结果在任意位宽下都为零，包括从较宽乘积截出的低位。
+        if (op == BinOp.Mul && right is ConstSym { Value: 0 }) return Zero(width);
+        if (op == BinOp.FAdd && width == 64)
+        {
+            // double(2^52 + x) - 2^52：低 32 位的无符号整数完整落在尾数里，两个运算均精确。
+            if (left is ConstSym) (left, right) = (right, left);
+            if (left is ConcatSym { Parts: [{ Width: 32 } integer, ConstSym { Width: 32, Value: 0x43300000 }] }
+                && right is ConstSym { Width: 64, Value: 0xc330000000000000 })
+                return Convert(ConvKind.UIntToFloat, integer, 64);
+        }
         var shift = ConstantAmount(right);
         switch (op)
         {
@@ -367,6 +383,7 @@ public sealed partial class SymTable
                 BinOp.And when IsZero(a) || IsZero(b) => Zero(size),
                 BinOp.And when b is ConstSym cb && cb.Value == ones => a,
                 BinOp.And when a is ConstSym ca && ca.Value == ones => b,
+                BinOp.And when size == 1 && size != width => Binary(BinOp.And, a, b, size),
                 BinOp.Or or BinOp.Xor when IsZero(b) => a,
                 BinOp.Or or BinOp.Xor when IsZero(a) => b,
                 _ => null,

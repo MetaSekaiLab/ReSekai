@@ -21,6 +21,7 @@ public sealed record MethodHandleValue(MethodRef Method, TypeRef Type, int Width
 /// <summary>表达式里的无参静态调用（async 的 sm.&lt;&gt;t__builder = Builder.Create()），Roslyn 不经过局部，反编译器按这个形态识别。Inlined 含义同 <see cref="ManagedCall.Inlined"/>。</summary>
 public sealed record StaticCallValue(MethodRef Method, TypeRef Type, int Width, bool Inlined) : ManagedValue(Type, Width);
 public sealed record NewArrayValue(ArrayRef ArrayType, ManagedValue Length) : ManagedValue(ArrayType, 64);
+public sealed record StackBytesValue(TypeRef Element, ManagedValue Length) : ManagedValue(new PointerRef(Element), 64);
 public sealed record NewObjectValue(MethodRef Constructor, IReadOnlyList<ManagedValue> Arguments) : ManagedValue(Constructor.DeclaringType, 64)
 {
     /// <summary>原生代码内联了这个构造函数：执行对照按构造函数的方法体透明执行。</summary>
@@ -62,6 +63,8 @@ public sealed record PendingAccess(ulong Address, string Reason, bool Write);
 public sealed record AddressValue(ManagedValue Target) : ManagedValue(new ByRefRef(Target.Type), 64);
 /// <summary>固定数组并取得首元素地址；null 或空数组返回空指针。</summary>
 public sealed record PinnedArrayValue(ManagedValue Array, ArrayRef ArrayType) : ManagedValue(new PointerRef(ArrayType.Element), 64);
+/// <summary>在当前方法栈中分配并清零固定元素类型的缓冲区。</summary>
+public sealed record ZeroedStackBufferValue(ManagedValue Count, PointerRef PointerType, int ElementSize) : ManagedValue(PointerType, 64);
 /// <summary>非托管指针按字节偏移，不增加数组边界检查。</summary>
 public sealed record PointerOffsetValue(ManagedValue Pointer, ManagedValue Offset) : ManagedValue(Pointer.Type, 64);
 /// <summary>叶子均已证明的结构体值；L4 用 initobj 和逐叶子写入构造。</summary>

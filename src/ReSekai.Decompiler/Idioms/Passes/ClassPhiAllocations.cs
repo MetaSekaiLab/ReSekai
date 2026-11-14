@@ -23,23 +23,25 @@ internal static class ClassPhiAllocations
         var changed = false;
         foreach (var block in function.Blocks.ToArray())
         {
-            var prefix = block.Statements.Where(s => s is not (Phi or Nop or Define)).Take(2).ToArray();
-            if (block.IsLandingPad || prefix is not [Call
+            if (block.IsLandingPad || block.Statements.OfType<Call>().FirstOrDefault(c => c.Op is { Kind: OpKind.NewObject, Operand: null }) is not Call
                 {
                     Kind: CallKind.Direct, Op: { Kind: OpKind.NewObject, Operand: null },
-                    Arguments: [Use { Width: 64 } pointer], Defines: [var created]
-                } allocation,
-                Call
+                    Arguments: [{ Width: 64 } pointer], Defines: [var created]
+                } allocation) continue;
+            var following = block.Statements.Skip(block.Statements.IndexOf(allocation) + 1).FirstOrDefault(s => s is not Nop);
+            if (following is not Call
                 {
                     Kind: CallKind.Direct, Op: null, Target: Const target, Defines.Length: 0,
                     Arguments: [Use receiver, Const { Value: 0 }]
-                } ctor]
+                } ctor
                 || receiver.Variable != created || !constructor(target.Value)) continue;
-            if (ClassValue(pointer.Variable) is (var selector, Select choice)
+            if (pointer is Use selectorUse && ClassValue(selectorUse.Variable) is (var selector, Select choice)
                 && SplitChoice(function, block, allocation, ctor, receiver, created, selector, choice, fresh))
                 return true;
+            if (pointer is Select inlined && Classes(inlined)
+                && SplitChoice(function, block, allocation, ctor, receiver, created, null, inlined, fresh)) return true;
             if (block.Statements.First(s => s is not (Phi or Nop)) != allocation
-                || block.Statements.OfType<Phi>().FirstOrDefault(p => p.Target == pointer.Variable) is not { } phi
+                || pointer is not Use use || block.Statements.OfType<Phi>().FirstOrDefault(p => p.Target == use.Variable) is not { } phi
                 || phi.Sources.Length != block.Predecessors.Count || block.Predecessors.Count < 2
                 || block.Predecessors.Any(p => p == block || p.Handler != block.Handler
                     || p.NormalSuccessors.Count() != 1 || !p.NormalSuccessors.Contains(block))) continue;
@@ -69,7 +71,7 @@ internal static class ClassPhiAllocations
     }
 
     private static bool SplitChoice(MachineFunction function, Block block, Call allocation, Call ctor, Use receiver,
-        Variable created, Variable selector, Select choice, Func<Variable> fresh)
+        Variable created, Variable? selector, Select choice, Func<Variable> fresh)
     {
         var allocationIndex = block.Statements.IndexOf(allocation);
         var constructorIndex = block.Statements.IndexOf(ctor);
@@ -77,8 +79,8 @@ internal static class ClassPhiAllocations
             || block.Handler is not null || function.Range.ExceptionRegions.Any(r => r.LandingPad != 0
             && (r.Start <= allocation.Address && allocation.Address < r.End || r.Start <= ctor.Address && ctor.Address < r.End)))
             return false;
-        var selectorIndex = block.Statements.FindIndex(s => s is Define d && d.Target == selector);
-        if (selectorIndex < 0 || selectorIndex >= allocationIndex
+        var selectorIndex = selector is null ? allocationIndex : block.Statements.FindIndex(s => s is Define d && d.Target == selector);
+        if (selectorIndex < 0 || selector is not null && selectorIndex >= allocationIndex
             || ContainsLoad(choice.True) || ContainsLoad(choice.False))
             return false;
 
@@ -105,10 +107,15 @@ internal static class ClassPhiAllocations
             merge.Successors.Add(successor);
         }
         // 选择的条件在选择器的原位置求值；保留选择器定义供区域之外的使用。
-        var stable = fresh();
-        block.Statements.Insert(selectorIndex, new Define(block.Statements[selectorIndex].Address, stable, choice.Condition));
-        block.Statements[selectorIndex + 1] = ((Define)block.Statements[selectorIndex + 1]) with { Value = choice with { Condition = new Use(stable, 1) } };
-        block.Statements = [.. block.Statements.Take(allocationIndex + 1)];
+        if (selector is not null)
+        {
+            var stable = fresh();
+            block.Statements.Insert(selectorIndex, new Define(block.Statements[selectorIndex].Address, stable, choice.Condition));
+            choice = choice with { Condition = new Use(stable, 1) };
+            block.Statements[selectorIndex + 1] = ((Define)block.Statements[selectorIndex + 1]) with { Value = choice };
+            allocationIndex++;
+        }
+        block.Statements = [.. block.Statements.Take(allocationIndex)];
         block.Successors.Clear();
 
         var results = new List<Variable>();
@@ -136,7 +143,7 @@ internal static class ClassPhiAllocations
             Link(arm, merge);
             results.Add(instance);
         }
-        Build(block, choice with { Condition = new Use(stable, 1) });
+        Build(block, choice);
         merge.Statements.Insert(0, new Phi(allocation.Address, created, results.ToArray()));
         function.Renumber();
         return true;

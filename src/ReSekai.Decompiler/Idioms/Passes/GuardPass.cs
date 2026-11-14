@@ -86,7 +86,9 @@ internal static class GuardPass
         else if (load.Width != width)
             return false;
         // 区域内除 helper 调用外只允许纯定义：常量、符号、对守卫字段的重新读取（初始化之后的值）
-        if (!statements.All(s => s is Nop or Jump || ReferenceEquals(s, helperCall) || s is Define { Value: Const or Symbol } || s is Define d && ClassInitializationFlags.IsReload(state.defs.Expand(d.Value), load)))
+        if (!statements.All(s => s is Nop or Jump || ReferenceEquals(s, helperCall) || s is Define { Value: Const or Symbol }
+            || s is Define d && (ClassInitializationFlags.IsReload(state.defs.Expand(d.Value), load)
+                || kind == OpKind.RunClassConstructor && !ExprMap.Walk(state.defs.Expand(d.Value)).Any(e => e is Load or Intrinsic or Unknown))))
             return false;
         var result = returnsArgument && helperCall.Defines.Length > 0 ? helperCall.Defines[0] : null;
         if (result is not null && statements.Any(s => ExprMap.Operands(s).SelectMany(ExprMap.Walk).OfType<Use>().Any(u => u.Variable == result)))

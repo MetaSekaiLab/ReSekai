@@ -20,6 +20,9 @@ internal sealed partial class BodyBuilder
         // 取址须能写入该位置，不接受只读的访问器证明。
         if (oracle.AddressArm(sym, expected) is { } addressed) return new AddressValue(LocationValue(addressed, address, store: true));
         if (oracle.PinnedArrayHead(sym, expected) is var (array, arrayType)) return new PinnedArrayValue(View(array, arrayType, address), arrayType);
+        if (expected is DefinitionRef selectionType && types.Kind(selectionType) == TypeKind.Struct
+            && oracle.NarrowStructChoice(sym, selectionType) is { } selection)
+            return Operation(selection, expected, address);
         if (expected is DefinitionRef structure && types.Kind(expected) == TypeKind.Struct && sym is not ConcatSym && oracle.BitRepresentation(sym))
             return StructBits(sym, structure, address);
         if (sym is not LocalSym && locals.TryGetValue(sym, out var known)) return Coerce(known, expected, address);
@@ -32,6 +35,8 @@ internal sealed partial class BodyBuilder
                 }
             case ConstSym constant:
                 return Constant(constant, expected);
+            case SizeOfSym size:
+                return Coerce(new SizeOfValue(size.Type, types.Int32), expected, address);
             case EntitySym { Symbol: { Kind: SymbolKind.String, Value: string text } }:
                 return new StringValue(text, types.String);
             // MethodInfo 指针在 IL 中只有作为方法句柄实参时才是值（表达式树的 ldtoken）。
@@ -61,7 +66,8 @@ internal sealed partial class BodyBuilder
                     if (oracle.ProjectedScalar(phi) is var (scalar, scalarType, low))
                         return Coerce(IntegerSlice(View(scalar, scalarType, address), low, phi.Width,
                             oracle.Unconstrained(phi.Width) ?? types.Integer(phi.Width <= 32 ? 32 : 64, false), address), expected, address);
-                    var type = oracle.TypeOf(phi) ?? expected ?? oracle.Unconstrained(phi.Width);
+                    var type = expected is DefinitionRef desired && oracle.StructLoopSnapshot(phi, desired)
+                        ? desired : oracle.TypeOf(phi) ?? expected ?? oracle.Unconstrained(phi.Width);
                     if (type is null) return Hole(address, "类型 φ 没有类型", expected);
                     phis.Add(phi);
                     return Coerce(Local(phi, type), expected, address);
@@ -74,6 +80,8 @@ internal sealed partial class BodyBuilder
                 return Composite(concat, expected, address);
             case LocalSym local when analysis.Memory.Find(local.Space, local.Offset, 1) is { Promoted: false } cell
                 && cell.Start == local.Offset && oracle.CellType(cell) is not null:
+                if (oracle.Locate(local, -1) is { Kind: LocationKind.Argument } argument)
+                    return new AddressValue(LocationValue(argument, address));
                 return new AddressValue(CellLocal(local));
             case LocalSym local when analysis.Memory.Find(local.Space, local.Offset, 1) is { Promoted: false } && oracle.Locate(local, 8) is { } place:
                 return new AddressValue(LocationValue(place, address));
@@ -88,6 +96,9 @@ internal sealed partial class BodyBuilder
     private ManagedValue Coerce(ManagedValue value, TypeRef? expected, ulong address = 0)
     {
         if (expected is null || value.Type.Equals(expected) || value is HoleValue) return value;
+        if (ManagedTypes.IsNativePointer(expected) && Width(value.Type) == Width(expected)
+            && types.Kind(value.Type) is TypeKind.Int or TypeKind.Pointer)
+            return new ConversionValue(ConvKind.Bitcast, value, expected, Width(expected));
         // 表示链上的同一段位：进入单字段结构体的字段；最内层为整数时按整数宽度一致的期望取值；外层按字段组成。
         if (oracle.Inside(value.Type, expected) is var (contained, _))
             return Nest(value, contained, expected, false, address);
@@ -103,6 +114,8 @@ internal sealed partial class BodyBuilder
                 Coerce(Nest(value, f.Source, f.SourceType, false, address), f.TargetType, address))).ToList(), address);
         if (ManagedTypes.IsReferenceType(value.Type) && ManagedTypes.IsReferenceType(expected)) return value;
         var (from, to) = (types.Kind(value.Type), types.Kind(expected));
+        if (expected is PointerRef && from == TypeKind.Int && value.Width == 64)
+            return new ConversionValue(ConvKind.Bitcast, value, expected, 64);
         if (Width(value.Type) == Width(expected) && value.Width is 32 or 64
             && (from == TypeKind.Int && to is TypeKind.Float or TypeKind.Double
                 || to == TypeKind.Int && from is TypeKind.Float or TypeKind.Double))
@@ -156,6 +169,8 @@ internal sealed partial class BodyBuilder
         var typing = oracle.OperationTypes(op, expected);
         switch (op.Op.Kind)
         {
+            case OperatorKind.Compare when PackedArgumentComparison(op, address) is { } packed:
+                return packed;
             case OperatorKind.Compare when op.Op.Cond is Cond.Eq or Cond.Ne && oracle.ClassIdentity(op.Args[0], op.Args[1]) is var (owner, sealedType):
                 {
                     // 对象的类指针与密封类比较：等价于对象是否为该类型（读取类指针蕴含对象非空）。
@@ -198,10 +213,17 @@ internal sealed partial class BodyBuilder
                     }
                     var type = typing.Result;
                     if (type is null) return Hole(address, $"类型 运算 {op.Op}", expected);
-                    // 指针加减常量：偏移按字节，写成指针偏移。
-                    if (type is PointerRef && op.Op.Binary is BinOp.Add or BinOp.Sub && SymTable.Resolve(op.Args[1]) is ConstSym step)
-                        return new PointerOffsetValue(View(op.Args[0], type, address), new ConstantValue(op.Op.Binary == BinOp.Add ? step.Value : unchecked(0 - step.Value), types.Int64, 64));
-                    return new BinaryValue(op.Op.Binary, View(op.Args[0], type, address), View(op.Args[1], typing.Inputs[1], address), type, op.Width);
+                    // 只有使用处要求指针时，非恒定整数偏移也保留原指针类型，避免影响未约束值的全局类型求解。
+                    if (op.Width == 64 && op.Op.Binary is BinOp.Add or BinOp.Sub
+                        && oracle.TypeOf(op.Args[0]) is PointerRef pointer && (expected is PointerRef || type is PointerRef)
+                        && oracle.PointerDisplacement(op.Args[1]))
+                    {
+                        var offset = View(op.Args[1], types.Int64, address);
+                        if (op.Op.Binary == BinOp.Sub)
+                            offset = new UnaryValue(UnOp.Neg, offset, types.Int64, 64);
+                        return new PointerOffsetValue(View(op.Args[0], pointer, address), offset);
+                    }
+                    return new BinaryValue(op.Op.Binary, View(op.Args[0], type, address), View(oracle.ShiftCount(op), typing.Inputs[1], address), type, op.Width);
                 }
             case OperatorKind.Unary:
                 {
@@ -228,6 +250,34 @@ internal sealed partial class BodyBuilder
                 }
         }
         return Hole(address, $"运算 {op.Op} 尚未接入", expected);
+    }
+
+    /// <summary>无填充的整数结构体按位异或后与零比较，等价于比较两侧对应的字段。</summary>
+    private ManagedValue? PackedArgumentComparison(OpSym comparison, ulong address)
+    {
+        var condition = comparison.Op.Cond;
+        if (condition is not (Cond.Eq or Cond.Ne) || comparison.Args is not [var first, var second]) return null;
+        if (SymTable.IsZero(first)) (first, second) = (second, first);
+        if (!SymTable.IsZero(second)) return null;
+        var bits = SymTable.Resolve(first);
+        if (bits is ConcatSym concat && concat.Parts.Skip(1).All(SymTable.IsZero)) bits = SymTable.Resolve(concat.Parts[0]);
+        if (bits is not OpSym { Op.Kind: OperatorKind.Binary, Op.Binary: BinOp.Xor, Args: [ArgSym left, ArgSym right] }
+            || oracle.TypeOf(left) is not DefinitionRef structure || types.Kind(structure) != TypeKind.Struct
+            || !structure.Equals(oracle.TypeOf(right)) || types.StorageBits(structure) != bits.Width
+            || types.IntegerPieces(structure) is not { Count: > 1 } pieces
+            || pieces.Any(piece => types.Kind(piece.Type) != TypeKind.Int || piece.Path.Any(field => !fields.Accessible(field, field.DeclaringType)))) return null;
+        var a = View(left, structure, address);
+        var b = View(right, structure, address);
+        ManagedValue? result = null;
+        foreach (var field in pieces)
+        {
+            var operandType = field.Width < 32 ? types.Int32 : field.Type;
+            var compare = new ComparisonValue(condition,
+                Coerce(Nest(a, field.Path, field.Type, false, address), operandType, address),
+                Coerce(Nest(b, field.Path, field.Type, false, address), operandType, address), types.Boolean);
+            result = result is null ? compare : new BooleanValue(condition == Cond.Eq, result, compare, types.Boolean);
+        }
+        return result;
     }
 
     /// <summary>原子的一段：值类型的字段；整数的低位截断；bool 的低位即自身。</summary>
@@ -291,6 +341,7 @@ internal sealed partial class BodyBuilder
             return View(whole, expected, address);
         expected ??= oracle.Unconstrained(concat.Width);
         if (expected is null) return Hole(address, $"类型 拼接没有期望类型 {concat}", null);
+        if (oracle.RejoinedReference(concat, expected) is { } reference) return View(reference, expected, address);
         if (oracle.OpenWholeRead(concat, expected) is { } entire) return View(entire, expected, address);
         if (types.Kind(expected) == TypeKind.Struct && oracle.JoinedSelect(concat) is { } selected) return View(selected, expected, address);
         // 全零的位是任何类型的默认值：泛型参数的实例在这里有确定的大小，但写出时仍按泛型参数，即 default(T)。
@@ -304,6 +355,15 @@ internal sealed partial class BodyBuilder
         {
             case TypeKind.Struct when expected is DefinitionRef structure:
                 return StructBits(concat, structure, address);
+            case TypeKind.Float or TypeKind.Double when concat.Width == Width(expected)
+                && concat.Parts is [SliceSym { Low: 0 } magnitude, ConstSym { Width: 1, Value: 0 }]
+                && magnitude.Base.Width == concat.Width && oracle.TypeOf(magnitude.Base)?.Equals(expected) == true:
+                // 只清除符号位，保留浮点数其余位，包括 NaN 的载荷。
+                return new UnaryValue(UnOp.FAbs, View(magnitude.Base, expected, address), expected, concat.Width);
+            case TypeKind.Float or TypeKind.Double when concat.Width == Width(expected) && concat.Width is 32 or 64:
+                // SIMD 寄存器里按整数位段拼接的结果可直接按同宽浮点位解释。
+                var integer = types.Integer(concat.Width, false);
+                return new ConversionValue(ConvKind.Bitcast, Composite(concat, integer, address), expected, concat.Width);
             case TypeKind.Int or TypeKind.Bool or TypeKind.Pointer:
                 {
                     var parts = concat.Parts;
@@ -340,18 +400,66 @@ internal sealed partial class BodyBuilder
         if (plan.Whole is { } whole) return View(whole, structure, address);
         if (plan.Snapshot is { } snapshot) return SnapshotUpdate(structure, snapshot, plan.Fields, address);
         if (PartialNullable(structure, plan, address) is { } nullable) return nullable;
-        return BranchConstruction(bits, structure, plan, address)
+        return SpanSlice(structure, plan, address) ?? SpanFromArray(structure, plan, address) ?? BranchConstruction(bits, structure, plan, address)
             ?? StructPhi(structure, plan)
             ?? Composed(structure, plan.Fields.Select(f => (f.Projection.Path, View(f.Value, f.Projection.Type, address))).ToList(), address);
+    }
+
+    private ManagedValue? SpanSlice(DefinitionRef span, AggregatePlan plan, ulong address)
+    {
+        if (span is not { Definition.Assembly: "mscorlib.dll", Definition.FullName: "System.ReadOnlySpan", Arguments: [var element] }
+            || plan.Fields.Count != 2 || plan.Fields.SingleOrDefault(f => f.Projection.Bit == 0 && f.Projection.Width == 64) is not { } pointer
+            || plan.Fields.SingleOrDefault(f => f.Projection.Path is [{ Field.Name: "_length" }]) is not { } length
+            || oracle.Decompose(pointer.Value) is not (SliceSym { Low: 0, Width: 64, Base: var source }, 0, { } index, var scale)
+            || !span.Equals(oracle.TypeOf(source)) || scale != types.Size(element)
+            || SymTable.Resolve(index) is not OpSym { Op.Conversion: ConvKind.SignExtend, Args: [var start] }
+            || !types.Int32.Equals(oracle.TypeOf(start)) || !types.Int32.Equals(oracle.TypeOf(length.Value))
+            || currentBlock is null || currentOutput is null || sharedEdge) return null;
+        var slice = span.Definition.Methods.Where(m => m.Name == "Slice" && !m.IsStatic && m.Parameters.Count == 2
+                && (m.Attributes & System.Reflection.MethodAttributes.MemberAccessMask) == System.Reflection.MethodAttributes.Public
+                && m.Parameters.All(p => p.Type.Equals(types.Int32)))
+            .Select(m => new MethodRef(m, span.Arguments, [])).SingleOrDefault(m => m.Concrete(m.Method.ReturnType).Equals(span));
+        if (slice is null || !oracle.SpanSliceChecked(currentBlock, source, span, start, length.Value)) return null;
+        var receiver = View(source, span, address);
+        if (receiver is not (ArgumentValue or LocalValue)) return null;
+        var result = NewLocal(span);
+        currentOutput.Add(new ManagedCall(address, new ManagedInvocation(slice, new AddressValue(receiver),
+            [View(start, types.Int32, address), View(length.Value, types.Int32, address)], false), result));
+        return result;
+    }
+
+    /// <summary>数组数据区的起点和同一数组的完整长度等价于 Span 的数组构造函数，包括零长度数组。</summary>
+    private ManagedValue? SpanFromArray(DefinitionRef span, AggregatePlan plan, ulong address)
+    {
+        if (span is not { Definition.Assembly: "mscorlib.dll", Definition.FullName: "System.Span" or "System.ReadOnlySpan", Arguments: [var element] }
+            || plan.Fields.Count != 2 || plan.Fields.SingleOrDefault(f => f.Projection.Bit == 0 && f.Projection.Width == 64) is not { } pointer
+            || pointer.Projection.Path is not [{ Field.Name: "_pointer" }, ..]
+            || plan.Fields.SingleOrDefault(f => f.Projection.Path is [{ Field.Name: "_length" }]) is not { } length
+            || !length.Projection.Type.Equals(types.Int32)) return null;
+        return SpanFromArray(span, element, pointer.Value, length.Value, address);
+    }
+
+    private ManagedValue? SpanFromArray(DefinitionRef span, TypeRef element, Sym pointer, Sym length, ulong address)
+    {
+        if (oracle.Decompose(pointer) is not (var array, RuntimeLayout.ArrayData, null, _)
+            || oracle.TypeOf(array) is not ArrayRef { IsVector: true } arrayType || !arrayType.Element.Equals(element)
+            || SymTable.Resolve(length) is not ReadSym read
+            || oracle.Locate(read.Address, read.Width) is not { Kind: LocationKind.Length, Base: { } basis }
+            || !ReferenceEquals(SymTable.Resolve(basis), SymTable.Resolve(array))) return null;
+        var constructor = span.Definition.Methods.Where(m => m.Name == ".ctor" && m.Parameters.Count == 1
+                && (m.Attributes & System.Reflection.MethodAttributes.MemberAccessMask) == System.Reflection.MethodAttributes.Public)
+            .Select(m => new MethodRef(m, span.Arguments, [])).SingleOrDefault(m => m.Concrete(m.Method.Parameters[0].Type).Equals(arrayType));
+        return constructor is null ? null : new NewObjectValue(constructor, [View(array, arrayType, address)]);
     }
 
     /// <summary>快照改写（<see cref="TypeOracle.UpdatedRead"/>）：复制快照，再写改动的直接字段。</summary>
     private ManagedValue SnapshotUpdate(DefinitionRef structure, Sym snapshot, IReadOnlyList<ProjectedSym> changed, ulong address)
     {
         var writes = changed.Select(c => (Field: c.Projection.Path[0], Value: View(c.Value, c.Projection.Type, address))).ToArray();
-        if (!CanEmitBefore(writes.Select(w => w.Value))) return Hole(address, $"值 {structure} 由快照改写，改写语句不能写在值之前", structure);
+        var source = View(snapshot, structure, address);
+        if (!CanEmitBefore(writes.Select(w => w.Value).Prepend(source))) return Hole(address, $"值 {structure} 由快照改写，改写语句不能写在值之前", structure);
         var copy = NewLocal(structure);
-        currentOutput!.Add(new ManagedAssignment(address, copy, View(snapshot, structure, address)));
+        currentOutput!.Add(new ManagedAssignment(address, copy, source));
         foreach (var (field, value) in writes)
             currentOutput.Add(new ManagedStore(address, FieldAccess(new AddressValue(copy), field, value.Type, true, address), value));
         return copy;
@@ -389,6 +497,7 @@ internal sealed partial class BodyBuilder
         }
         // 来源还是一层 φ 时接着还原，不在这里展开成字段。
         return StructPhi(plan.Structure, new AggregatePlan(null, fields))
+            ?? SpanFromArray(plan.Structure, new AggregatePlan(null, fields), address)
             ?? Composed(plan.Structure, fields.Select(f => (f.Projection.Path, View(f.Value, f.Projection.Type, address))).ToList(), address);
     }
 
@@ -540,6 +649,7 @@ internal sealed partial class BodyBuilder
         UnaryValue unary => NoEffect(unary.Operand),
         ConversionValue conversion => NoEffect(conversion.Operand),
         ComparisonValue comparison => NoEffect(comparison.Left) && NoEffect(comparison.Right),
+        ChoiceValue choice => NoEffect(choice.Condition) && NoEffect(choice.True) && NoEffect(choice.False),
         _ => false,
     };
 
@@ -556,6 +666,9 @@ internal sealed partial class BodyBuilder
         var targetWidth = Width(target);
         switch (part)
         {
+            case OpSym { Op.Kind: OperatorKind.Select, Args: [var condition, var yes, var no] } selection when selection.Width <= targetWidth:
+                return IntegerBits(yes, target, address) is { } taken && IntegerBits(no, target, address) is { } skipped
+                    ? new ChoiceValue(View(condition, types.Boolean, address), taken, skipped, target, targetWidth) : null;
             case OpSym operation when oracle.ModularArithmetic(operation) is { } carrier:
                 {
                     if (IntegerBits(operation.Args[0], carrier, address) is not { } left) return null;
@@ -575,6 +688,10 @@ internal sealed partial class BodyBuilder
                 return Resize(known, target);
             case PhiSym phi when oracle.ProjectedScalar(phi) is var (scalar, scalarType, low):
                 return IntegerSlice(View(scalar, scalarType, address), low, phi.Width, target, address);
+            case PhiSym phi when phi.Projection is var (wide, low) && oracle.CarrierPhi(wide, low, phi.Width) is { } carrier:
+                return IntegerSlice(View(carrier, types.UInt32, address), 0, phi.Width, target, address);
+            case SliceSym { Base: PhiSym wide } slice when oracle.CarrierPhi(wide, slice.Low, slice.Width) is { } carrier:
+                return IntegerSlice(View(carrier, types.UInt32, address), 0, slice.Width, target, address);
             case SliceSym slice when oracle.UntypedWidePhiPiece(slice) is { } widePiece:
                 return IntegerBits(widePiece, target, address);
             case SliceSym slice when oracle.EnclosingScalar(slice) is var (scalar, scalarType, low):

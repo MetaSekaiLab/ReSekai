@@ -9,7 +9,7 @@ namespace ReSekai.Decompiler.Recovery.Runtime;
 public sealed record PointerEffect(int Argument, int Value, int Size, MemoryAccess Access);
 
 public enum RuntimeInputKind { Value, Location, Pointee }
-/// <summary>运行时操作实际使用的值与期望类型；Pointee 指名提升单元中的逻辑值编号，Width 不为 0 时只取逻辑值从 Low 位起的一段。</summary>
+/// <summary>运行时操作实际使用的值与期望类型；Pointee 指名提升单元中的逻辑值编号。Width 不为 0 时只取值从 Low 位起的一段。</summary>
 public sealed record RuntimeInput(Sym Value, TypeRef? Type, RuntimeInputKind Kind = RuntimeInputKind.Value, int Pointee = 0, int Low = 0, int Width = 0);
 
 /// <summary>运行时操作的类型查询。</summary>
@@ -271,12 +271,12 @@ public static class RuntimeOps
                 return true;
             },
         };
-        // 向量的第二个实参是长度；其他数组（GenArrayNew）是栈上各维长度（il2cpp_array_size_t）的数组，取每项的低 32 位作 int32 长度。
+        // 向量的第二个实参是 int32 长度；其他数组（GenArrayNew）传栈上各维长度，也只读取每项的低 32 位。
         yield return new(OpKind.NewArray)
         {
             Inputs = (call, a, t) => a.Count != 2 ? [] : t.ClassOperand(call) is ArrayRef { IsVector: false } multi
                 ? Enumerable.Range(0, multi.Rank).Select(d => new RuntimeInput(a[1], t.Types.Int32, RuntimeInputKind.Pointee, 1, d * 64, 32)).ToArray()
-                : [new(a[1], t.Types.Int32)],
+                : [new(a[1], t.Types.Int32, Width: Math.Min(32, a[1].Width))],
             PointerEffects = (call, abi) => ClassOperand(call) is ArrayRef { IsVector: false } multi && call.Arguments.Length == 2
                 ? [new PointerEffect(1, 1, 8 * multi.Rank, MemoryAccess.Read)] : [],
             Behavior = new(EffectKind.Allocate, ExceptionEffect.Any),
@@ -525,16 +525,18 @@ public static class RuntimeOps
         };
         yield return new(OpKind.ImportOutPair)
         {
-            ResultWidths = _ => [32, 32],
-            Inputs = (_, a, t) => a.Count == 1 ? [new(a[0], t.Types.Single)] : [],
-            ResultType = (call, t) => call.Op?.Operand is "sincosf" ? t.Types.Single : null,
+            ResultWidths = call => call.Op?.Operand is "sincosf" ? [32, 32] : [64, 64],
+            Inputs = (call, a, t) => a.Count == 1 && t.Types.SinCosImport(call.Op?.Operand as string) is { } pair
+                ? [new(a[0], pair.Method.Parameters[0].Type)] : [],
+            ResultType = (call, t) => t.Types.SinCosImport(call.Op?.Operand as string)?.Method.Parameters[0].Type,
             Lower = (IRuntimeLowering c, out ManagedStatement? terminal) =>
             {
                 terminal = null;
-                if (c.Op.Operand is not "sincosf" || c.Arguments.Count != 1 || c.Call.Results.Length != 2
-                    || c.Types.SinCosImport() is not { } method) return false;
-                var sine = c.Local(c.ResultAt(0), c.Types.Single);
-                var cosine = c.Local(c.ResultAt(1), c.Types.Single);
+                if (c.Arguments.Count != 1 || c.Call.Results.Length != 2
+                    || c.Types.SinCosImport(c.Op.Operand as string) is not { } method) return false;
+                var valueType = method.Method.Parameters[0].Type;
+                var sine = c.Local(c.ResultAt(0), valueType);
+                var cosine = c.Local(c.ResultAt(1), valueType);
                 c.Emit(new ManagedCall(c.Call.Address, new(method, null,
                     [c.Input(0), new AddressValue(sine), new AddressValue(cosine)], false), null));
                 return true;

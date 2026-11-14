@@ -24,7 +24,7 @@ public static class ManagedEffects
             IndirectValue => Read(MemoryKind.Reference),
             AddressValue address => Address(address.Target, evidence),
             NewObjectValue => EffectSummary.Unknown,
-            NewArrayValue or NewMultiArrayValue or BoxValue or DelegateValue => new(EffectKind.Allocate, ExceptionEffect.Any),
+            NewArrayValue or NewMultiArrayValue or StackBytesValue or ZeroedStackBufferValue or BoxValue or DelegateValue => new(EffectKind.Allocate, ExceptionEffect.Any),
             CheckedCastValue or UnboxAddressValue or UnboxValue => new(EffectKind.None, ExceptionEffect.Any),
             BinaryValue { Op: BinOp.SDiv or BinOp.UDiv or BinOp.SRem or BinOp.URem } => new(EffectKind.None, ExceptionEffect.Other),
             BinaryValue or UnaryValue or ConversionValue or ComparisonValue or BooleanValue or NegatedValue

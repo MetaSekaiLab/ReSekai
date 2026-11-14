@@ -65,19 +65,73 @@ public sealed partial class TypeOracle
     }
 
     /// <summary>标量合流的投影复用完整载体，避免为循环中的每一级截断建立新的合流。</summary>
-    public (PhiSym Whole, TypeRef Type, int Low)? ProjectedScalar(PhiSym phi) =>
-        phi.Width is > 1 and < 64 and not (8 or 16 or 32)
-        && phi.Projection is var (whole, low) && ScalarBits(whole, []) && IntegerRepresentation(whole) is var (source, integer)
-        && low + phi.Width <= types.Bits(integer) ? (whole, source, low) : null;
+    public (PhiSym Whole, TypeRef Type, int Low)? ProjectedScalar(PhiSym phi)
+    {
+        if (phi.Width is not (> 1 and < 64 and not (8 or 16 or 32)) || phi.Projection is not { } projection) return null;
+        var (whole, low) = projection;
+        // SIMD 寄存器用整宽合流；只在较窄的载体类型已由来源证明时取其低段。
+        if (whole.Width > 64 && low + phi.Width <= 32)
+        {
+            var lane = values.Syms.Projection(whole, 0, 32);
+            if (TypeOf(lane) is { } single && types.Kind(single) == TypeKind.Float) return (lane, single, low);
+        }
+        if (whole.Width > 64 && low + phi.Width <= 64)
+        {
+            var carrier = values.Syms.Projection(whole, 0, 64);
+            if (TypeOf(carrier) is { } scalar && types.Kind(scalar) is TypeKind.Int or TypeKind.Double
+                && ScalarBits(carrier, [])) return (carrier, scalar, low);
+        }
+        return ScalarBits(whole, []) && IntegerRepresentation(whole) is var (source, integer)
+            && low + phi.Width <= types.Bits(integer) ? (whole, source, low) : null;
+    }
+
+    /// <summary>宽合流夹带其它字段或填充时，若所需整数段在入口和回边上均可见，只投影完整整数段。</summary>
+    public PhiSym? CarrierPhi(PhiSym phi, int low, int width)
+    {
+        if (phi.Projection is not null || low != 0 || width is <= 0 or >= 32 || phi.Width <= 32) return null;
+        if (values.Syms.Slice(phi, 0, 32) is not PhiSym carrier) return null;
+        var seen = new HashSet<Sym>();
+        bool Integer(Sym value)
+        {
+            value = SymTable.Resolve(value);
+            if (!seen.Add(value)) return true;
+            return value.Width == 32 && (TypeOf(value) is { } type && types.Kind(type) == TypeKind.Int || value switch
+            {
+                ConstSym => true,
+                PhiSym p => p.Sources.Length > 0 && p.Sources.All(source => source is not null && Integer(source)),
+                OpSym { Op.Kind: OperatorKind.Binary } operation when operation.Op.Binary is BinOp.Add or BinOp.Sub or BinOp.Mul
+                    => operation.Args.All(Integer),
+                _ => false,
+            });
+        }
+        return Integer(carrier) ? carrier : null;
+    }
 
     /// <summary>
     /// 各入边都是相邻字段合并的宽读取、自身没有类型的合流只是搬运；它的片按各入边的片合流，类型由字段给出。
     /// 64 位的合并读取也可能含填充（ldp 成对读出带填充的结构体），不能拼成整数，同样按片合流。
+    /// 嵌套合流只有在每条路径上的目标位片都能确定为相同类型的字段时才按字段投影。
     /// </summary>
     public PhiSym? UntypedWidePhiPiece(SliceSym slice) =>
         slice.Base is PhiSym { Projection: null, Width: >= 64 } phi && TypeOf(phi) is null
-        && phi.Sources.All(s => s is not null && SymTable.Resolve(s) is ReadSym read && Parts(read) is not null)
+        && (phi.Sources.All(s => s is not null && SymTable.Resolve(s) is ReadSym read && Parts(read) is not null)
+            || WidePhiField(phi, slice.Low, slice.Width, new()) is not null)
             ? values.Syms.Projection(phi, slice.Low, slice.Width) : null;
+
+    private TypeRef? WidePhiField(Sym value, int low, int width, HashSet<PhiSym> active)
+    {
+        switch (SymTable.Resolve(value))
+        {
+            case ReadSym read when Parts(read) is not null:
+                return Part(read, low, width)?.Type;
+            case PhiSym { Projection: null } phi when active.Add(phi):
+                var fields = phi.Sources.Select(s => s is null ? null : WidePhiField(s, low, width, active)).Distinct().ToArray();
+                active.Remove(phi);
+                return fields is [var type] ? type : null;
+            default:
+                return null;
+        }
+    }
 
     private bool ScalarBits(Sym value, HashSet<Sym> seen)
     {

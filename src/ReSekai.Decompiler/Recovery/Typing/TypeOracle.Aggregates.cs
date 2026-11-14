@@ -14,6 +14,37 @@ public sealed record AggregatePlan(Sym? Whole, IReadOnlyList<ProjectedSym> Field
 
 public sealed partial class TypeOracle
 {
+    /// <summary>错位复制拆开的引用仍须在每条入边上取同一个完整的引用。</summary>
+    internal PhiSym? RejoinedReference(ConcatSym bits, TypeRef expected)
+    {
+        if (bits.Width != 64 || !ManagedTypes.IsReferenceType(expected)) return null;
+        var parts = new List<Sym>(bits.Parts.Length);
+        foreach (var part in bits.Parts)
+            switch (SymTable.Resolve(part))
+            {
+                case PhiSym phi: parts.Add(phi); break;
+                case SliceSym { Base: PhiSym whole, Low: var low, Width: var width }:
+                    parts.Add(values.Syms.Projection(whole, low, width));
+                    break;
+                default: return null;
+            }
+        var phis = parts.Cast<PhiSym>().ToArray();
+        var first = phis[0];
+        if (phis.Any(p => p.Block != first.Block) || first.Sources.Length == 0) return null;
+        var sources = new Sym[first.Sources.Length];
+        for (var edge = 0; edge < sources.Length; edge++)
+        {
+            if (phis.Any(p => p.Sources[edge] is null)) return null;
+            var whole = values.Syms.Concat(phis.Select(p => p.Sources[edge]!));
+            if (!SymTable.IsZero(whole) && (TypeOf(whole) is not { } type || !types.IsAssignable(type, expected))) return null;
+            sources[edge] = whole;
+        }
+        var joined = values.Syms.Phi(first.Block, (nameof(RejoinedReference), bits), bits.Width);
+        for (var edge = 0; edge < sources.Length; edge++) values.Syms.SetSource(joined, edge, sources[edge]);
+        Use(joined, expected);
+        return joined;
+    }
+
     /// <summary>没有自然结构体类型、按位解释的值；跨字段或非标准宽度的位片、相邻字段合并的读取没有自然类型，同样按位解释。</summary>
     public bool BitRepresentation(Sym value) => SymTable.Resolve(value) is ConcatSym or ConstSym
         || TypeOf(value) is null && (SymTable.Resolve(value) is SliceSym || SymTable.Resolve(value) is ReadSym merged && Parts(merged) is not null
@@ -31,19 +62,38 @@ public sealed partial class TypeOracle
         var (chosen, other) = (new List<Sym>(), new List<Sym>());
         foreach (var part in bits.Parts)
         {
-            if (SymTable.Resolve(part) is not OpSym { Op.Kind: OperatorKind.Select, Args: [var test, var yes, var no] }
+            if (SymTable.Resolve(part) is UndefSym)
+            {
+                chosen.Add(part);
+                other.Add(part);
+                continue;
+            }
+            var (root, low) = SymTable.Resolve(part) is SliceSym slice ? (SymTable.Resolve(slice.Base), slice.Low) : (SymTable.Resolve(part), 0);
+            if (root is not OpSym { Op.Kind: OperatorKind.Select, Args: [var test, var yes, var no] }
                 || condition is not null && !ReferenceEquals(SymTable.Resolve(test), condition)) return null;
             condition = SymTable.Resolve(test);
-            chosen.Add(yes);
-            other.Add(no);
+            chosen.Add(values.Syms.Slice(yes, low, part.Width));
+            other.Add(values.Syms.Slice(no, low, part.Width));
         }
         return condition is null ? null : values.Syms.Select(condition, values.Syms.Concat(chosen), values.Syms.Concat(other), bits.Width);
+    }
+
+    /// <summary>寄存器中的选择宽于整个结构体时，去掉两个来源中不属于结构体的高位。</summary>
+    internal OpSym? NarrowStructChoice(Sym bits, DefinitionRef structure)
+    {
+        if (bits is not SliceSym { Low: 0, Base: OpSym { Op.Kind: OperatorKind.Select, Args: [var test, var yes, var no] }, Width: var width }
+            || width != types.StorageBits(structure)) return null;
+        var taken = values.Syms.Slice(yes, 0, width);
+        var other = values.Syms.Slice(no, 0, width);
+        bool Whole(Sym arm) => structure.Equals(TypeOf(arm)) || SymTable.Segments(arm).All(SymTable.IsZero);
+        return Whole(taken) && Whole(other) ? values.Syms.Select(test, taken, other, width) as OpSym : null;
     }
 
     /// <summary>先证明整体读取，再按共享布局投影字段；只省略已知为零的位，不省略未知或未定义值。</summary>
     public AggregatePlan? Aggregate(Sym bits, DefinitionRef structure)
     {
         if (WholeRead(bits, structure) is { } whole) return new(whole, []);
+        if (WholeCarrier(bits, structure) is { } carrier && !ReferenceEquals(carrier, bits)) return new(carrier, []);
         if (UpdatedRead(bits, structure) is var (snapshot, changed)) return new(null, changed) { Snapshot = snapshot };
         if (FieldValues(bits, structure) is not { } projected) return null;
         var fields = new List<ProjectedSym>();
@@ -68,13 +118,13 @@ public sealed partial class TypeOracle
     }
 
     /// <summary>
-    /// clang 把结构体局部拆成叶子的 φ（SROA）后按叶子组成：字段都是同一块的 φ 或其片、其中有不可访问的字段时，下降还原成一个结构体 φ。
+    /// clang 把结构体局部拆成叶子的 φ（SROA）后按叶子组成：有不可访问的字段或不可定型的宽 φ 时，还原同块的结构体 φ。
     /// 给出各字段对应的 φ 与片的低位；不成立时为 null。类型使用分析与下降共用这一判定。
     /// </summary>
     public IReadOnlyList<(ValueProjection Projection, PhiSym Phi, int Low)>? StructPhiLeaves(AggregatePlan plan)
     {
-        if (plan.Fields.Count == 0 || !plan.Fields.Any(f => f.Projection.Path.Any(p => !ManagedAccess.Field(types, method, p, p.DeclaringType)))) return null;
-        var leaves = new List<(ValueProjection, PhiSym, int)>();
+        if (plan.Fields.Count == 0) return null;
+        var leaves = new List<(ValueProjection Projection, PhiSym Phi, int Low)>();
         foreach (var field in plan.Fields)
             switch (SymTable.Resolve(field.Value))
             {
@@ -82,7 +132,9 @@ public sealed partial class TypeOracle
                 case SliceSym { Base: var root, Low: var low } when SymTable.Resolve(root) is PhiSym phi: leaves.Add((field.Projection, phi, low)); break;
                 default: return null;
             }
-        return leaves.All(l => l.Item2.Block == leaves[0].Item2.Block) ? leaves : null;
+        return leaves.All(l => l.Phi.Block == leaves[0].Phi.Block)
+            && (leaves.Any(l => l.Projection.Path.Any(p => !ManagedAccess.Field(types, method, p, p.DeclaringType)))
+                || leaves.Any(l => l.Phi.Width > 64 && TypeOf(l.Phi) is null)) ? leaves : null;
     }
 
     /// <summary>结构体 φ 在第 index 条入边上的整个值：各叶子 φ 在这条边上的来源按布局拼接，叶子之间的空位未定义。</summary>
@@ -138,7 +190,47 @@ public sealed partial class TypeOracle
                 if (ProjectedField(nested) is { } field && field.Type.Equals(structure)) return nested;
             }
         }
-        return StructPhiEdge(leaves, structure, index) is { } edge ? WholeRead(edge, structure) : null;
+        if (StructPhiEdge(leaves, structure, index) is not { } edge) return null;
+        if (WholeRead(edge, structure) is { } read) return read;
+        // 每条边分别保留整值和条件，避免把同一次条件选择的各个机器字当成独立字段。
+        if (edge is ConcatSym concat && JoinedSelect(concat) is OpSym { Args: [_, var yes, var no] } choice
+            && StructureCarrier(yes, structure) && StructureCarrier(no, structure)) return choice;
+        return WholeCarrier(edge, structure) ?? (StructureCarrier(edge, structure) ? edge : null);
+    }
+
+    private bool StructureCarrier(Sym value, DefinitionRef structure)
+    {
+        value = SymTable.Resolve(value);
+        if (WholeCarrier(value, structure) is not null) return true;
+        if (value is not ConcatSym concat || StructPhiLeaves(new AggregatePlan(null, types.Projections(structure)
+                .Select(p => new ProjectedSym(p, values.Syms.Slice(concat, p.Bit, p.Width))).ToArray())) is not { } leaves)
+            return false;
+        return Enumerable.Range(0, leaves[0].Phi.Sources.Length).All(j =>
+            StructPhiEdge(leaves, structure, j) is { } incoming && WholeCarrier(incoming, structure) is not null);
+    }
+
+    /// <summary>全部有效字段对应同一结构体值的原位切片；寄存器填充无需作为托管值读取。</summary>
+    private Sym? WholeCarrier(Sym value, DefinitionRef structure)
+    {
+        if (structure.Equals(TypeOf(value))) return value;
+        if (value is not ConcatSym concat || value.Width != types.StorageBits(structure)) return null;
+        Sym? whole = null;
+        var fields = types.Projections(structure).ToArray();
+        if (fields.Length == 0 || fields.Any(field => !field.Fits(value.Width))) return null;
+        foreach (var field in fields)
+        {
+            if (values.Syms.Slice(value, field.Bit, field.Width) is not SliceSym slice
+                || slice.Low != field.Bit || !structure.Equals(TypeOf(slice.Base))
+                || whole is not null && !ReferenceEquals(whole, slice.Base)) return null;
+            whole = slice.Base;
+        }
+        var at = 0;
+        foreach (var part in concat.Parts)
+        {
+            if (part is not UndefSym && (part is not SliceSym slice || slice.Low != at || !ReferenceEquals(slice.Base, whole))) return null;
+            at += part.Width;
+        }
+        return whole;
     }
 
     /// <summary>结构体 φ 的每条入边都能整体取得：值与写入都整体进行，不需要逐个访问叶子。</summary>

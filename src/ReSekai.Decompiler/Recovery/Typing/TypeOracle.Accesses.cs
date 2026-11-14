@@ -1,6 +1,7 @@
 using ReSekai.Decompiler.Facts;
 using ReSekai.Decompiler.Ir;
 using ReSekai.Decompiler.Machine.Flow;
+using ReSekai.Decompiler.Recovery.Calls;
 using ReSekai.Decompiler.Recovery.Values;
 
 namespace ReSekai.Decompiler.Recovery.Typing;
@@ -13,7 +14,7 @@ public sealed record StoreGroup(IReadOnlyList<Store> Members, Location Target, S
 /// 在未提升的位置（对象字段、元素、经引用、可寻址局部）上，这些段在 IL 中是对同一个结构体位置的一次读写。
 /// 写入：同一块中根与下标相同、互不重叠的写入恰好铺满一个结构体位置，之间只有不读内存的定义、空语句与写屏障时，
 /// 合成一次对该位置的写入，在第一个成员处写出。
-/// 读取：结构体的全部叶子来自同一块中同段内存的读取，之间只有不读其他内存的定义时，在第一次读取处读取整体。
+/// 读取：结构体的全部叶子来自同段内存且之间没有写入或调用时，在第一次读取处读取整体。
 /// 常量写入可越过同一实例内不相交字段的读取；第一次写入已验证接收者，读取不产生新的异常。
 /// 其余情况不跨越调用、其他写入或无关读取，原有的异常与副作用次序不变。
 /// </summary>
@@ -304,7 +305,7 @@ public sealed partial class TypeOracle
             {
                 Sym? candidate = null;
                 if (group.All(l => StorageBits(l.Type) is > 0 and var width && l.Offset * 8 + width <= bits.Width && FromValue(bits, l.Offset, width, total, ref candidate))
-                    && candidate is not null && TypeOf(candidate) is { } type && type.Equals(structure))
+                    && candidate is not null && (structure.Equals(TypeOf(candidate)) || StructLoopSnapshot(candidate, structure)))
                 {
                     whole = candidate;
                     break;
@@ -334,6 +335,50 @@ public sealed partial class TypeOracle
         return Snapshot(address, reads, structure, total) is { } snapshot ? (snapshot, changed) : null;
     }
 
+    /// <summary>已证明不读取最后一个值类型字段的按值调用，可以从同一位置完整复制结构体。</summary>
+    public ReadSym? ArgumentCopy(CallShape shape, MachineValue value, TypeRef type, Sym bits)
+    {
+        if (value.Transfer != Transfer.Value || value.Index < 0 || type is not DefinitionRef structure
+            || types.Kind(structure) != TypeKind.Struct || value.Pieces is not [var first, var second]
+            || first.Offset != 0 || second.Offset * 8 != first.Width
+            || !shape.Unused.Contains(second.Register) || shape.Unused.Contains(first.Register)) return null;
+        var requiredBits = first.Width;
+        var total = types.StorageBits(structure);
+        if (requiredBits <= 0 || requiredBits >= total || bits.Width < requiredBits) return null;
+        var reads = new HashSet<ReadSym>();
+        Sym? address = null;
+        foreach (var field in types.Projections(structure).Where(f => f.Bit < requiredBits))
+            if (field.Bit % 8 != 0 || field.Bit + field.Width > requiredBits
+                || !FromReads(bits, field.Bit / 8, field.Width, ref address, reads)) return null;
+        return reads.Count != 0 ? Snapshot(address, reads, structure, total) : null;
+    }
+
+    /// <summary>循环携带完整结构体，回边只改写部分字段，入口为已定型的值。未改写字段仍由结构体局部持有。</summary>
+    public bool StructLoopSnapshot(Sym value, DefinitionRef structure)
+    {
+        if (value is not PhiSym { Projection: null, Sources.Length: 2 } phi || types.StorageBits(structure) != phi.Width) return false;
+        var total = phi.Width;
+        var fields = types.Fields(structure).ToArray();
+        if (fields.Length == 0 || fields.Any(f => f.Path.Count != 1 || !f.Fits(total))) return false;
+        bool Kept(ValueProjection field, Sym edge)
+        {
+            Sym? original = phi;
+            return field.Bit % 8 == 0 && FromValue(edge, field.Bit / 8, field.Width, total, ref original);
+        }
+        bool Seed(Sym edge) => edge is not PhiSym && (structure.Equals(TypeOf(edge)) || WholeRead(edge, structure) is not null
+            || FieldValues(edge, structure) is { } source && source.Any(f => SymTable.Resolve(f.Value) is SliceSym { Base: ArgSym arg }
+                && structure.Equals(TypeOf(arg))));
+        for (var i = 0; i < 2; i++)
+        {
+            if (phi.Sources[i] is not { } recurrence || phi.Sources[1 - i] is not { } start) continue;
+            var edge = SymTable.Resolve(recurrence);
+            if (ReferenceEquals(edge, phi) || edge.Width != total || !Seed(SymTable.Resolve(start))) continue;
+            var changed = fields.Where(f => !Kept(f, edge)).ToArray();
+            if (changed.Length > 0 && changed.Length < fields.Length && changed.All(f => Writable(f.Path[0], f.Type))) return true;
+        }
+        return false;
+    }
+
     /// <summary>
     /// 快照改写的字段写得出：对调用方可访问、与调用方同程序集（按原生代码直接写），或所在类型有参数恰为字段类型的 setter 形方法（可能是被内联的访问器）。
     /// 都不成立时（如别的程序集值类型的私有字段且没有 setter）改写只能是洞，不按快照改写。
@@ -354,7 +399,12 @@ public sealed partial class TypeOracle
         var at = offset * 8;
         foreach (var piece in part is ConcatSym concat ? concat.Parts : [part])
         {
-            var (source, low) = piece is SliceSym slice ? (SymTable.Resolve(slice.Base), slice.Low) : (SymTable.Resolve(piece), 0);
+            var (source, low) = SymTable.Resolve(piece) switch
+            {
+                SliceSym slice => (SymTable.Resolve(slice.Base), slice.Low),
+                PhiSym { Projection: { } projection } => (projection.Whole, projection.Low),
+                var root => (root, 0),
+            };
             if (source.Width != total || low != at || source is ConcatSym or ConstSym or UndefSym || whole is not null && !Equals(whole, source)) return false;
             whole = source;
             at += piece.Width;
@@ -365,14 +415,27 @@ public sealed partial class TypeOracle
     /// <summary>在这些读取的第一处对 address 处结构体位置的整体读取；各读取之间只能是定义。</summary>
     private ReadSym? Snapshot(Sym? address, HashSet<ReadSym> reads, TypeRef structure, int total)
     {
-        if (address is null || (Locate(address, total) is { } located && located.Type.Equals(structure) ? located : PointerElement(address, structure)) is null) return null;
-        var block = values.BlockOf(reads.First().Site);
-        var sites = reads.Select(r => block.Statements.FindIndex(s => ReferenceEquals(s, r.Site))).ToArray();
-        if (sites.Any(s => s < 0)) return null;
-        var first = sites.Min();
-        // 各段之间只能是定义：其中对别处的读取不改内存；整体读取落在第一段处，后面的段读同一对象，提前读不改变异常。
-        for (var i = first; i <= sites.Max(); i++)
-            if (block.Statements[i] is not Define) return null;
+        if (address is null || reads.Count == 0
+            || (Locate(address, total) is { } located && located.Type.Equals(structure) ? located : PointerElement(address, structure)) is not { } location) return null;
+        var blocks = reads.Select(r => values.BlockOf(r.Site)).Distinct().ToArray();
+        if (blocks is [var a, var b] && a.Predecessors is [var pred] && ReferenceEquals(pred, b)) blocks = [b, a];
+        if (blocks.Length > 2) return null;
+        var readSites = reads.Select(r => r.Site).ToHashSet(ReferenceEqualityComparer.Instance);
+        var block = blocks[0];
+        var first = block.Statements.FindIndex(s => readSites.Contains(s));
+        var lastBlock = blocks[^1];
+        var last = lastBlock.Statements.FindLastIndex(s => readSites.Contains(s));
+        if (first < 0 || last < 0) return null;
+        if (blocks.Length == 2)
+        {
+            // 仅在有类型的托管引用上跨一个保护分支；第一段已解引用，额外读取属于同一有效结构体。
+            if (location is not { Kind: LocationKind.Reference, Path.Count: 0, Base: { } root, ByteOffset: null }
+                || TypeOf(root) is not ByRefRef || block.Handler is not null || lastBlock.Predecessors is not [var predecessor]
+                || !ReferenceEquals(predecessor, block) || block.Statements[^1] is not Branch
+                || block.Statements.Skip(first).SkipLast(1).Any(s => s is not (Define or Nop))
+                || lastBlock.Statements.Take(last + 1).Any(s => s is not (Define or Nop))) return null;
+        }
+        else if (block.Statements.Skip(first).Take(last - first + 1).Any(s => s is not Define)) return null;
         var site = block.Statements[first];
         if (wholeReads.TryGetValue((site, address, total), out var whole)) return whole;
         whole = values.Syms.Read(site, -1 - wholeReads.Count, address, total);
@@ -387,6 +450,19 @@ public sealed partial class TypeOracle
 
     /// <summary>值在机器上的存储位宽。</summary>
     public int StorageBits(TypeRef type) => types.StorageBits(type);
+
+    /// <summary>移位指令只读移位量的低位，原生寄存器中相邻字段和填充位不参与。</summary>
+    public Sym ShiftCount(OpSym operation)
+    {
+        var count = operation.Args[1];
+        if (operation is { Op.Binary: BinOp.Shl or BinOp.LShr or BinOp.AShr, Width: 32 or 64 }
+            && SymTable.Resolve(count) is SliceSym { Base: var aggregate, Low: var low }
+            && TypeOf(aggregate) is DefinitionRef owner && types.Kind(owner) == TypeKind.Struct
+            && types.Projections(owner).FirstOrDefault(p => p.Bit == low && p.Width is >= 8 and <= 32
+                && types.Kind(p.Type) == TypeKind.Int) is { } field)
+            return values.Syms.Slice(aggregate, low, field.Width);
+        return count;
+    }
 
     /// <summary>标量叶子的机器位宽。</summary>
     public int LeafBits(TypeRef type) => ManagedTypes.IsReferenceType(type) || type is ByRefRef or PointerRef ? 64 : Math.Max(1, types.Bits(type));

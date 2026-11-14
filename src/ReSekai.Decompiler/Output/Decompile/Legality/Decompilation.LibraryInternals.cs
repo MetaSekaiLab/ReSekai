@@ -1,3 +1,4 @@
+using ICSharpCode.Decompiler.CSharp;
 using ICSharpCode.Decompiler.CSharp.Syntax;
 using ICSharpCode.Decompiler.CSharp.Transforms;
 using ICSharpCode.Decompiler.Semantics;
@@ -17,8 +18,10 @@ public static partial class Decompilation
 
         public void Run(AstNode rootNode, TransformContext context)
         {
+            ReadOnlySpanRebindings(rootNode);
             foreach (var call in rootNode.Descendants.OfType<InvocationExpression>().Reverse().ToArray())
             {
+                if (IsUnsafeAsPointer(call)) ReadOnlySpanPointer(call);
                 if (call.Annotation<ResolveResult>() is not InvocationResolveResult { Member: IMethod method }) continue;
                 switch (method.DeclaringTypeDefinition?.FullName, method.Name)
                 {
@@ -33,6 +36,12 @@ public static partial class Decompilation
                         break;
                     case ("System.Math", "ThrowMinMaxException"):
                         Throw(call, "ArgumentException");
+                        break;
+                    case ("System.ThrowHelper", "ThrowArgumentOutOfRangeException") when method.Parameters.Count == 0
+                        && call.Parent is ExpressionStatement { NextSibling: ThrowStatement { Expression: NullReferenceExpression } unreachable }:
+                        // 此重载直接抛出默认的 ArgumentOutOfRangeException，后面的 null throw 是 IL 终结占位。
+                        Throw(call, "ArgumentOutOfRangeException");
+                        unreachable.Remove();
                         break;
                     case ("System.Collections.Generic.HashSet", "AddIfNotPresent") when call.Target is MemberReferenceExpression target:
                         target.MemberName = "Add";
@@ -53,6 +62,99 @@ public static partial class Decompilation
             }
             foreach (var block in rootNode.Descendants.OfType<BlockStatement>().ToArray()) ReadOnlyFieldRuns(block);
             foreach (var cast in rootNode.Descendants.OfType<CastExpression>().ToArray()) ComparerImplementation(cast);
+            foreach (var declaration in rootNode.Descendants.OfType<VariableDeclarationStatement>().ToArray()) ComparerLocal(declaration);
+            NativeImportIntegers(rootNode);
+        }
+
+        private static bool IsUnsafeAsPointer(InvocationExpression call) =>
+            call.Target is MemberReferenceExpression { MemberName: "AsPointer", Target: TypeReferenceExpression unsafeType }
+            && (unsafeType.Annotation<ResolveResult>()?.Type.FullName == "System.Runtime.CompilerServices.Unsafe"
+                || unsafeType.Type.ToString() is "System.Runtime.CompilerServices.Unsafe" or "global::System.Runtime.CompilerServices.Unsafe");
+
+        private static bool IsReadOnlySpanReference(Expression? expression) => expression is InvocationExpression call
+            && call.Annotation<ResolveResult>() is InvocationResolveResult { Member: IMethod
+                { Name: "GetPinnableReference", Parameters.Count: 0, DeclaringTypeDefinition: { Namespace: "System", Name: "ReadOnlySpan" } } };
+
+        /// <summary>只读 Span 的地址跨块重绑定到局部时，局部仍为只读引用；只有指针转换需要移除只读修饰。</summary>
+        private static void ReadOnlySpanRebindings(AstNode root)
+        {
+            foreach (var assignment in root.Descendants.OfType<AssignmentExpression>().ToArray())
+            {
+                if (assignment is not { Operator: AssignmentOperatorType.Assign, Left: IdentifierExpression target,
+                        Right: DirectionExpression { FieldDirection: FieldDirection.Ref } reference }
+                    || !IsReadOnlySpanReference(reference.Expression) || target.GetILVariable() is not { } local
+                    || EnclosingFunction(assignment) is not { } function) continue;
+                var declarations = function.Descendants.OfType<VariableInitializer>().Where(v => v.GetILVariable() == local).ToArray();
+                if (declarations is not [VariableInitializer { Initializer: null, Parent: VariableDeclarationStatement
+                    { Variables.Count: 1, Type: ComposedType { HasRefSpecifier: true, HasReadOnlySpecifier: false } declaration } }]) continue;
+                var conversions = function.Descendants.OfType<IdentifierExpression>().Where(i => i.GetILVariable() == local && i != target)
+                    .Select(PointerUse).ToArray();
+                if (conversions.Length == 0 || conversions.Any(c => c is null)) continue;
+                declaration.HasReadOnlySpecifier = true;
+                foreach (var conversion in conversions) ReadOnlyPointerArgument(conversion!);
+            }
+
+            static DirectionExpression? PointerUse(IdentifierExpression use) =>
+                use.Parent is DirectionExpression { FieldDirection: FieldDirection.Ref, Parent: InvocationExpression call } direction
+                    && IsUnsafeAsPointer(call) && call.Arguments.Count == 1 && call.Arguments.First() == direction ? direction : null;
+        }
+
+        /// <summary>原生导入按 CLR 的 IntPtr 签名声明，并保留调用点原有的原生宽度转换。</summary>
+        private static void NativeImportIntegers(AstNode root)
+        {
+            var imports = new Dictionary<IMethod, Dictionary<int, string>>();
+            static string? RuntimeType(AstType? type) => (type switch { PrimitiveType p => p.Keyword, SimpleType s => s.Identifier, _ => null }) switch
+            {
+                "nint" => "IntPtr",
+                "nuint" => "UIntPtr",
+                _ => null,
+            };
+            foreach (var declaration in root.Descendants.OfType<MethodDeclaration>().Where(m => m.Modifiers.HasFlag(Modifiers.Extern)))
+            {
+                if (declaration.GetSymbol() is not IMethod method) continue;
+                var parameters = declaration.Parameters.Select((p, i) => (p, i, type: RuntimeType(p.Type))).Where(p => p.type is not null).ToArray();
+                if (parameters.Length == 0) continue;
+                imports.Add(method.MemberDefinition as IMethod ?? method, parameters.ToDictionary(p => p.i, p => p.type!));
+                foreach (var (parameter, _, type) in parameters) parameter.Type = GlobalType("System", type!);
+            }
+            if (imports.Count == 0) return;
+            foreach (var call in root.Descendants.OfType<InvocationExpression>().ToArray())
+            {
+                if (call.Annotation<ResolveResult>() is not InvocationResolveResult { Member: IMethod method }
+                    || !imports.TryGetValue(method.MemberDefinition as IMethod ?? method, out var parameters)) continue;
+                var arguments = call.Arguments.ToArray();
+                for (var i = 0; i < arguments.Length; i++)
+                {
+                    var argument = arguments[i];
+                    var position = argument is NamedArgumentExpression named
+                        ? method.Parameters.ToList().FindIndex(p => p.Name == named.Name) : i;
+                    if (!parameters.TryGetValue(position, out var type)) continue;
+                    if (argument is NamedArgumentExpression explicitName)
+                        explicitName.Expression = new CastExpression(GlobalType("System", type), explicitName.Expression.Clone());
+                    else argument.ReplaceWith(new CastExpression(GlobalType("System", type), argument.Clone()));
+                }
+            }
+        }
+
+        /// <summary>保留 GetPinnableReference 的空 Span 语义，只在转为指针时移除引用的只读修饰。</summary>
+        private static void ReadOnlySpanPointer(InvocationExpression call)
+        {
+            if (call.Arguments.ToArray() is not [DirectionExpression { FieldDirection: FieldDirection.Ref, Expression: var value } argument]) return;
+            InvocationExpression? origin = value as InvocationExpression;
+            if (value is IdentifierExpression identifier && identifier.GetILVariable() is { } variable && EnclosingFunction(call) is { } function)
+            {
+                var declarations = function.Descendants.OfType<VariableInitializer>().Where(v => v.GetILVariable() == variable).ToArray();
+                if (declarations is [VariableInitializer { Initializer: DirectionExpression { Expression: InvocationExpression initializer } }]
+                    && !function.Descendants.OfType<AssignmentExpression>().Any(a => a.Left is IdentifierExpression left && left.GetILVariable() == variable))
+                    origin = initializer;
+            }
+            if (IsReadOnlySpanReference(origin)) ReadOnlyPointerArgument(argument);
+        }
+
+        private static void ReadOnlyPointerArgument(DirectionExpression argument)
+        {
+            var cast = new MemberReferenceExpression(new TypeReferenceExpression(GlobalType("System", "Runtime", "CompilerServices", "Unsafe")), "AsRef");
+            argument.Expression = new InvocationExpression(cast, new DirectionExpression(FieldDirection.In, argument.Expression.Clone()));
         }
 
         private static void Throw(InvocationExpression call, string exception)
@@ -158,7 +260,7 @@ public static partial class Decompilation
 
         /// <summary>
         /// Span 和 ReadOnlySpan 按引用构造的构造函数不公开，是 string.AsSpan、栈上缓冲区之类展开后的形状：
-        /// new ReadOnlySpan&lt;char&gt;(ref s.GetRawStringData(), s.Length) 写成 MemoryExtensions.AsSpan(s, 0, s.Length)，
+        /// 由 s.GetRawStringData() 与 s.Length 构造的只读字符 Span 写成 MemoryExtensions.AsSpan(s, 0, s.Length)，
         /// s 为 null 时同样在取长度处抛空引用异常；new Span&lt;T&gt;(ref *p, n) 写成指针构造函数 new Span&lt;T&gt;(p, n)，
         /// 公开的构造函数多检查一次 n 不为负（不检查的构造函数要求调用方保证）。
         /// </summary>
@@ -167,7 +269,13 @@ public static partial class Decompilation
             if (creation.Annotation<ResolveResult>() is not InvocationResolveResult { Member: IMethod { IsConstructor: true, DeclaringTypeDefinition: { Namespace: "System", Name: "Span" or "ReadOnlySpan" } span } constructor }
                 || constructor.Parameters.Count != 2 || constructor.Parameters[0].Type.Kind != ICSharpCode.Decompiler.TypeSystem.TypeKind.ByReference
                 || creation.Arguments.ToArray() is not [DirectionExpression { FieldDirection: FieldDirection.Ref, Expression: var reference }, var length]) return;
-            if (span.Name == "ReadOnlySpan" && reference is InvocationExpression { Arguments.Count: 0, Target: MemberReferenceExpression { MemberName: "GetRawStringData", Target: { } text } } raw
+            // CIL 可先把托管引用转成 char*，然后立刻解引用来构造 Span；剥掉这一对往返转换。
+            var origin = reference is UnaryOperatorExpression { Operator: UnaryOperatorType.Dereference,
+                Expression: CastExpression { Type: ComposedType { PointerRank: 1, BaseType: PrimitiveType { Keyword: "char" } },
+                    Expression: InvocationExpression asPointer } } && IsUnsafeAsPointer(asPointer)
+                && asPointer.Arguments.ToArray() is [DirectionExpression { FieldDirection: FieldDirection.Ref, Expression: var value }]
+                    ? value : reference;
+            if (span.Name == "ReadOnlySpan" && origin is InvocationExpression { Arguments.Count: 0, Target: MemberReferenceExpression { MemberName: "GetRawStringData", Target: { } text } } raw
                 && raw.Annotation<ResolveResult>() is InvocationResolveResult { Member.DeclaringTypeDefinition.KnownTypeCode: KnownTypeCode.String }
                 && length is MemberReferenceExpression { MemberName: "Length", Target: { } measured } && measured.ToString() == text.ToString()
                 && !text.DescendantsAndSelf.Any(n => n is InvocationExpression or AssignmentExpression or UnaryOperatorExpression { Operator: UnaryOperatorType.Await or UnaryOperatorType.Increment or UnaryOperatorType.Decrement or UnaryOperatorType.PostIncrement or UnaryOperatorType.PostDecrement }))
@@ -249,6 +357,16 @@ public static partial class Decompilation
         {
             if ((cast.Annotation<ResolveResult>()?.Type ?? cast.Type.Annotation<ResolveResult>()?.Type)?.GetDefinition() is not { } target) return;
             if (target.FullName != "System.StringComparer" && target.GetAllBaseTypes().Any(b => b.GetDefinition()?.FullName == "System.StringComparer")) cast.ReplaceWith(cast.Expression.Clone());
+        }
+
+        /// <summary>IL2CPP 按内部实现给比较器局部变量定型，StringComparer 的公开属性只返回基类。</summary>
+        private static void ComparerLocal(VariableDeclarationStatement declaration)
+        {
+            if (declaration.Type.Annotation<ResolveResult>()?.Type.GetDefinition() is not { Accessibility: not Accessibility.Public } implementation
+                || !implementation.GetAllBaseTypes().Any(t => t.FullName == "System.StringComparer")
+                || !declaration.Variables.All(v => v.Initializer?.Annotation<ResolveResult>() is MemberResolveResult
+                    { Member: IProperty { IsStatic: true, Accessibility: Accessibility.Public, DeclaringTypeDefinition.FullName: "System.StringComparer", ReturnType.FullName: "System.StringComparer" } })) return;
+            declaration.Type = GlobalType("System", "StringComparer");
         }
     }
 }

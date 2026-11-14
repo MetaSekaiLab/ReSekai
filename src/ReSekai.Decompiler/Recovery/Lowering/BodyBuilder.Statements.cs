@@ -22,6 +22,13 @@ internal sealed partial class BodyBuilder
         if (statement is Define && operands is [OpSym { Op.Kind: OperatorKind.Select } selection]
             && Reads(statement).Any(materialized.Contains))
         {
+            // 直接方法的元数据在两路都无运行时读取，只有条件需要保留在原机器位置。
+            if (selection.Args is [var condition, EntitySym { Symbol.Kind: SymbolKind.Method }, EntitySym { Symbol.Kind: SymbolKind.Method }])
+            {
+                var test = View(condition, types.Boolean, statement.Address);
+                output.Add(new ManagedAssignment(statement.Address, Local(condition, types.Boolean), test));
+                return null;
+            }
             var selected = View(selection, oracle.TypeOf(selection), statement.Address);
             output.Add(new ManagedAssignment(statement.Address, Local(selection, selected.Type), selected));
             return null;
@@ -190,6 +197,7 @@ internal sealed partial class BodyBuilder
                 foreach (var part in oracle.Split(address, values.Operands(member)[1].Width) ?? [])
                 {
                     var path = part.Leaf.Path;
+                    var whole = false;
                     for (var i = 1; i < path.Count; i++)
                     {
                         if (FieldType(path[i - 1], null) is not DefinitionRef structure || types.Kind(structure) != TypeKind.Struct) continue;
@@ -201,16 +209,27 @@ internal sealed partial class BodyBuilder
                         if (bit % 8 != 0) break;
                         var start = offset + bit / 8;
                         var end = start + types.Size(structure);
-                        if (plan.Any(z => z.Start == start && z.End == end)) break;
-                        if (!Covered(start, end)) continue;
-                        // 触及它的写入要么整个落在里面，要么按字段拆开写：否则那次写入按定位整体写出，跳不过这一段。
-                        if (run.Any(m => m.Start < end && start < m.End && !(start <= m.Start && m.End <= end)
-                            && (oracle.Locate(m.Address, (int)(m.End - m.Start) * 8) ?? oracle.ViewLocate(m.Address, (int)(m.End - m.Start) * 8, m.Store)) is not null)) break;
-                        var emitter = run.First(m => m.Start < end && start < m.End).Store;
-                        plan.Add((part.Leaf with { Path = path.Take(i).ToArray(), Type = structure }, start, end, emitter));
+                        whole = Add(part.Leaf with { Path = path.Take(i).ToArray(), Type = structure }, start, end);
+                        if (!whole) continue;
                         break;
                     }
+                    if (!whole && ManagedTypes.IsReferenceType(part.Leaf.Type) && part.FieldBit % 8 == 0)
+                    {
+                        var start = offset + (part.Bit - part.FieldBit) / 8;
+                        Add(part.Leaf, start, start + 8);
+                    }
                 }
+            bool Add(Location place, long start, long end)
+            {
+                if (plan.Any(z => z.Start <= start && end <= z.End)) return true;
+                if (!Covered(start, end)) return false;
+                // 跨越边界的写入必须可拆成字段，才能在同一位置合并清零。
+                if (run.Any(m => m.Start < end && start < m.End && !(start <= m.Start && m.End <= end)
+                    && (oracle.Locate(m.Address, (int)(m.End - m.Start) * 8) ?? oracle.ViewLocate(m.Address, (int)(m.End - m.Start) * 8, m.Store)) is not null)) return false;
+                plan.RemoveAll(z => start <= z.Start && z.End <= end);
+                plan.Add((place, start, end, run.First(m => m.Start < end && start < m.End).Store));
+                return true;
+            }
             // 计划之间不能相交：相交说明同一段字节有两种解释。
             if (plan.Any(a => plan.Any(b => !ReferenceEquals(a.Place, b.Place) && a.Start < b.End && b.Start < a.End))) plan.Clear();
             foreach (var (member, _, _, _) in run) zeroPlans[member] = plan;

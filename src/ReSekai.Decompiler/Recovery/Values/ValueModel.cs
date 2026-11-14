@@ -282,6 +282,11 @@ public sealed partial class ValueModel
                 return Syms.Local(LocalSpace.Frame, f.Offset);
             case StackAllocation a:
                 return Syms.Local(LocalSpace.Dynamic(a.Site, a.Element), 0);
+            case ClassProperty { Kind: ClassPropertyKind.StackSlotSize, Type: var sized }
+                when sized is DefinitionRef { Definition.IsValueType: true }
+                    || sized is GenericParameterRef { Parameter.Attributes: var constraints }
+                        && (constraints & System.Reflection.GenericParameterAttributes.NotNullableValueTypeConstraint) != 0:
+                return Syms.SizeOf(sized);
             case ClassProperty p:
                 return Syms.Unknown($"运行时 类属性 {p}", p.Width);
             case Entry e:

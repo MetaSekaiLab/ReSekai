@@ -133,7 +133,8 @@ internal static class PathSplitting
                 var (current, guarded) = entry;
                 if (current.Statements.Any(statement => phis && (guarded
                         ? FieldAccesses(model, oracle, statement).Any(access => LocatedPerSource(access.Address, access.Width, block, oracle))
-                        : Singletons(model, oracle, statement).Any(sym => Distinct(sym, block, oracle)))
+                        : Singletons(model, oracle, statement).Any(sym => Distinct(sym, block, oracle))
+                            || model.ReadsAt(statement).Any(read => StaticAndInstance(read, block, oracle)))
                     || Viewed(model, oracle, statement, block)))
                 {
                     yield return block;
@@ -146,6 +147,29 @@ internal static class PathSplitting
                     if (next.Predecessors.Count == 1 && next != block) pending.Enqueue((next, guarded || tested));
             }
         }
+    }
+
+    /// <summary>静态数据区与实例共用读取指令时，静态数据区不是另一路的托管对象。</summary>
+    private static bool StaticAndInstance(ReadSym read, Block block, TypeOracle oracle)
+    {
+        if (oracle.Decompose(read.Address) is not (PhiSym phi, var offset, null, _) || phi.Block != block
+            || phi.Sources.Any(s => s is null)) return false;
+        var sources = phi.Sources.Select(s => SymTable.Resolve(s!)).ToArray();
+        var hasStatic = false;
+        var hasInstance = false;
+        foreach (var source in sources)
+        {
+            if (source is EntitySym { Symbol: { Kind: SymbolKind.StaticFields, Value: TypeRef owner } })
+            {
+                if (oracle.FieldAt(owner, (int)offset, read.Width, true, false) is null) return false;
+                hasStatic = true;
+            }
+            else if (oracle.TypeOf(source) is { } instance && ManagedTypes.IsReferenceType(instance)
+                && oracle.FieldAt(instance, (int)offset, read.Width, false, false) is not null)
+                hasInstance = true;
+            else return false;
+        }
+        return hasStatic && hasInstance;
     }
 
     /// <summary>语句中要求单一实体的符号值：尚不能表示为托管位置的地址、调用目标与经指针访问的实参。</summary>
@@ -170,7 +194,7 @@ internal static class PathSplitting
                         yield return read.Address;
                 // 局部地址、方法实体及运行时操作的类元数据都要求单一实体。
                 for (var i = 0; i < call.Arguments.Length; i++)
-                    if (SymTable.Resolve(operands[1 + i]) is PhiSym phi && (phi.Sources.All(s => s is not null
+                    if (SymTable.Resolve(operands[1 + i]) is PhiSym phi && (LocalAddresses(phi) || phi.Sources.All(s => s is not null
                         && (SymTable.Resolve(s) is LocalSym or EntitySym { Symbol.Kind: SymbolKind.Method }
                             || call.Op is not null && SymTable.Resolve(s) is EntitySym { Symbol.Kind: SymbolKind.Class }))
                         || Entities(phi, call.Op is not null) is { Count: > 1 }))
@@ -180,6 +204,26 @@ internal static class PathSplitting
         foreach (var operand in operands)
             foreach (var read in Reads(operand))
                 if (oracle.Locate(read.Address, read.Width) is null) yield return read.Address;
+    }
+
+    /// <summary>嵌套合流选取不同的局部副本地址时，分开各路才能为调用保留完整的栈访问范围。</summary>
+    private static bool LocalAddresses(PhiSym phi)
+    {
+        var pending = new Stack<PhiSym>([phi]);
+        var seen = new HashSet<PhiSym>();
+        var found = false;
+        while (pending.TryPop(out var current))
+        {
+            if (!seen.Add(current)) continue;
+            foreach (var source in current.Sources)
+                switch (source is null ? null : SymTable.Resolve(source))
+                {
+                    case PhiSym nested: pending.Push(nested); break;
+                    case LocalSym: found = true; break;
+                    default: return false;
+                }
+        }
+        return found;
     }
 
     /// <summary>
@@ -359,6 +403,8 @@ internal static class PathSplitting
     /// <summary>以条件分支进入合流块的边插入只含跳转的块，使每个前驱都无条件进入合流块。</summary>
     private static void SplitCriticalEdges(MachineFunction function, Block merge)
     {
+        // 删除合流块后编号可以不连续，新地址必须大于仍在图中的所有拆分块。
+        var nextAddress = function.Blocks.Where(b => b.Start >= SyntheticBase).Select(b => b.Start + 1).DefaultIfEmpty(SyntheticBase).Max();
         for (var j = 0; j < merge.Predecessors.Count; j++)
         {
             var from = merge.Predecessors[j];
@@ -372,7 +418,7 @@ internal static class PathSplitting
             // 从 try 内进入合流块的边也要切开：复制的语句不属于 try，不能并入前驱。
             var last = from.Statements.LastOrDefault();
             if (!(last is Ir.Branch { Target: var target, Fallthrough: var fallthrough } && target != fallthrough || last is Ir.Jump && from.Handler is not null)) continue;
-            var address = SyntheticBase + (ulong)function.Blocks.Count(b => b.Start >= SyntheticBase);
+            var address = nextAddress++;
             var middle = new Block(address) { End = address };
             middle.Statements.Add(new Ir.Jump(address, merge.Start));
             var k = from.Successors.IndexOf(merge);

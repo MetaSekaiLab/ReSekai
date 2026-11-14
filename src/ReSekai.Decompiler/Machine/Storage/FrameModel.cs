@@ -37,12 +37,14 @@ internal sealed record FrameReach(IReadOnlyList<Store> Stores, bool FromEntry, S
 internal sealed class FrameModel
 {
     private const int ReachBudget = 8192;
+    private const int PointerTargetsBudget = 256;
 
     private readonly record struct CallRange(long Offset, int Size, MemoryAccess Access, bool WritesResult);
 
     private readonly MachineFunction function;
     private readonly IFrameCallEffects calls;
     private readonly Dictionary<Variable, Expr> definitions = [];
+    private readonly Dictionary<Load, Expr?> nearbyStores = new(ReferenceEqualityComparer.Instance);
     private readonly Dictionary<Variable, HashSet<long>> pointsTo = [];
     private readonly Dictionary<long, HashSet<long>> held = [];
     /// <summary>以帧地址为基址、加变量下标得到的地址：只在作为读写地址时不算逃逸。</summary>
@@ -51,28 +53,40 @@ internal sealed class FrameModel
     /// <summary>按调用身份记录：转发改写实参后仍是同一次调用，访问范围不变。</summary>
     private readonly Dictionary<CallSite, List<CallRange>> ranges = [];
     private readonly List<(long Offset, int? Size)> escaped = [];
+    public bool HasPointerFacts { get; }
 
     public FrameModel(MachineFunction function, IFrameCallEffects calls)
     {
         this.function = function;
         this.calls = calls;
-        foreach (var statement in function.Blocks.SelectMany(b => b.Statements))
-            if (statement is Define define) definitions[define.Target] = define.Value;
-        SolvePointers();
+        foreach (var block in function.Blocks)
+            for (var i = 0; i < block.Statements.Count; i++)
+            {
+                var statement = block.Statements[i];
+                if (statement is Define define) definitions[define.Target] = define.Value;
+                foreach (var load in ExprMap.Operands(statement).SelectMany(ExprMap.Walk).OfType<Load>()
+                    .Where(l => l is { Width: 64, Address: FrameAddress }))
+                {
+                    var value = NearbyStore(block, i, ((FrameAddress)load.Address).Offset);
+                    if (!nearbyStores.TryAdd(load, value) && !Equals(nearbyStores[load], value)) nearbyStores[load] = null;
+                }
+            }
+        HasPointerFacts = SolvePointers();
+        if (!HasPointerFacts) return;
         foreach (var statement in function.Blocks.SelectMany(b => b.Statements)) Collect(statement);
         SolveEscapes();
     }
 
     /// <summary>地址可能指向的帧偏移；不指向固定帧时为空。</summary>
-    public IReadOnlyCollection<long> Targets(Expr address) => Points(address).Distinct().ToArray();
+    private IReadOnlyCollection<long> Targets(Expr address) => Points(address).Distinct().ToArray();
 
     /// <summary>地址唯一指向的帧偏移。</summary>
-    public long? Slot(Expr address) => Targets(address) is { Count: 1 } targets ? targets.First() : null;
+    public long? Slot(Expr address) => HasPointerFacts && Targets(address) is { Count: 1 } targets ? targets.First() : null;
 
-    public bool Escaped(long offset, int bytes) => escaped.Any(e => Overlaps(e.Offset, e.Size, offset, bytes));
+    public bool Escaped(long offset, int bytes) => !HasPointerFacts || escaped.Any(e => Overlaps(e.Offset, e.Size, offset, bytes));
 
     /// <summary>语句是否可能覆盖指定帧区间中的任一字节。</summary>
-    public bool MayWrite(Stmt statement, long offset, int bytes) => Kill(statement, offset, bytes, out _);
+    public bool MayWrite(Stmt statement, long offset, int bytes) => !HasPointerFacts || Kill(statement, offset, bytes, out _);
 
     /// <summary>
     /// 区间不再被读取，地址未逃逸，调用也不经指针观察它。没有被直接读取过的槽可能是未解析调用的栈实参，因此要求调用不读这段栈；
@@ -171,6 +185,7 @@ internal sealed class FrameModel
     /// <summary>第 index 条语句之前，[offset, offset+bytes) 的来源。throughCalls：已知调用不改写它，只看写入。</summary>
     public FrameReach Reach(Block block, int index, long offset, int bytes, bool throughCalls = false)
     {
+        if (!HasPointerFacts) return new([], false, null, true);
         var stores = new List<Store>();
         var fromEntry = false;
         var steps = 0;
@@ -257,7 +272,7 @@ internal sealed class FrameModel
 
     // ---- 指向关系 ----
 
-    private void SolvePointers()
+    private bool SolvePointers()
     {
         var statements = function.Blocks.SelectMany(b => b.Statements).ToArray();
         for (var changed = true; changed;)
@@ -283,7 +298,11 @@ internal sealed class FrameModel
                         break;
                 }
             }
+            // 环中的指针每轮可产生新的偏移。没有收敛时，有限前缀不能用来证明不别名。
+            if (pointsTo.Values.Any(s => s.Count > PointerTargetsBudget)
+                || indexed.Values.Any(s => s.Count > PointerTargetsBudget) || held.Values.Any(s => s.Count > PointerTargetsBudget)) return false;
         }
+        return true;
     }
 
     private static bool Add<TKey>(Dictionary<TKey, HashSet<long>> sets, TKey key, IEnumerable<long> values) where TKey : notnull
@@ -306,9 +325,33 @@ internal sealed class FrameModel
         Binary { Op: BinOp.Add, Left: Const c } add => Points(add.Right).Select(o => o + c.Signed),
         Binary { Op: BinOp.Sub, Right: Const c } sub => Points(sub.Left).Select(o => o - c.Signed),
         Select select => Points(select.True).Concat(Points(select.False)),
+        Load { Width: 64 } load when nearbyStores.GetValueOrDefault(load) is { } value => Points(value),
         Load { Width: 64 } load => Points(load.Address).SelectMany(s => held.TryGetValue(s, out var values) ? values : []),
         _ => [],
     };
+
+    /// <summary>栈槽复用时，唯一前驱路径上的完整写入可给出当前值，避免混入别处写到同一槽的指针。</summary>
+    private Expr? NearbyStore(Block block, int index, long slot)
+    {
+        for (var budget = 32; budget > 0; budget--)
+        {
+            for (var i = index - 1; i >= 0; i--)
+            {
+                switch (block.Statements[i])
+                {
+                    case Store { Target: FrameAddress target } store:
+                        if (!Overlaps(target.Offset, store.Value.Width / 8, slot, 8)) continue;
+                        return store.Value.Width == 64 && target.Offset == slot && !ExprMap.Walk(store.Value).Any(e => e is Load)
+                            ? store.Value : null;
+                    case Call or Opaque or Store:
+                        return null;
+                }
+            }
+            if (block == function.EntryBlock || block.Predecessors is not [var predecessor] || predecessor.Handler == block) return null;
+            (block, index) = (predecessor, predecessor.Statements.Count);
+        }
+        return null;
+    }
 
     /// <summary>帧地址加变量下标的基址；下标范围未知，访问按基址以上的任意位置计。</summary>
     private IEnumerable<long> IndexedRoots(Expr expression) => expression switch
@@ -507,6 +550,7 @@ internal static class FrameForwarding
         for (var round = 0; round < Rounds; round++)
         {
             var model = new FrameModel(function, calls);
+            if (!model.HasPointerFacts) break;
             var changed = false;
             foreach (var block in function.Blocks)
                 for (var i = 0; i < block.Statements.Count; i++)

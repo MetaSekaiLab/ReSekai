@@ -47,7 +47,7 @@ public sealed record MachineSignature(MachineValue[] Arguments, MachineValue? Re
 
 public sealed partial class ManagedAbi
 {
-    /// <summary>已拆包的 invoker：引用按值，值参数按地址，非 void 返回值写入最后一个存储。</summary>
+    /// <summary>已拆包的 invoker：引用和非托管指针按值，其他值参数按地址，非 void 返回值写入最后一个存储。</summary>
     public MachineSignature Invoker(MethodRef method)
     {
         var arguments = new List<MachineValue>();
@@ -63,7 +63,7 @@ public sealed partial class ManagedAbi
         {
             var type = method.Concrete(method.Method.Parameters[index].Type);
             var piece = Piece(arguments.Count);
-            if (type is ByRefRef || ManagedTypes.IsReferenceType(type))
+            if (type is ByRefRef or PointerRef || ManagedTypes.IsReferenceType(type))
                 arguments.Add(Direct(index, type, [piece], method.Method.Parameters[index].Attributes));
             else arguments.Add(new(index, type, Transfer.Copy, [piece], SharedValue(type) ? -1 : Size(type), MemoryAccess.Read));
         }

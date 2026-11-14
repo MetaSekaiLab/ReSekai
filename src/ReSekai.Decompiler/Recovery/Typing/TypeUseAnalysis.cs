@@ -91,7 +91,8 @@ internal sealed class TypeUseAnalysis(MethodAnalysis analysis, TypeOracle oracle
         {
             foreach (var input in RuntimeOps.Of(op.Kind)?.Inputs?.Invoke(call, arguments.Take(call.OriginalArgumentCount).ToArray(), oracle) ?? [])
             {
-                if (input.Kind == RuntimeInputKind.Value) Use(input.Value, input.Type, call);
+                if (input.Kind == RuntimeInputKind.Value)
+                    Use(input.Width > 0 ? values.Syms.Slice(input.Value, input.Low, input.Width) : input.Value, input.Type, call);
                 else if (input.Kind == RuntimeInputKind.Pointee && values.CellContent(call, input.Pointee, arguments, false) is { } content)
                     Use(input.Width > 0 ? values.Syms.Slice(content, input.Low, input.Width) : content, input.Type, call);
                 else if (input.Type is { } type && oracle.Locate(input.Value, Types.StorageBits(type)) is { } location) Location(location, call);
@@ -119,7 +120,7 @@ internal sealed class TypeUseAnalysis(MethodAnalysis analysis, TypeOracle oracle
             }
             // 未使用的 ABI 槽没有类型用途，也不应迫使无关读取落地。
             if (oracle.Supply(shape, parameter, type, content) != ArgumentSupply.Content) continue;
-            if (parameter.Transfer == Transfer.Value) Use(content, type, call);
+            if (parameter.Transfer == Transfer.Value) Use(oracle.ArgumentCopy(shape, parameter, type, content) ?? content, type, call);
             else
             {
                 var element = type is ByRefRef byRef ? byRef.Element : type;
@@ -131,6 +132,8 @@ internal sealed class TypeUseAnalysis(MethodAnalysis analysis, TypeOracle oracle
 
         void Delegate(DelegateTarget target)
         {
+            if (target is MergedDelegateTarget merged)
+                foreach (var source in merged.Sources) Delegate(source);
             if (target is not SelectedDelegateTarget selected) return;
             Use(selected.Condition, Types.Boolean, call);
             Delegate(selected.True);
@@ -168,12 +171,22 @@ internal sealed class TypeUseAnalysis(MethodAnalysis analysis, TypeOracle oracle
     {
         if (!ReferenceEquals(read.Site, user)) materialized.Add(read);
         if (oracle.Locate(read.Address, read.Width) is { } location) Location(location, user);
+        else if (oracle.BooleanAddress(read.Address, read.Width) is var (condition, yes, no))
+        {
+            Use(condition, Types.Boolean, user);
+            Location(yes, user);
+            Location(no, user);
+        }
         else if (oracle.NarrowRead(read) is { } narrow) Location(narrow.Leaf, user);
     }
 
     private void Visit(Sym value, TypeRef? expected, Stmt? user)
     {
         if (oracle.AddressArm(value, expected) is { } addressed) { Location(addressed, user); return; }
+        if (value is ConcatSym referenceBits && expected is not null && oracle.RejoinedReference(referenceBits, expected) is { } reference)
+        { Use(reference, expected, user); return; }
+        if (expected is DefinitionRef choiceType && Types.Kind(choiceType) == TypeKind.Struct
+            && oracle.NarrowStructChoice(value, choiceType) is { } choice) { Use(choice, expected, user); return; }
         // 与下降一致：拼接不是整体读取、各段是同一条件下的选择时，按两路整体选择。
         if (value is ConcatSym parts && expected is not null && Types.Kind(expected) == TypeKind.Struct && oracle.CompositeRead(parts) is null
             && oracle.OpenWholeRead(parts, expected) is null && oracle.JoinedSelect(parts) is { } selected) { Use(selected, expected, user); return; }
@@ -224,7 +237,8 @@ internal sealed class TypeUseAnalysis(MethodAnalysis analysis, TypeOracle oracle
                 if (op.Op.Kind == OperatorKind.Compare && op.Op.Cond is Cond.Eq or Cond.Ne
                     && oracle.ClassIdentity(op.Args[0], op.Args[1]) is var (owner, _)) { Use(owner, Types.Object, user); break; }
                 var typing = oracle.OperationTypes(op, expected);
-                for (var i = 0; i < op.Args.Length; i++) Use(op.Args[i], typing.Inputs[i], user);
+                for (var i = 0; i < op.Args.Length; i++)
+                    Use(i == 1 && op.Op.Kind == OperatorKind.Binary ? oracle.ShiftCount(op) : op.Args[i], typing.Inputs[i], user);
                 break;
             case SliceSym slice:
                 if (oracle.UntypedWidePhiPiece(slice) is { } widePiece) { Use(widePiece, expected, user); break; }

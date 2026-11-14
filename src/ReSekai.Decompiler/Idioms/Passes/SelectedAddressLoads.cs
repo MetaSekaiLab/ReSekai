@@ -10,6 +10,11 @@ internal static class SelectedAddressLoads
     public static bool Run(MachineFunction function, Func<Variable> fresh)
     {
         var definitions = function.Blocks.SelectMany(b => b.Statements).OfType<Define>().ToDictionary(d => d.Target, d => d.Value);
+        var jumpInputs = new HashSet<Variable>();
+        var pending = new Stack<Expr>(function.Blocks.SelectMany(b => b.Statements).OfType<IndirectJump>().Select(j => j.Target));
+        while (pending.TryPop(out var expression))
+            foreach (var use in ExprMap.Walk(expression).OfType<Use>())
+                if (jumpInputs.Add(use.Variable) && definitions.TryGetValue(use.Variable, out var source)) pending.Push(source);
         Dominators? dominators = null;
         static bool Pure(Expr value) => !ExprMap.Walk(value).Any(e => e is Load or Intrinsic or Unknown
             or Binary { Op: BinOp.SDiv or BinOp.UDiv or BinOp.SRem or BinOp.URem });
@@ -40,8 +45,17 @@ internal static class SelectedAddressLoads
         Select? Choice(Expr address, HashSet<Variable> seen)
         {
             if (address is Use use && seen.Add(use.Variable) && definitions.TryGetValue(use.Variable, out var value))
-                return value is Use or Select ? Choice(value, seen) : null;
-            if (address is Select { Width: 64 } select && Pure(select.Condition) && Pure(select.True) && Pure(select.False)) return select;
+            {
+                var expression = Fold.Simplify(new Extract(value, 0, use.Width));
+                return Choice(expression, seen);
+            }
+            if (address is Select select && Pure(select.Condition) && Pure(select.True) && Pure(select.False)) return select;
+            if (address is Ir.Convert { Kind: ConvKind.ZeroExtend } extension && Choice(extension.Operand, seen) is { } extended)
+                return new Select(extended.Condition, Fold.Simplify(extension with { Operand = extended.True }), Fold.Simplify(extension with { Operand = extended.False }), extension.Width);
+            if (address is Extract { Low: 0 } extract && Choice(extract.Operand, seen) is { } extracted)
+                return new Select(extracted.Condition, Fold.Simplify(extract with { Operand = extracted.True }), Fold.Simplify(extract with { Operand = extracted.False }), extract.Width);
+            if (address is Binary { Op: BinOp.Shl, Right: Const } shift && Choice(shift.Left, seen) is { True: Const, False: Const } shifted)
+                return new Select(shifted.Condition, Fold.Simplify(shift with { Left = shifted.True }), Fold.Simplify(shift with { Left = shifted.False }), shift.Width);
             if (address is not Binary { Op: BinOp.Add, Width: 64 } add) return null;
             if (Pure(add.Right) && Choice(add.Left, seen) is { } left)
                 return left with { True = Fold.Simplify(add with { Left = left.True }), False = Fold.Simplify(add with { Left = left.False }) };
@@ -55,8 +69,12 @@ internal static class SelectedAddressLoads
             {
                 var statement = block.Statements[i];
                 if (statement is Store store && Pure(store.Value) && Choice(store.Target, []) is
-                    { True: Binary { Op: BinOp.Add, Left: Use owner, Right: Const }, False: Binary { Op: BinOp.Add, Left: Use other, Right: Const } } destination
-                    && owner == other && SplitStore(function, block, i, store, destination)) return true;
+                    { True: Binary { Op: BinOp.Add, Left: Use or Entry, Right: Const } yes,
+                        False: Binary { Op: BinOp.Add, Left: Use or Entry, Right: Const } no } destination
+                    && (yes.Left == no.Left || destination.Condition is Compare { Cond: Cond.Eq, Left: var tested, Right: Const { Value: 0 } }
+                        && tested == no.Left || destination.Condition is Compare { Cond: Cond.Ne, Left: var nonNull, Right: Const { Value: 0 } }
+                        && nonNull == yes.Left)
+                    && SplitStore(function, block, i, store, destination)) return true;
                 if (statement is Phi phi && phi.Sources.Length == block.Predecessors.Count)
                 {
                     var sources = phi.Sources.ToArray();
@@ -85,7 +103,9 @@ internal static class SelectedAddressLoads
                         return aliasSide ? alias.True : alias.False;
                     if (expression is Select { True: Load, False: Load } selected
                         && KnownSide(block, selected.Condition) is { } selectedSide) return selectedSide ? selected.True : selected.False;
-                    if (statement is not Define || expression is not Load load || Choice(load.Address, []) is not { } choice) return null;
+                    // 间接跳转从一次表项读取提取下标；保留选择地址，避免变成两个独立的读取。
+                    if (statement is not Define define || jumpInputs.Contains(define.Target)
+                        || expression is not Load load || Choice(load.Address, []) is not { } choice) return null;
                     return KnownSide(block, choice.Condition) is { } side ? load with { Address = side ? choice.True : choice.False }
                         : new Select(choice.Condition, load with { Address = choice.True }, load with { Address = choice.False }, load.Width);
                 }));
