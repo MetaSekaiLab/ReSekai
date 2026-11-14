@@ -100,7 +100,7 @@ static class Export
             output.Note("导出", options.Apk, error.ToString(), true);
             throw;
         }
-        finally { output.Report(options.Full ? "full" : "stubs", recovery is null ? null : new { recovery.SelectedMethods, recovery.EmittedMethods, recovery.PartialMethods, recovery.EmitFailures }); }
+        finally { output.Report(options.Full ? "full" : "stubs", recovery is null ? null : new { recovery.SelectedMethods, recovery.EmittedMethods, recovery.PartialMethods, recovery.EmitFailures, reused = stagedScripts is not null }); }
         Console.WriteLine($"导出 {output.Files} 个文件，错误 {output.Errors}：{output.Root}");
         if (output.Errors != 0) Console.WriteLine($"未完成项：{Path.Join(work, "report.json")}");
         return output.Errors == 0 ? 0 : 1;

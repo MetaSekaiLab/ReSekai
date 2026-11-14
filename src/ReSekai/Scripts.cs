@@ -105,7 +105,17 @@ sealed class Scripts(ProgramModel model, Packages packages, Output output)
                 string path = folder + "/" + safe;
                 string guid = Output.Guid("source:" + assembly.AssemblyName + "/" + relative);
                 foreach (var type in declared) targets[new ScriptName(assembly.AssemblyName, type.Namespace, type.Name).Key] = guid;
-                output.Write(path, File.ReadAllText(source));
+                string code = File.ReadAllText(source);
+                if (full && assembly.AssemblyName == "spine-csharp" && relative == "Spine/SequenceTimeline.cs"
+                    && packages.SpineSource is { } spine && code.Contains("base._002Ector(frameCount, array);", StringComparison.Ordinal))
+                {
+                    code = SpineSequenceTimeline(spine);
+                    output.Write(folder + "/LICENSE-Spine.txt", File.ReadAllBytes(Path.Join(spine, "LICENSE")));
+                    output.AssemblySources[assembly.AssemblyName] = $"反编译 + Spine {SourcePackages.Spine.Version} SequenceTimeline";
+                }
+                if (full && assembly.AssemblyName == "MagicaCloth" && relative == "MagicaCloth/BaseCloth.cs")
+                    code = GeneratedSource.MagicaClothCulling(code);
+                output.Write(path, code);
                 output.Meta(path, guid, "MonoImporter", "  serializedVersion: 2\n  defaultReferences: []\n  executionOrder: 0\n");
             }
             if (assembly.AssemblyName is "Assembly-CSharp" or "Assembly-CSharp-firstpass") continue;
@@ -121,6 +131,16 @@ sealed class Scripts(ProgramModel model, Packages packages, Output output)
             output.Meta(asmdef, Output.Guid("assembly:" + assembly.AssemblyName), "AssemblyDefinitionImporter");
         }
         return result;
+    }
+
+    static string SpineSequenceTimeline(string source)
+    {
+        string animation = File.ReadAllText(Path.Join(source, "Animation.cs"));
+        int ns = animation.IndexOf("namespace Spine", StringComparison.Ordinal);
+        int type = animation.IndexOf("\tpublic class SequenceTimeline : Timeline, ISlotTimeline", StringComparison.Ordinal);
+        if (ns < 0 || type < ns) throw new InvalidDataException("Spine SequenceTimeline 源码结构不匹配");
+        // 上游 4.1.2 将 SequenceTimeline 放在 Animation.cs 末尾。
+        return animation[..ns] + "namespace Spine {\n" + animation[type..];
     }
 
     static bool Predefined(string name) => name is "Assembly-CSharp" or "Assembly-CSharp-firstpass";
@@ -155,7 +175,7 @@ sealed class Scripts(ProgramModel model, Packages packages, Output output)
         var root = manifest.RootElement;
         var request = root.GetProperty("request");
         if (root.GetProperty("status").GetString() != "complete"
-            || !assemblies.ToHashSet().SetEquals(request.GetProperty("Assemblies").EnumerateArray().Select(a => a.GetString()!)))
+            || !assemblies.ToHashSet().IsSubsetOf(request.GetProperty("Assemblies").EnumerateArray().Select(a => a.GetString()!)))
             throw new InvalidDataException("恢复产物未完成或程序集范围不一致");
         var inputs = root.GetProperty("inputs");
         foreach (var (key, file) in new[] { ("binary", "libil2cpp.so"), ("metadata", "global-metadata.dat") })

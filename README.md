@@ -7,6 +7,7 @@
 - `--resources <目录>` 加入同版本服务器资源。
 - `--scripts stubs|full` 导出空桩或恢复方法体，默认 `stubs`。
 - `--upm auto|none|包名列表` 自动选择 UPM 包、禁用 UPM 或指定包名（逗号分隔），默认 `auto`。
+- `--recovered-scripts <目录>` 在完整模式复用同一 APK 已完成的 `.resekai/scripts`，重新导出到空目录。
 
 ## 引用项目
 

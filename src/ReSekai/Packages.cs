@@ -14,6 +14,7 @@ sealed class Packages
     public Dictionary<string, (string Guid, long Id)> Scripts { get; } = [];
     public Dictionary<string, string> Shaders { get; } = [];
     public Dictionary<string, string> Versions { get; } = new(StringComparer.Ordinal);
+    public string? SpineSource { get; private set; }
     readonly Dictionary<string, JsonElement> catalog;
     readonly JsonElement[] scriptMap;
 
@@ -62,16 +63,36 @@ sealed class Packages
         if (options.Upm == "none") return;
         bool automatic = options.Upm == "auto";
         var input = model.Assemblies.Select(a => a.AssemblyName).ToHashSet();
-        string[] selected = automatic ? catalog.Where(p => !Modified(p.Value) && p.Value.GetProperty("assemblies").EnumerateArray().Any(a => input.Contains(a.GetString()!))).Select(p => p.Key).ToArray()
+        var sources = SourcePackages.Embedded.ToDictionary(p => p.Name);
+        var burstFields = model.Assemblies.Where(a => a.AssemblyName == "Unity.Collections").SelectMany(a => a.Types)
+            .Where(t => t.Name.EndsWith("$BurstDirectCall", StringComparison.Ordinal)).SelectMany(t => t.Fields);
+        bool collectionsBurstFields = burstFields.Any(f => f.Name == "DeferredCompilation" && f.Type is DefinitionRef { Definition.FullName: "System.IntPtr" }
+            && (f.Attributes & System.Reflection.FieldAttributes.FieldAccessMask) == System.Reflection.FieldAttributes.Private);
+        string[] selected = automatic ? catalog.Where(p => !Modified(p.Key, p.Value, collectionsBurstFields) && p.Value.GetProperty("assemblies").EnumerateArray().Any(a => input.Contains(a.GetString()!))).Select(p => p.Key)
+            .Concat(sources.Values.Where(p => input.Contains(p.Assembly)).Select(p => p.Name)).ToArray()
             : options.Upm.Split(',', StringSplitOptions.TrimEntries | StringSplitOptions.RemoveEmptyEntries);
         foreach (string name in selected)
-            if (!catalog.ContainsKey(name) || Modified(catalog[name])) throw new ArgumentException($"没有适配的原版包：{name}");
+            if (!sources.ContainsKey(name) && (!catalog.TryGetValue(name, out var known) || Modified(name, known, collectionsBurstFields))) throw new ArgumentException($"没有适配的原版包：{name}");
         using HttpClient client = new() { Timeout = TimeSpan.FromMinutes(3) };
+        if (options.Full && automatic && input.Contains("spine-csharp"))
+        {
+            var spine = SourcePackages.Spine;
+            string directory = Path.Join(output.Root, ".resekai", "packages", spine.Name + "@" + spine.Version);
+            try
+            {
+                await spine.Fetch(client, directory);
+                SpineSource = directory;
+            }
+            catch (Exception error) when (error is HttpRequestException or TaskCanceledException or InvalidDataException)
+            {
+                output.Note("UPM", spine.Name, $"Spine 上游源码不可用：{error.Message}");
+            }
+        }
         Dictionary<string, string> available = [];
         foreach (string root in selected.Order(StringComparer.Ordinal))
         {
             Dictionary<string, string> closure = [];
-            try { await Resolve(root, catalog[root].GetProperty("version").GetString()!, closure); }
+            try { await Resolve(root, sources.TryGetValue(root, out var upstream) ? upstream.Version : catalog[root].GetProperty("version").GetString()!, closure); }
             catch (Exception error) when (automatic && error is HttpRequestException or TaskCanceledException or InvalidDataException or DirectoryNotFoundException)
             {
                 output.Note("UPM", root, $"改为自行生成代码：{error.Message}");
@@ -85,6 +106,7 @@ sealed class Packages
         foreach (var pair in Versions.OrderBy(p => p.Key, StringComparer.Ordinal))
         {
             string source = available[pair.Key + "@" + pair.Value];
+            if (sources.TryGetValue(pair.Key, out var upstream)) RegisterSourceScripts(model, upstream, source);
             foreach (string file in Directory.EnumerateFiles(source, "*", SearchOption.AllDirectories).Order(StringComparer.Ordinal))
             {
                 string relative = Path.GetRelativePath(source, file).Replace('\\', '/');
@@ -131,10 +153,12 @@ sealed class Packages
         async Task Resolve(string name, string version, Dictionary<string, string> closure)
         {
             if (name.StartsWith("com.unity.modules.", StringComparison.Ordinal)) return;
-            if (!Regex.IsMatch(name, @"^com\.unity\.[a-z0-9.-]+$") || !Regex.IsMatch(version, @"^[0-9][a-zA-Z0-9.+-]*$")) throw new InvalidDataException($"未支持的包依赖：{name}@{version}");
+            sources.TryGetValue(name, out var upstream);
+            if ((upstream is null && !Regex.IsMatch(name, @"^com\.unity\.[a-z0-9.-]+$")) || !Regex.IsMatch(version, @"^[0-9][a-zA-Z0-9.+-]*$"))
+                throw new InvalidDataException($"未支持的包依赖：{name}@{version}");
             if (catalog.TryGetValue(name, out var known))
             {
-                if (Modified(known)) throw new InvalidDataException($"依赖 {name} 包含游戏修改，不能用原版替换");
+                if (Modified(name, known, collectionsBurstFields)) throw new InvalidDataException($"依赖 {name} 包含游戏修改，不能用原版替换");
                 version = known.GetProperty("version").GetString()!;
             }
             if (Versions.TryGetValue(name, out var installed)) version = Higher(installed, version);
@@ -151,7 +175,14 @@ sealed class Packages
                 string? editor = EditorPath();
                 string? builtin = editor is null ? null : Path.Join(Path.GetDirectoryName(editor), "Data", "Resources", "PackageManager", "BuiltInPackages", name);
                 string cached = Path.Join(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "Unity", "cache", "packages", "packages.unity.com", key);
-                if (builtin is not null && File.Exists(Path.Join(builtin, "package.json"))) directory = builtin;
+                string? cache = Environment.GetEnvironmentVariable("RESEKAI_PACKAGE_CACHE");
+                if (upstream is not null)
+                {
+                    Console.WriteLine($"下载源码包 {name}@{version}");
+                    await upstream.Fetch(client, directory);
+                }
+                else if (!string.IsNullOrEmpty(cache) && File.Exists(Path.Join(cache, key, "package.json"))) directory = Path.Join(cache, key);
+                else if (builtin is not null && File.Exists(Path.Join(builtin, "package.json"))) directory = builtin;
                 else if (File.Exists(Path.Join(cached, "package.json"))) directory = cached;
                 else
                 {
@@ -181,7 +212,37 @@ sealed class Packages
         }
     }
 
-    static bool Modified(JsonElement package) => package.GetProperty("embedded").GetBoolean() || package.GetProperty("missingFields").GetInt32() != 0;
+    static bool Modified(string name, JsonElement package, bool collectionsBurstFields)
+    {
+        int missingFields = package.GetProperty("missingFields").GetInt32();
+        // 此目录版本的额外字段来自 Burst IL 后处理，Collections 的托管调用接口保持一致。
+        return package.GetProperty("embedded").GetBoolean() || missingFields != 0
+            && !(collectionsBurstFields && name == "com.unity.collections" && package.GetProperty("version").GetString() == "1.5.2"
+                && package.GetProperty("missingTypes").GetInt32() == 0 && missingFields == 1);
+    }
+
+    void RegisterSourceScripts(ProgramModel model, SourcePackages package, string directory)
+    {
+        var scriptTypes = model.Assemblies.Where(a => a.AssemblyName == package.Assembly)
+            .SelectMany(a => a.Types).Where(t => t.DeclaringType is null && IsScript(t))
+            .ToLookup(t => t.SimpleName, StringComparer.Ordinal);
+        foreach (string meta in Directory.EnumerateFiles(directory, "*.cs.meta", SearchOption.AllDirectories))
+        {
+            var candidates = scriptTypes[Path.GetFileNameWithoutExtension(Path.GetFileNameWithoutExtension(meta))];
+            if (!candidates.Any()) continue;
+            string source = File.ReadAllText(meta[..^5]);
+            var guid = Regex.Match(File.ReadAllText(meta), @"(?m)^guid: ([0-9a-f]{32})").Groups[1].Value;
+            if (guid.Length == 0) continue;
+            foreach (var type in candidates.Where(t => t.Namespace.Length == 0 || Regex.IsMatch(source, @"\bnamespace\s+" + Regex.Escape(t.Namespace) + @"\s*[{;]")))
+                Scripts.Add(new ScriptName(package.Assembly, type.Namespace, type.Name).Key, (guid, 11500000));
+        }
+        static bool IsScript(TypeDef type)
+        {
+            for (TypeRef? current = type.BaseType; current is DefinitionRef d; current = d.Definition.BaseType)
+                if (d.Definition.FullName is "UnityEngine.MonoBehaviour" or "UnityEngine.ScriptableObject") return true;
+            return false;
+        }
+    }
 
     // versionDefines 只识别包身份；自行生成的运行时程序集同样提供该能力。
     // Editor 集成需要 APK 中不存在的编辑器程序集，不在这里启用。
