@@ -79,6 +79,7 @@ public sealed partial class MethodDecompiler
         if (finished.TryGetValue(request, out var known)) return known;
         var before = cuts;
         var result = Declaration(method, entry) ?? PlatformInvoke(method, entry)
+            ?? RestorePackedFlag(method, entry)
             ?? RestoreHammersley(method, entry) ?? RestoreUrpInsertionSort(method, entry)
             ?? RestoreUrpPackageMethod(method, entry) ?? Run(method, entry);
         if (cuts == before) finished.TryAdd(request, result);
