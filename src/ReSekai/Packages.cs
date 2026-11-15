@@ -15,6 +15,7 @@ sealed class Packages
     public Dictionary<string, string> Shaders { get; } = [];
     public Dictionary<string, string> Versions { get; } = new(StringComparer.Ordinal);
     public string? SpineSource { get; private set; }
+    public CubismRuntime? Cubism { get; private set; }
     readonly Dictionary<string, JsonElement> catalog;
     readonly JsonElement[] scriptMap;
 
@@ -62,6 +63,7 @@ sealed class Packages
     {
         if (options.Upm == "none") return;
         bool automatic = options.Upm == "auto";
+        var cubism = SourcePackages.Cubism;
         var input = model.Assemblies.Select(a => a.AssemblyName).ToHashSet();
         var sources = SourcePackages.Embedded.ToDictionary(p => p.Name);
         var burstFields = model.Assemblies.Where(a => a.AssemblyName == "Unity.Collections").SelectMany(a => a.Types)
@@ -72,8 +74,26 @@ sealed class Packages
             .Concat(sources.Values.Where(p => input.Contains(p.Assembly)).Select(p => p.Name)).ToArray()
             : options.Upm.Split(',', StringSplitOptions.TrimEntries | StringSplitOptions.RemoveEmptyEntries);
         foreach (string name in selected)
-            if (!sources.ContainsKey(name) && (!catalog.TryGetValue(name, out var known) || Modified(name, known, collectionsBurstFields))) throw new ArgumentException($"没有适配的原版包：{name}");
+            if (name != cubism.Name && !sources.ContainsKey(name) && (!catalog.TryGetValue(name, out var known) || Modified(name, known, collectionsBurstFields))) throw new ArgumentException($"没有适配的原版包：{name}");
         using HttpClient client = new() { Timeout = TimeSpan.FromMinutes(3) };
+        bool cubismRequested = selected.Contains(cubism.Name);
+        bool hasCubism = model.Assemblies.Where(a => a.AssemblyName == cubism.Assembly).SelectMany(a => a.Types)
+            .Any(t => t.FullName == "Live2D.Cubism.Core.Unmanaged.CubismCoreDll");
+        if (cubismRequested && (!options.Full || !hasCubism))
+            throw new ArgumentException($"{cubism.Name} 需要包含 Live2D 的 APK 和 --scripts full");
+        if (options.Full && hasCubism && (automatic || cubismRequested))
+        {
+            string directory = Path.Join(output.Root, ".resekai", "packages", cubism.Name + "@" + cubism.Version);
+            try
+            {
+                Console.WriteLine($"准备 {cubism.Name}@{cubism.Version} 和 Purism Core 1.1.0");
+                Cubism = await CubismRuntime.Fetch(client, directory);
+            }
+            catch (Exception error) when (automatic && error is HttpRequestException or TaskCanceledException or InvalidDataException)
+            {
+                output.Note("UPM", cubism.Name, $"Cubism 上游 SDK 不可用：{error.Message}", true);
+            }
+        }
         if (options.Full && automatic && input.Contains("spine-csharp"))
         {
             var spine = SourcePackages.Spine;
@@ -89,7 +109,7 @@ sealed class Packages
             }
         }
         Dictionary<string, string> available = [];
-        foreach (string root in selected.Order(StringComparer.Ordinal))
+        foreach (string root in selected.Where(name => name != cubism.Name).Order(StringComparer.Ordinal))
         {
             Dictionary<string, string> closure = [];
             try { await Resolve(root, sources.TryGetValue(root, out var upstream) ? upstream.Version : catalog[root].GetProperty("version").GetString()!, closure); }
@@ -236,12 +256,13 @@ sealed class Packages
             foreach (var type in candidates.Where(t => t.Namespace.Length == 0 || Regex.IsMatch(source, @"\bnamespace\s+" + Regex.Escape(t.Namespace) + @"\s*[{;]")))
                 Scripts.Add(new ScriptName(package.Assembly, type.Namespace, type.Name).Key, (guid, 11500000));
         }
-        static bool IsScript(TypeDef type)
-        {
-            for (TypeRef? current = type.BaseType; current is DefinitionRef d; current = d.Definition.BaseType)
-                if (d.Definition.FullName is "UnityEngine.MonoBehaviour" or "UnityEngine.ScriptableObject") return true;
-            return false;
-        }
+    }
+
+    internal static bool IsScript(TypeDef type)
+    {
+        for (TypeRef? current = type.BaseType; current is DefinitionRef d; current = d.Definition.BaseType)
+            if (d.Definition.FullName is "UnityEngine.MonoBehaviour" or "UnityEngine.ScriptableObject") return true;
+        return false;
     }
 
     // versionDefines 只识别包身份；自行生成的运行时程序集同样提供该能力。

@@ -95,9 +95,17 @@ sealed class Scripts(ProgramModel model, Packages packages, Output output)
             string folder = assembly.AssemblyName == "Assembly-CSharp-firstpass" ? "Assets/Plugins/Assembly-CSharp-firstpass" : "Assets/Scripts/" + Output.Safe(assembly.AssemblyName);
             var types = assembly.Types.Where(t => t.DeclaringType is null).GroupBy(t => $"{(t.Namespace.Length == 0 ? "" : Output.Safe(t.Namespace) + "/")}{Output.Safe(t.SimpleName)}.cs", StringComparer.OrdinalIgnoreCase)
                 .ToDictionary(g => g.Key, g => g.ToArray(), StringComparer.OrdinalIgnoreCase);
-            foreach (string source in Directory.EnumerateFiles(from, "*.cs", SearchOption.AllDirectories).Order(StringComparer.Ordinal))
+            var cubism = assembly.AssemblyName == SourcePackages.Cubism.Assembly ? packages.Cubism : null;
+            var (upstream, replaced) = cubism is null ? (new Dictionary<string, string>(), new HashSet<string>()) : cubism.Plan(types);
+            if (cubism is not null)
             {
-                string relative = Path.GetRelativePath(from, source).Replace('\\', '/');
+                cubism.Write(output, folder);
+                output.AssemblySources[assembly.AssemblyName] = $"反编译 + Cubism Unity SDK {SourcePackages.Cubism.Version} + Purism Core 1.1.0 v5";
+            }
+            var generated = Directory.EnumerateFiles(from, "*.cs", SearchOption.AllDirectories)
+                .ToDictionary(path => Path.GetRelativePath(from, path).Replace('\\', '/'), StringComparer.OrdinalIgnoreCase);
+            foreach (string relative in generated.Keys.Where(path => !replaced.Contains(path)).Concat(upstream.Keys).Order(StringComparer.Ordinal))
+            {
                 if (relative.StartsWith("references/", StringComparison.Ordinal) || relative == "Properties/StrippedAttributes.cs") continue;
                 TypeDef[] declared = types.GetValueOrDefault(relative) ?? [];
                 if (declared.Length > 0 && declared.All(t => t.CustomAttributes.HasAttribute("Microsoft.CodeAnalysis.EmbeddedAttribute") || t.CustomAttributes.HasAttribute("System.CodeDom.Compiler.GeneratedCodeAttribute"))) continue;
@@ -105,7 +113,7 @@ sealed class Scripts(ProgramModel model, Packages packages, Output output)
                 string path = folder + "/" + safe;
                 string guid = Output.Guid("source:" + assembly.AssemblyName + "/" + relative);
                 foreach (var type in declared) targets[new ScriptName(assembly.AssemblyName, type.Namespace, type.Name).Key] = guid;
-                string code = File.ReadAllText(source);
+                string code = upstream.TryGetValue(relative, out string? upstreamCode) ? upstreamCode : File.ReadAllText(generated[relative]);
                 if (full && assembly.AssemblyName == "spine-csharp" && relative == "Spine/SequenceTimeline.cs"
                     && packages.SpineSource is { } spine && code.Contains("base._002Ector(frameCount, array);", StringComparison.Ordinal))
                 {
