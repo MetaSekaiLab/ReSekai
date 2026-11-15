@@ -47,7 +47,8 @@ sealed class Yaml(Func<Value?, string> reference)
     readonly StringBuilder text = new("%YAML 1.1\n%TAG !u! tag:unity3d.com,2011:\n");
     public void Document(int classId, long id, Schema schema, Value value, bool settings = false)
     {
-        text.Append($"--- !u!{classId} &{id}\n{schema.Type}:\n");
+        // ProjectSettings 的单例以 &1 标识，Player 对象的 PathID 与此无关。
+        text.Append($"--- !u!{classId} &{(settings ? 1 : id)}\n{schema.Type}:\n");
         Body(schema, value, 2, "", settings);
     }
     public override string ToString() => text.ToString();

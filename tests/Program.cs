@@ -22,6 +22,12 @@ var reader = new Binary([0, 1, 0, 0, 0, 0, 0, 0], offset: 1);
 Value.Read(new Schema("UInt8", "flag", 1, 0x4000), reader);
 Assert(reader.Position == 4, "必须按文件位置对齐");
 Assert(Output.Safe("CON.txt") == "_CON.txt", "Windows 保留名");
+var settingsSchema = new Schema("GraphicsSettings", "Base");
+Yaml settingsYaml = new(_ => "{fileID: 0}");
+settingsYaml.Document(30, 7, settingsSchema, new Value(settingsSchema, null), settings: true);
+settingsYaml.Document(30, 7, settingsSchema, new Value(settingsSchema, null));
+Assert(settingsYaml.ToString().Contains("--- !u!30 &1\nGraphicsSettings:")
+    && settingsYaml.ToString().Contains("--- !u!30 &7\nGraphicsSettings:"), "项目设置与普通资源使用各自的对象编号");
 var prefab = new Document("player", 1, 1, Output.Guid("prefab"), [1, 2, 3, 4, long.MinValue]) { Prefab = true };
 var reordered = new Document("player", 1, 1, prefab.Guid, prefab.Objects.Reverse().ToArray()) { Prefab = true };
 prefab.MapPrefabFileIds();
