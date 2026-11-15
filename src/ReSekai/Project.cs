@@ -1,3 +1,4 @@
+using System.Globalization;
 using System.Text.RegularExpressions;
 
 namespace ReSekai;
@@ -13,7 +14,8 @@ sealed class Document(string file, long main, int classId, string guid, long[] o
     public TextureGroup? Texture { get; set; }
     public Dictionary<long, long> FileIds { get; } = [];
     public string Path { get; set; } = "";
-    public bool Scene { get; init; }
+    public int? SceneIndex { get; init; }
+    public bool Scene => SceneIndex.HasValue;
     public bool Settings { get; init; }
     public bool Prefab { get; init; }
     public bool Imported => Texture is not null || ClassId is 49 or 48 or 72 or 128 or 83;
@@ -56,6 +58,7 @@ sealed class Project(Output output, Scripts scripts, ScriptLayout layouts, Packa
     readonly HashSet<ObjectId> emptyTextures = [];
     readonly Dictionary<ObjectId, Value> sprites = [];
     string[] tags = [];
+    string[] scenePaths = [];
     static readonly Dictionary<int, string> SettingsNames = new()
     {
         [5] = "TimeManager", [11] = "AudioManager", [13] = "InputManager", [19] = "Physics2DSettings", [30] = "GraphicsSettings", [47] = "QualitySettings",
@@ -69,6 +72,8 @@ sealed class Project(Output output, Scripts scripts, ScriptLayout layouts, Packa
         Animations.Scan(batch);
         foreach (var file in batch)
         {
+            if (file.Name == "globalgamemanagers" && file.Objects.FirstOrDefault(i => file.Types[i.Type].ClassId == 141) is { } settings)
+                scenePaths = file.Read(settings)["scenes"].Items.Select(scene => scene.Text.Replace('\\', '/')).ToArray();
             if (file.Name is not ("unity_builtin_extra" or "unity default resources"))
             foreach (var item in file.Objects.Where(i => file.Types[i.Type].ClassId is 28 or 213))
             {
@@ -133,8 +138,21 @@ sealed class Project(Output output, Scripts scripts, ScriptLayout layouts, Packa
                     documents.Add(new(file.Name, item.Id, cls, Output.Guid("settings:" + cls), [item.Id]) { Settings = true, Path = "ProjectSettings/" + SettingsNames[cls] + ".asset" });
                 }
             }
-            else if (Regex.IsMatch(file.Name, @"^level\d+$"))
-                documents.Add(new(file.Name, objects[0].Id, file.Types[objects[0].Type].ClassId, Output.Guid("scene:" + file.Name), objects.Select(i => i.Id).ToArray()) { Scene = true, Path = "Assets/Scenes/" + file.Name + ".unity" });
+            else if (file.Name.StartsWith("level", StringComparison.Ordinal)
+                && int.TryParse(file.Name.AsSpan(5), NumberStyles.None, CultureInfo.InvariantCulture, out int sceneIndex))
+            {
+                string path = $"Assets/Scenes/{file.Name}.unity";
+                if (sceneIndex < scenePaths.Length && scenePaths[sceneIndex] is string original
+                    && original.StartsWith("Assets/", StringComparison.Ordinal) && original.EndsWith(".unity", StringComparison.OrdinalIgnoreCase))
+                    path = Canonical(original);
+                string guid = Output.Guid("scene:" + file.Name);
+                if (!usedPaths.Add(path))
+                {
+                    path = $"Assets/Scenes/{file.Name}_{guid[..8]}.unity";
+                    if (!usedPaths.Add(path)) throw new InvalidDataException($"场景路径重复：{path}");
+                }
+                documents.Add(new(file.Name, objects[0].Id, file.Types[objects[0].Type].ClassId, guid, objects.Select(i => i.Id).ToArray()) { SceneIndex = sceneIndex, Path = path });
+            }
             else if (Regex.IsMatch(file.Name, @"^[0-9a-f]{32}$") && objects.Length > 0)
             {
                 bool prefab = objects.Any(i => file.Types[i.Type].ClassId == 1);

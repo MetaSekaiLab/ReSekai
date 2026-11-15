@@ -88,8 +88,8 @@ static class Export
             }
             output.Write("ProjectSettings/ProjectVersion.txt", $"m_EditorVersion: {Schemas.Version}\n");
             output.Write("ProjectSettings/EditorSettings.asset", "%YAML 1.1\n%TAG !u! tag:unity3d.com,2011:\n--- !u!159 &1\nEditorSettings:\n  m_ObjectHideFlags: 0\n  serializedVersion: 12\n  m_SerializationMode: 2\n  m_SpritePackerMode: 4\n");
-            string scenes = string.Join("", project.Documents.Values.SelectMany(v => v).Where(d => d.Scene).OrderBy(d => d.Path, StringComparer.Ordinal)
-                .Select(d => $"  - enabled: 1\n    path: {d.Path}\n    guid: {d.Guid}\n"));
+            string scenes = string.Join("", project.Documents.Values.SelectMany(v => v).Where(d => d.Scene).OrderBy(d => d.SceneIndex)
+                .Select(d => $"  - enabled: 1\n    path: {Yaml.Quote(d.Path)}\n    guid: {d.Guid}\n"));
             output.Write("ProjectSettings/EditorBuildSettings.asset", "%YAML 1.1\n%TAG !u! tag:unity3d.com,2011:\n--- !u!1045 &1\nEditorBuildSettings:\n  m_ObjectHideFlags: 0\n  serializedVersion: 2\n  m_Scenes:\n" + scenes + "  m_configObjects: {}\n");
             output.Write("Packages/manifest.json", JsonSerializer.Serialize(new { dependencies = model.Assemblies.Where(a => a.AssemblyName.StartsWith("UnityEngine.", StringComparison.Ordinal) && a.AssemblyName.EndsWith("Module", StringComparison.Ordinal))
                 .Select(a => a.AssemblyName[12..^6].ToLowerInvariant()).Where(ModuleNames.Contains).Distinct().Order(StringComparer.Ordinal).ToDictionary(n => "com.unity.modules." + n, _ => "1.0.0") }, new JsonSerializerOptions { WriteIndented = true }));
