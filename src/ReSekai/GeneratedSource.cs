@@ -32,6 +32,45 @@ static class GeneratedSource
             match.Groups[1].Value + $"#if {CriWareSdk.Windows}\n\t\tplaybackTimeMs = debugAudioSyncedTime = playback.GetTimeSyncedWithAudio();\n#else\n" +
             match.Groups[2].Value + "#endif\n" + match.Groups[3].Value, "AudioSyncedUnityTimer.Execute");
 
+    public static string EditorRenderCleanup(string source) => ReplaceOnce(source.ReplaceLineEndings("\n"),
+        @"(?m)^(\t\tpublic static void Destroy\(global::UnityEngine.Object obj\)\n\t\t\{\n\t\t\tif \(obj != null\)\n\t\t\t\{\n)(\t\t\t\tglobal::UnityEngine.Object.Destroy\(obj\);)$",
+        match => match.Groups[1].Value + """
+        #if UNITY_EDITOR
+                        if (!global::UnityEngine.Application.isPlaying)
+                        {
+                            global::UnityEngine.Object.DestroyImmediate(obj);
+                            return;
+                        }
+        #endif
+
+        """ + match.Groups[2].Value, "CoreUtils.Destroy");
+
+    public static string EditorDirectTitle(string source) => ReplaceOnce(source.ReplaceLineEndings("\n"),
+        @"(?m)^\t\tprotected override void Awake\(\)\n\t\t\{\n",
+        match => match.Value + "#if UNITY_EDITOR\n\t\t\tSekaiSingletonManager.RegisterFormatters();\n#endif\n", "TitleController.Awake");
+
+    public static string RegisterFormatters(string source) => ReplaceOnce(source.ReplaceLineEndings("\n"),
+        @"(?m)^(\t\tpublic override void OnInitialize\(\)\n\t\t\{\n)(\t\t\tglobal::MessagePack.Resolvers.CompositeResolver.RegisterAndSetAsDefault\([^\n]+\);)$",
+        match => "\t\tinternal static void RegisterFormatters()\n\t\t{\n"
+            + "\t\t\tif (ReferenceEquals(global::MessagePack.MessagePackSerializer.DefaultResolver, global::MessagePack.Resolvers.CompositeResolver.Instance)) return;\n"
+            + match.Groups[2].Value + "\n\t\t}\n\n" + match.Groups[1].Value + "\t\t\tRegisterFormatters();", "SekaiSingletonManager.OnInitialize");
+
+    public static string WindowsFastAes(string source) => ReplaceOnce(source.ReplaceLineEndings("\n"),
+        @"(?ms)^(\tpublic static IFastAESAlgorithm Create\(\)\n\t\{\n)(.*?)(^\t\})$",
+        match => match.Groups[1].Value + $"#if {CriWareSdk.Windows}\n\t\treturn new FastAESAlgorithmDotnet();\n#else\n"
+            + match.Groups[2].Value + "#endif\n" + match.Groups[3].Value, "FastAESAlgorithmFactory.Create");
+
+    public static string MagicaClothPostProcess(string source) => ReplaceOnce(source.ReplaceLineEndings("\n"),
+        @"(?ms)^(\t\tinternal struct PostProcessTeamDataJob\b.*?^\t\t\})$",
+        match => match.Value
+            .Replace("void* unsafeBufferPointerWithoutChecks = global::Unity.Collections.LowLevel.Unsafe.NativeArrayUnsafeUtility.GetUnsafeBufferPointerWithoutChecks(teamData);",
+                "ref TeamData team = ref global::Unity.Collections.LowLevel.Unsafe.UnsafeUtility.ArrayElementAsRef<TeamData>(global::Unity.Collections.LowLevel.Unsafe.NativeArrayUnsafeUtility.GetUnsafeBufferPointerWithoutChecks(teamData), index);", StringComparison.Ordinal)
+            .Replace("((TeamData*)((byte*)unsafeBufferPointerWithoutChecks + index * (uint)sizeof(TeamData)))->", "team.", StringComparison.Ordinal)
+            .Replace("void* unsafeBufferPointerWithoutChecks2 = global::Unity.Collections.LowLevel.Unsafe.NativeArrayUnsafeUtility.GetUnsafeBufferPointerWithoutChecks(teamWorldInfluenceList);",
+                "ref WorldInfluence influence = ref global::Unity.Collections.LowLevel.Unsafe.UnsafeUtility.ArrayElementAsRef<WorldInfluence>(global::Unity.Collections.LowLevel.Unsafe.NativeArrayUnsafeUtility.GetUnsafeBufferPointerWithoutChecks(teamWorldInfluenceList), index);", StringComparison.Ordinal)
+            .Replace("((WorldInfluence*)((byte*)unsafeBufferPointerWithoutChecks2 + index * (uint)sizeof(WorldInfluence)))->", "influence.", StringComparison.Ordinal),
+        "PostProcessTeamDataJob.Execute");
+
     static string ReplaceOnce(string source, string pattern, MatchEvaluator replacement, string method)
     {
         var matches = Regex.Matches(source, pattern, RegexOptions.CultureInvariant);

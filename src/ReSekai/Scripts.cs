@@ -135,6 +135,16 @@ sealed class Scripts(ProgramModel model, Packages packages, Output output)
                 }
                 if (full && assembly.AssemblyName == "MagicaCloth" && relative == "MagicaCloth/BaseCloth.cs")
                     code = GeneratedSource.MagicaClothCulling(code);
+                if (full && assembly.AssemblyName == "MagicaCloth" && relative == "MagicaCloth/PhysicsManagerTeamData.cs")
+                    code = GeneratedSource.MagicaClothPostProcess(code);
+                if (full && assembly.AssemblyName == "Unity.RenderPipelines.Core.Runtime" && relative == "UnityEngine.Rendering/CoreUtils.cs")
+                    code = GeneratedSource.EditorRenderCleanup(code);
+                if (full && assembly.AssemblyName == "Assembly-CSharp" && relative == "Sekai/TitleController.cs")
+                    code = GeneratedSource.EditorDirectTitle(code);
+                if (full && assembly.AssemblyName == "Assembly-CSharp" && relative == "Sekai/SekaiSingletonManager.cs")
+                    code = GeneratedSource.RegisterFormatters(code);
+                if (full && assembly.AssemblyName == "FastAES" && relative == "FastAESAlgorithmFactory.cs")
+                    code = GeneratedSource.WindowsFastAes(code);
                 if (full && assembly.AssemblyName == "uPalette" && relative == "uPalette.Runtime.Core/PaletteStore.cs")
                 {
                     code = GeneratedSource.PaletteEditor(code);
