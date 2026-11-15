@@ -447,7 +447,9 @@ sealed class Project(Output output, Scripts scripts, ScriptLayout layouts, Packa
 
     string Canonical(string path)
     {
-        string[] segments = path.Split('/').Select(Output.Safe).ToArray();
+        string extension = Path.GetExtension(path);
+        string[] segments = (extension.Length == 0 ? path : path[..^extension.Length]).Split('/').Select(Output.Safe).ToArray();
+        segments[^1] += extension;
         for (int i = 1; i < segments.Length - 1; i++)
         {
             string key = string.Join('/', segments.Take(i + 1));

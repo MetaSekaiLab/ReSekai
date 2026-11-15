@@ -143,6 +143,8 @@ sealed class Scripts(ProgramModel model, Packages packages, Output output)
                 if (packages.CriWare is not null && assembly.AssemblyName == "Assembly-CSharp" && relative == "AudioSyncedUnityTimer.cs"
                     && code.Contains("GetTimeAndScaleSyncedWithAudio(", StringComparison.Ordinal))
                     code = GeneratedSource.CriAudioClock(code);
+                if (relative == NativeMathSource.Path)
+                    code = NativeMathSource.ForUnity(code, Path.Join(assemblies, assembly.Name));
                 output.Write(path, code);
                 output.Meta(path, guid, "MonoImporter", "  serializedVersion: 2\n  defaultReferences: []\n  executionOrder: 0\n");
             }
