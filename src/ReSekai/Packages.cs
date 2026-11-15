@@ -16,6 +16,7 @@ sealed class Packages
     public Dictionary<string, string> Versions { get; } = new(StringComparer.Ordinal);
     public string? SpineSource { get; private set; }
     public CubismRuntime? Cubism { get; private set; }
+    public CriWareSdk? CriWare { get; private set; }
     readonly Dictionary<string, JsonElement> catalog;
     readonly JsonElement[] scriptMap;
 
@@ -61,10 +62,16 @@ sealed class Packages
 
     public async Task Prepare(Options options, ProgramModel model, Output output)
     {
+        var input = model.Assemblies.Select(a => a.AssemblyName).ToHashSet();
+        if (options.Full && input.Contains(CriWareSdk.Assembly))
+        {
+            CriWare = CriWareSdk.LoadConfigured();
+            if (CriWare is null)
+                output.Note("原生插件", CriWareSdk.Assembly, "未配置 Windows CRIWARE SDK，使用 RESEKAI_CRIWARE_SDK 指向 SDK ZIP");
+        }
         if (options.Upm == "none") return;
         bool automatic = options.Upm == "auto";
         var cubism = SourcePackages.Cubism;
-        var input = model.Assemblies.Select(a => a.AssemblyName).ToHashSet();
         var sources = SourcePackages.Embedded.ToDictionary(p => p.Name);
         var burstFields = model.Assemblies.Where(a => a.AssemblyName == "Unity.Collections").SelectMany(a => a.Types)
             .Where(t => t.Name.EndsWith("$BurstDirectCall", StringComparison.Ordinal)).SelectMany(t => t.Fields);

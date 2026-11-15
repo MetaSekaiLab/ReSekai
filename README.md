@@ -8,6 +8,7 @@
 - `--scripts stubs|full` 导出空桩或恢复方法体，默认 `stubs`。
 - `--upm auto|none|包名列表` 自动选择 UPM 包、禁用 UPM 或指定包名（逗号分隔），默认 `auto`。
 - 完整导出会随依赖流程接入 Cubism Unity SDK 与 Purism Core Windows x64 插件。手动选包时使用 `com.live2d.cubism`。
+- 含 CRIWARE 的完整导出会保留 APK 的 Android ARM64 原生库。将 `RESEKAI_CRIWARE_SDK` 设为 `criware_sdk_unity_v3_14_00_smartphone_en.zip` 的路径，或把 ZIP 放入 `RESEKAI_PACKAGE_CACHE`，即可同时导出 Windows x64 的配套封装和插件。
 - `--recovered-scripts <目录>` 在完整模式复用同一 APK 已完成的 `.resekai/scripts`，重新导出到空目录。
 
 ## 引用项目

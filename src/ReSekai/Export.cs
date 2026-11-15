@@ -23,6 +23,8 @@ static class Export
             var model = ModelBuilder.Load(Path.Join(work, "libil2cpp.so"), Path.Join(work, "global-metadata.dat")).Model;
             Packages packages = new();
             await packages.Prepare(options, model, output);
+            if (options.Full && model.Assemblies.Any(a => a.AssemblyName == CriWareSdk.Assembly))
+                CriWareSdk.WriteAndroid(apk, output);
             Scripts scripts = new(model, packages, output);
             recovery = scripts.Write(work, options.Full, stagedScripts);
             Project project = new(output, scripts, new(model), packages);

@@ -104,7 +104,17 @@ sealed class Scripts(ProgramModel model, Packages packages, Output output)
             }
             var generated = Directory.EnumerateFiles(from, "*.cs", SearchOption.AllDirectories)
                 .ToDictionary(path => Path.GetRelativePath(from, path).Replace('\\', '/'), StringComparer.OrdinalIgnoreCase);
-            foreach (string relative in generated.Keys.Where(path => !replaced.Contains(path)).Concat(upstream.Keys).Order(StringComparer.Ordinal))
+            var criware = assembly.AssemblyName == CriWareSdk.Assembly ? packages.CriWare : null;
+            var sdkSources = criware?.MatchFiles(generated.Keys.Where(p => !p.StartsWith("references/", StringComparison.Ordinal)));
+            if (criware is not null)
+            {
+                criware.WriteWindows(output);
+                output.AssemblySources[assembly.AssemblyName] = "Windows CRIWARE Unity SDK 2.46.25 + Android 反编译及 APK 原生库";
+            }
+            else if (full && assembly.AssemblyName == CriWareSdk.Assembly)
+                output.AssemblySources[assembly.AssemblyName] = "反编译 + Android APK 原生库";
+            var sdkOnly = sdkSources?.Keys.Where(path => !generated.ContainsKey(path)) ?? [];
+            foreach (string relative in generated.Keys.Where(path => !replaced.Contains(path)).Concat(upstream.Keys).Concat(sdkOnly).Order(StringComparer.Ordinal))
             {
                 if (relative.StartsWith("references/", StringComparison.Ordinal) || relative == "Properties/StrippedAttributes.cs") continue;
                 TypeDef[] declared = types.GetValueOrDefault(relative) ?? [];
@@ -113,7 +123,9 @@ sealed class Scripts(ProgramModel model, Packages packages, Output output)
                 string path = folder + "/" + safe;
                 string guid = Output.Guid("source:" + assembly.AssemblyName + "/" + relative);
                 foreach (var type in declared) targets[new ScriptName(assembly.AssemblyName, type.Namespace, type.Name).Key] = guid;
-                string code = upstream.TryGetValue(relative, out string? upstreamCode) ? upstreamCode : File.ReadAllText(generated[relative]);
+                string? recovered = generated.TryGetValue(relative, out string? file) ? File.ReadAllText(file) : null;
+                string code = sdkSources is null ? upstream.GetValueOrDefault(relative) ?? recovered!
+                    : CriWareSdk.PlatformSource(relative, recovered, sdkSources.GetValueOrDefault(relative));
                 if (full && assembly.AssemblyName == "spine-csharp" && relative == "Spine/SequenceTimeline.cs"
                     && packages.SpineSource is { } spine && code.Contains("base._002Ector(frameCount, array);", StringComparison.Ordinal))
                 {
@@ -123,6 +135,14 @@ sealed class Scripts(ProgramModel model, Packages packages, Output output)
                 }
                 if (full && assembly.AssemblyName == "MagicaCloth" && relative == "MagicaCloth/BaseCloth.cs")
                     code = GeneratedSource.MagicaClothCulling(code);
+                if (full && assembly.AssemblyName == "uPalette" && relative == "uPalette.Runtime.Core/PaletteStore.cs")
+                {
+                    code = GeneratedSource.PaletteEditor(code);
+                    output.AssemblySources[assembly.AssemblyName] = "反编译 + Editor 调色板加载";
+                }
+                if (packages.CriWare is not null && assembly.AssemblyName == "Assembly-CSharp" && relative == "AudioSyncedUnityTimer.cs"
+                    && code.Contains("GetTimeAndScaleSyncedWithAudio(", StringComparison.Ordinal))
+                    code = GeneratedSource.CriAudioClock(code);
                 output.Write(path, code);
                 output.Meta(path, guid, "MonoImporter", "  serializedVersion: 2\n  defaultReferences: []\n  executionOrder: 0\n");
             }
@@ -135,7 +155,15 @@ sealed class Scripts(ProgramModel model, Packages packages, Output output)
                 references = references.Where(r => !Predefined(r)).ToArray();
             }
             string asmdef = folder + "/" + Output.Safe(assembly.AssemblyName) + ".asmdef";
-            output.Write(asmdef, JsonSerializer.Serialize(new { name = assembly.AssemblyName, references, allowUnsafeCode = true }, new JsonSerializerOptions { WriteIndented = true }));
+            var jsonOptions = new JsonSerializerOptions { WriteIndented = true };
+            if (criware is null)
+                output.Write(asmdef, JsonSerializer.Serialize(new { name = assembly.AssemblyName, references, allowUnsafeCode = true }, jsonOptions));
+            else
+            {
+                if (available.Contains("Unity.Profiling.Core"))
+                    references = references.Append("Unity.Profiling.Core").Distinct(StringComparer.Ordinal).Order(StringComparer.Ordinal).ToArray();
+                output.Write(asmdef, JsonSerializer.Serialize(new { name = assembly.AssemblyName, references, allowUnsafeCode = true, versionDefines = criware.VersionDefines }, jsonOptions));
+            }
             output.Meta(asmdef, Output.Guid("assembly:" + assembly.AssemblyName), "AssemblyDefinitionImporter");
         }
         return result;

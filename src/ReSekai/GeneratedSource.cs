@@ -4,6 +4,42 @@ namespace ReSekai;
 
 static class GeneratedSource
 {
+    public static string PaletteEditor(string source)
+    {
+        source = source.ReplaceLineEndings("\n");
+        source = ReplaceOnce(source, @"(?m)^(\s*)_instance = (?:global::UnityEngine\.)?ScriptableObject\.CreateInstance<PaletteStore>\(\);$", match =>
+            "#if UNITY_EDITOR\n" + match.Groups[1].Value + "_instance = LoadEditorAsset();\n#else\n" + match.Value + "\n#endif", "PaletteStore.Instance");
+        return ReplaceOnce(source, @"(?m)^(\t\tprivate void OnEnable\(\)\n\t\t\{\n)(\t\t\t_instance = this;\n)(\t\t\})$", match =>
+            match.Groups[1].Value + "#if !UNITY_EDITOR\n" + match.Groups[2].Value + "#endif\n" + match.Groups[3].Value + "\n\n" +
+            """
+            #if UNITY_EDITOR
+                private static PaletteStore LoadEditorAsset()
+                {
+                    foreach (string guid in global::UnityEditor.AssetDatabase.FindAssets("t:PaletteStore", new[] { "Assets" }))
+                    {
+                        string path = global::UnityEditor.AssetDatabase.GUIDToAssetPath(guid);
+                        var store = global::UnityEditor.AssetDatabase.LoadAssetAtPath<PaletteStore>(path);
+                        if (store != null) return store;
+                    }
+                    return null;
+                }
+            #endif
+            """, "PaletteStore.OnEnable");
+    }
+
+    public static string CriAudioClock(string source) => ReplaceOnce(source.ReplaceLineEndings("\n"),
+        @"(?ms)^(\tpublic void Execute\(float unityTime\)\n\t\{\n)(.*?)(^\t\})", match =>
+            match.Groups[1].Value + $"#if {CriWareSdk.Windows}\n\t\tplaybackTimeMs = debugAudioSyncedTime = playback.GetTimeSyncedWithAudio();\n#else\n" +
+            match.Groups[2].Value + "#endif\n" + match.Groups[3].Value, "AudioSyncedUnityTimer.Execute");
+
+    static string ReplaceOnce(string source, string pattern, MatchEvaluator replacement, string method)
+    {
+        var matches = Regex.Matches(source, pattern, RegexOptions.CultureInvariant);
+        if (matches.Count != 1) throw new InvalidDataException($"导出适配无法匹配 {method}");
+        Match match = matches[0];
+        return source[..match.Index] + replacement(match) + source[(match.Index + match.Length)..];
+    }
+
     public static string MagicaClothCulling(string source)
     {
         // 空列表直接可见，非空列表遍历到第一个可见 Renderer，两个分支在更新状态前汇合。
