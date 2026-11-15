@@ -195,6 +195,13 @@ sealed class Project(Output output, Scripts scripts, ScriptLayout layouts, Packa
                     foreach (var child in children.Where(c => c.Id != main.Id)) Add(child, [child], Output.Guid(file.Name + ":" + child.Id), false);
                     children = [main];
                 }
+                // Player 的 Shader 子资源也要交给 ShaderImporter 重建。
+                if (children.Any(c => c.Id != main.Id && file.Types[c.Type].ClassId == 48))
+                {
+                    foreach (var child in children.Where(c => c.Id != main.Id && file.Types[c.Type].ClassId == 48))
+                        Add(child, [child], Output.Guid(file.Name + ":" + child.Id), false);
+                    children = children.Where(c => c.Id == main.Id || file.Types[c.Type].ClassId != 48).ToArray();
+                }
                 if (cls is 28 or 213 && children.Any(c => file.Types[c.Type].ClassId is not (28 or 213)))
                 {
                     foreach (var child in children.Where(c => file.Types[c.Type].ClassId is not (28 or 213))) Add(child, [child], Output.Guid(file.Name + ":" + child.Id), false);
@@ -211,7 +218,12 @@ sealed class Project(Output output, Scripts scripts, ScriptLayout layouts, Packa
                     var basic = Value.Read(Schemas.Classes[114].Player!, file.Open(main));
                     name = basic.Find("m_Name")?.Text ?? "MonoBehaviour";
                 }
-                else name = file.Read(main).Find("m_Name")?.Text ?? Schemas.Classes.GetValueOrDefault(cls)?.Name ?? "Object";
+                else
+                {
+                    Value asset = file.Read(main);
+                    var shaderName = cls == 48 ? asset.Find("m_ParsedForm")?.Find("m_Name")?.Text : null;
+                    name = shaderName ?? asset.Find("m_Name")?.Text ?? Schemas.Classes.GetValueOrDefault(cls)?.Name ?? "Object";
+                }
                 if (cls == 48 && packages.Shaders.TryGetValue(name, out var shader))
                 {
                     targets[new(file.Name, main.Id)] = new(shader, 4800000, 3);

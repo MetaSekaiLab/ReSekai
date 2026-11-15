@@ -16,12 +16,15 @@ static class Shader
     public static string Generate(Value shader, Action<string> issue)
     {
         Value form = shader["m_ParsedForm"];
+        var subShaders = form["m_SubShaders"].Items;
+        string fallback = form["m_FallbackName"].Text;
+        if (subShaders.Length == 0 && fallback.Length == 0) throw new InvalidDataException("没有 SubShader 或 Fallback");
         StringBuilder text = new($"// 从 GLES3 程序重建，需要 OpenGLCore 或 OpenGLES3。\nShader {Yaml.Quote(form["m_Name"].Text)}\n{{\n");
         text.AppendLine("Properties {");
         foreach (var property in form["m_PropInfo"]["m_Props"].Items) text.AppendLine(Property(property));
         text.AppendLine("}");
-        byte[][] segments = Segments(shader);
-        foreach (var sub in form["m_SubShaders"].Items)
+        byte[][] segments = subShaders.Length == 0 ? [] : Segments(shader);
+        foreach (var sub in subShaders)
         {
             text.AppendLine("SubShader {");
             text.AppendLine(Tags(sub["m_Tags"]));
@@ -46,8 +49,7 @@ static class Shader
             }
             text.AppendLine("}");
         }
-        if (form["m_SubShaders"].Items.Length == 0) throw new InvalidDataException("没有 SubShader");
-        if (form["m_FallbackName"].Text.Length > 0) text.AppendLine("Fallback " + Yaml.Quote(form["m_FallbackName"].Text));
+        if (fallback.Length > 0) text.AppendLine("Fallback " + Yaml.Quote(fallback));
         return text.AppendLine("}").ToString().ReplaceLineEndings("\n");
     }
 
