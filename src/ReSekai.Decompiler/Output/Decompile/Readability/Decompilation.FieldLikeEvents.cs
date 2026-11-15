@@ -37,10 +37,19 @@ public static partial class Decompilation
                 declaration.Attributes.MoveTo(folded.Attributes);
                 foreach (var attribute in backing.Attributes.SelectMany(s => s.Attributes))
                     if (!IsGeneratedMarker(attribute)) folded.Attributes.Add(new AttributeSection((Attribute)attribute.Clone()) { AttributeTarget = "field" });
-                folded.Variables.Add(new VariableInitializer(declaration.Name));
                 folded.CopyAnnotationsFrom(declaration);
-                declaration.ReplaceWith(folded);
-                backing.Remove();
+                if (backing.Variables.First().Initializer is { } initializer)
+                {
+                    folded.Variables.Add(new VariableInitializer(declaration.Name, initializer.Clone()));
+                    backing.ReplaceWith(folded);
+                    declaration.Remove();
+                }
+                else
+                {
+                    folded.Variables.Add(new VariableInitializer(declaration.Name));
+                    declaration.ReplaceWith(folded);
+                    backing.Remove();
+                }
             }
         }
 

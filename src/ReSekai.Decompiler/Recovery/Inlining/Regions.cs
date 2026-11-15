@@ -1080,6 +1080,10 @@ internal sealed class RegionProver(ManagedTypes types, InlineEvidence evidence, 
             var bound = attempt.Solver.Apply(attempt.Formals[0]);
             if (bound.HasFormal || (ConstructWrappedReceiver(attempt, before, bound) ?? Reify(attempt, before, bound, null) ?? CopyReceiver(attempt, before, bound, method)) is not { } self)
             { failure = "接收者不能写回"; return null; }
+            // 共享原生布局能证明字段读写，却不能把一个泛型实例当成同一泛型类的另一个实例调用。
+            if (self.Type is DefinitionRef actual && method.DeclaringType is DefinitionRef declared
+                && actual.Definition == declared.Definition && !actual.Equals(declared) && !types.IsAssignable(actual, declared))
+            { failure = $"接收者 {actual} 与内联模板的声明类型 {declared} 不匹配"; return null; }
             receiver = self;
         }
         if (candidate.Kind == ReplacementKind.BaseConstructor) receiver = new ArgumentValue(-1, caller.Method.DeclaringType, 64);
