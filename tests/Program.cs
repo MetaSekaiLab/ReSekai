@@ -14,6 +14,7 @@ static void Reject(Action action)
     throw new Exception("应拒绝无效输入");
 }
 AnimationChecks.Basic();
+TerminalValueChecks.Run();
 SerialSourceChecks.Timeout();
 Reject(() => Output.Under(Environment.CurrentDirectory, "../escape"));
 Reject(() => new Binary([1, 2, 3]).U32());

@@ -67,6 +67,7 @@ public static partial class Decompilation
         transforms?.Register(decompiler, DecompilePosition.AfterLegality);
         decompiler.AstTransforms.Add(new FieldLikeEvents());
         decompiler.AstTransforms.Add(new EventFieldNames());
+        decompiler.AstTransforms.Add(new TerminalValues());
         transforms?.Register(decompiler, DecompilePosition.AfterEvents);
         return decompiler;
     }

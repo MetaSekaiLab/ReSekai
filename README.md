@@ -8,8 +8,9 @@
 - `--scripts stubs|full` 导出空桩或恢复方法体，默认 `stubs`。
 - `--upm auto|none|包名列表` 自动选择 UPM 包、禁用 UPM 或指定包名（逗号分隔），默认 `auto`。
 - 完整导出会随依赖流程接入 Cubism Unity SDK 与 Purism Core Windows x64 插件。手动选包时使用 `com.live2d.cubism`。
+- 完整导出保留 APK 的第三方 Android ARM64 原生库，包括 Live2D、CRIWARE、Firebase。游戏 IL2CPP、Unity 引擎和 Burst 生成库由 Unity 重建。Android 构建会接入 Firebase 和 Play Games 的 Java 依赖，并使用 APK 内的 Firebase 配置。Google Maven 无法访问时可用 `RESEKAI_GOOGLE_MAVEN` 指向 HTTPS 镜像。
 - 含 CRIWARE 的完整导出会保留 APK 的 Android ARM64 原生库。将 `RESEKAI_CRIWARE_SDK` 设为 `criware_sdk_unity_v3_14_00_smartphone_en.zip` 的路径，或把 ZIP 放入 `RESEKAI_PACKAGE_CACHE`，即可同时导出 Windows x64 的配套封装和插件。
-- `--recovered-scripts <目录>` 在完整模式复用同一 APK 已完成的 `.resekai/scripts`，重新导出到空目录。
+- `--recovered-scripts <目录>` 在完整模式复用同一 APK 已完成的 `.resekai/scripts` 中的恢复程序集，按当前规则重新生成源码并导出到空目录。
 
 ## 引用项目
 

@@ -19,6 +19,8 @@ public static partial class Decompilation
             {
                 if (attribute.Type.Annotation<TypeResolveResult>()?.Type.GetDefinition() is not { } type
                     || ReferenceEquals(type.ParentModule, context.TypeSystem.MainModule) || type.Accessibility == Accessibility.Public) continue;
+                if (type.Accessibility is Accessibility.Internal or Accessibility.ProtectedOrInternal
+                    && type.ParentModule?.InternalsVisibleTo(context.TypeSystem.MainModule) == true) continue;
                 var section = (AttributeSection)attribute.Parent!;
                 attribute.Remove();
                 if (!section.Attributes.Any()) section.Remove();

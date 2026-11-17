@@ -16,6 +16,35 @@ sealed class Apk(string path) : IDisposable
         return result.ToArray();
     }
 
+    public void WriteNativePlugins(Output output)
+    {
+        foreach (var entry in zip.Entries.Where(e => e.FullName.StartsWith("lib/arm64-v8a/", StringComparison.Ordinal)
+            && e.Name.EndsWith(".so", StringComparison.Ordinal)))
+        {
+            // 引擎、游戏代码和 Burst 库由 Unity 根据恢复后的工程重新生成。
+            if (entry.Name is "libil2cpp.so" or "libunity.so" or "libmain.so" or "lib_burst_generated.so") continue;
+            string path = "Assets/Plugins/Android/libs/arm64-v8a/" + entry.Name;
+            output.Write(path, Read(entry.FullName));
+            output.Meta(path, Output.Guid("native-plugin:android-arm64:" + entry.Name), "PluginImporter",
+                """
+                  serializedVersion: 2
+                  platformData:
+                  - first:
+                      Any:
+                    second:
+                      enabled: 0
+                      settings: {}
+                  - first:
+                      Android: Android
+                    second:
+                      enabled: 1
+                      settings:
+                        CPU: ARM64
+
+                """);
+        }
+    }
+
     public void Extract(string output)
     {
         byte[] image = Read("lib/arm64-v8a/libil2cpp.so");

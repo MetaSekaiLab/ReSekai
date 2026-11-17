@@ -208,28 +208,9 @@ sealed class Project(Output output, Scripts scripts, ScriptLayout layouts, Packa
                 if (guid == new string('0', 32) || guid is Builtin or Default) guid = Output.Guid("builtin-copy:" + guid);
                 int cls = file.Types[main.Type].ClassId;
                 // 导入器生成的资源单独写出，避免它们吞掉同文件的其他对象。
-                if (cls is 48 or 49 or 72 or 83 or 128 && children.Length > 1)
-                {
-                    foreach (var child in children.Where(c => c.Id != main.Id)) Add(child, [child], Output.Guid(file.Name + ":" + child.Id), false);
-                    children = [main];
-                }
                 // Player 的 Shader 子资源也要交给 ShaderImporter 重建。
-                if (children.Any(c => c.Id != main.Id && file.Types[c.Type].ClassId == 48))
-                {
-                    foreach (var child in children.Where(c => c.Id != main.Id && file.Types[c.Type].ClassId == 48))
-                        Add(child, [child], Output.Guid(file.Name + ":" + child.Id), false);
-                    children = children.Where(c => c.Id == main.Id || file.Types[c.Type].ClassId != 48).ToArray();
-                }
-                if (cls is 28 or 213 && children.Any(c => file.Types[c.Type].ClassId is not (28 or 213)))
-                {
-                    foreach (var child in children.Where(c => file.Types[c.Type].ClassId is not (28 or 213))) Add(child, [child], Output.Guid(file.Name + ":" + child.Id), false);
-                    children = children.Where(c => file.Types[c.Type].ClassId is 28 or 213).ToArray();
-                }
-                if (cls is not (28 or 213) && children.Any(c => file.Types[c.Type].ClassId is 28 or 213))
-                {
-                    foreach (var child in children.Where(c => file.Types[c.Type].ClassId is 28 or 213)) Add(child, [child], Output.Guid(file.Name + ":" + child.Id), false);
-                    children = children.Where(c => file.Types[c.Type].ClassId is not (28 or 213)).ToArray();
-                }
+                var split = children.Where(c => c.Id != main.Id && Separate(file.Types[c.Type].ClassId)).ToArray();
+                children = children.Where(c => c.Id == main.Id || !Separate(file.Types[c.Type].ClassId)).ToArray();
                 string name;
                 if (cls == 114 && file.Types[main.Type].Schema is null)
                 {
@@ -245,14 +226,22 @@ sealed class Project(Output output, Scripts scripts, ScriptLayout layouts, Packa
                 if (cls == 48 && packages.Shaders.TryGetValue(name, out var shader))
                 {
                     targets[new(file.Name, main.Id)] = new(shader, 4800000, 3);
-                    return;
                 }
-                string extension = prefab ? ".prefab" : cls switch { 21 => ".mat", 48 => ".shader", 49 => ".bytes", 72 => ".compute", 74 => ".anim", 83 => ".wav", 91 => ".controller", 128 => ".ttf", 221 => ".overrideController", 319 => ".mask", 687078895 => ".spriteatlas", _ => ".asset" };
-                string path = paths.GetValueOrDefault(new(file.Name, main.Id)) ?? $"Assets/Objects/{Output.Safe(name.Length == 0 ? "Object" : name)}_{guid[..8]}";
-                if (Path.HasExtension(path)) path = path[..^Path.GetExtension(path).Length];
-                path = Canonical(path + extension);
-                if (!usedPaths.Add(path)) { path = path[..^extension.Length] + "_" + guid[..8] + extension; if (!usedPaths.Add(path)) throw new InvalidDataException($"资源路径重复：{path}"); }
-                documents.Add(new(file.Name, main.Id, cls, guid, children.Select(i => i.Id).ToArray()) { Prefab = prefab, Path = path, Bundle = file.Bundle });
+                else
+                {
+                    string extension = prefab ? ".prefab" : cls switch { 21 => ".mat", 48 => ".shader", 49 => ".bytes", 72 => ".compute", 74 => ".anim", 83 => ".wav", 91 => ".controller", 128 => ".ttf", 221 => ".overrideController", 319 => ".mask", 687078895 => ".spriteatlas", _ => ".asset" };
+                    string path = paths.GetValueOrDefault(new(file.Name, main.Id)) ?? $"Assets/Objects/{Output.Safe(name.Length == 0 ? "Object" : name)}_{guid[..8]}";
+                    if (Path.HasExtension(path)) path = path[..^Path.GetExtension(path).Length];
+                    path = Canonical(path + extension);
+                    if (!usedPaths.Add(path)) { path = path[..^extension.Length] + "_" + guid[..8] + extension; if (!usedPaths.Add(path)) throw new InvalidDataException($"资源路径重复：{path}"); }
+                    documents.Add(new(file.Name, main.Id, cls, guid, children.Select(i => i.Id).ToArray()) { Prefab = prefab, Path = path, Bundle = file.Bundle });
+                }
+
+                // ResourceManager 可以给主资源和子资源登记同一路径，主资源优先占用。
+                foreach (var child in split) Add(child, [child], Output.Guid(file.Name + ":" + child.Id), false);
+
+                bool Separate(int childClass) => cls is 48 or 49 or 72 or 83 or 128 || childClass == 48
+                    || (cls is 28 or 213) != (childClass is 28 or 213);
             }
         }
     }
@@ -340,7 +329,7 @@ sealed class Project(Output output, Scripts scripts, ScriptLayout layouts, Packa
                 targets[pair.Key] = new(placeholder.Guid, placeholder.Id, 3);
                 continue;
             }
-            if (scripts.Target(pair.Value) is { } target) targets[pair.Key] = new(target.Guid, target.Id, 3);
+            if (scripts.Target(pair.Value, componentScripts.Contains(pair.Key)) is { } target) targets[pair.Key] = new(target.Guid, target.Id, 3);
         }
     }
 
@@ -410,6 +399,10 @@ sealed class Project(Output output, Scripts scripts, ScriptLayout layouts, Packa
         {
             Set("allowUnsafeCode", true);
             Set("apiCompatibilityLevel", 3);
+            // Unity IAP 4.15.1 引入的 Google Play Billing 8.3.0 要求 Android API 23。
+            if (packages.Versions.GetValueOrDefault("com.unity.purchasing") == "4.15.1"
+                && (value.Find("AndroidMinSdkVersion")?.Number ?? 0) < 23)
+                Set("AndroidMinSdkVersion", 23);
             foreach (var setting in new[] { ("apiCompatibilityLevelPerPlatform", 3), ("scriptingBackend", 1) })
             {
                 var pair = schema.Children.First(c => c.Name == setting.Item1).Element!;

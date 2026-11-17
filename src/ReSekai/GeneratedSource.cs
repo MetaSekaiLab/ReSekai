@@ -32,6 +32,26 @@ static class GeneratedSource
             match.Groups[1].Value + $"#if {CriWareSdk.Windows}\n\t\tplaybackTimeMs = debugAudioSyncedTime = playback.GetTimeSyncedWithAudio();\n#else\n" +
             match.Groups[2].Value + "#endif\n" + match.Groups[3].Value, "AudioSyncedUnityTimer.Execute");
 
+    public static string CriDisposableRegistration(string source) => Regex.Replace(source.ReplaceLineEndings("\n"),
+        @"(?m)^(\t\tpublic static void Register\(CriDisposable disposable, ModuleType type\)\n\t\t\{\n)\t\t\tthrow global::ReSekai\.Decompiler\.Unrecovered\.Fail\(\d+uL\);$",
+        match => match.Groups[1].Value + "\t\t\tlock (refList)\n"
+            + "\t\t\t{\n\t\t\t\tif (SearchForDisposable(disposable) >= 0)\n"
+            + "\t\t\t\t{\n\t\t\t\t\tglobal::UnityEngine.Debug.LogWarning(\"[CRIWARE] Internal: Duplicated object GUID\");\n"
+            + "\t\t\t\t\treturn;\n\t\t\t\t}\n"
+            + "\t\t\t\trefList.Add(new ObjectRef(disposable.guid, disposable, type));\n\t\t\t}", RegexOptions.CultureInvariant);
+
+    public static string CriCueInfoLayout(string source)
+    {
+        const string marshal = "global::System.Runtime.InteropServices.";
+        string code = source.ReplaceLineEndings("\n");
+        code = Regex.Replace(code, @"(?m)^(\t\t\t)(private float\[\] calculationParameters;)$",
+            $"$1[{marshal}MarshalAs({marshal}UnmanagedType.ByValArray, SizeConst = 3)]\n$1$2",
+            RegexOptions.CultureInvariant);
+        return Regex.Replace(code, @"(?m)^(\t\t\t)(public ushort\[\] categories;)$",
+            $"$1[{marshal}MarshalAs({marshal}UnmanagedType.ByValArray, SizeConst = 16)]\n$1$2",
+            RegexOptions.CultureInvariant);
+    }
+
     public static string EditorRenderCleanup(string source) => ReplaceOnce(source.ReplaceLineEndings("\n"),
         @"(?m)^(\t\tpublic static void Destroy\(global::UnityEngine.Object obj\)\n\t\t\{\n\t\t\tif \(obj != null\)\n\t\t\t\{\n)(\t\t\t\tglobal::UnityEngine.Object.Destroy\(obj\);)$",
         match => match.Groups[1].Value + """
@@ -48,6 +68,10 @@ static class GeneratedSource
     public static string EditorDirectTitle(string source) => ReplaceOnce(source.ReplaceLineEndings("\n"),
         @"(?m)^\t\tprotected override void Awake\(\)\n\t\t\{\n",
         match => match.Value + "#if UNITY_EDITOR\n\t\t\tSekaiSingletonManager.RegisterFormatters();\n#endif\n", "TitleController.Awake");
+
+    public static string DevelopmentLogging(string source) => ReplaceOnce(source.ReplaceLineEndings("\n"),
+        @"(?m)^\t\t\tglobal::UnityEngine\.Debug\.unityLogger\.logEnabled = false;$",
+        match => "#if !DEVELOPMENT_BUILD\n" + match.Value + "\n#endif", "EnvironmentConfig.SetupLogFliter");
 
     public static string RegisterFormatters(string source) => ReplaceOnce(source.ReplaceLineEndings("\n"),
         @"(?m)^(\t\tpublic override void OnInitialize\(\)\n\t\t\{\n)(\t\t\tglobal::MessagePack.Resolvers.CompositeResolver.RegisterAndSetAsDefault\([^\n]+\);)$",
@@ -70,6 +94,35 @@ static class GeneratedSource
                 "ref WorldInfluence influence = ref global::Unity.Collections.LowLevel.Unsafe.UnsafeUtility.ArrayElementAsRef<WorldInfluence>(global::Unity.Collections.LowLevel.Unsafe.NativeArrayUnsafeUtility.GetUnsafeBufferPointerWithoutChecks(teamWorldInfluenceList), index);", StringComparison.Ordinal)
             .Replace("((WorldInfluence*)((byte*)unsafeBufferPointerWithoutChecks2 + index * (uint)sizeof(WorldInfluence)))->", "influence.", StringComparison.Ordinal),
         "PostProcessTeamDataJob.Execute");
+
+    public static string MagicaClothEdgeCapsule(string source) => ReplaceOnce(source.ReplaceLineEndings("\n"),
+        @"(?ms)^(\t\t\tprivate (?:unsafe )?bool CapsuleColliderDetection\([^\n]+\)\n)\t\t\t\{\n.*?^\t\t\t\}$",
+        match => match.Groups[1].Value + """
+                        {
+                            var scale = Unity.Mathematics.math.dot(dir, boneSclList[transformIndexList[cindex]]);
+                            var size = radiusList[cindex] * scale;
+                            var axis = dir * size.x;
+                            var previousRotation = rotList[cindex];
+                            var previousCenter = posList[cindex];
+                            var previousAxis = Unity.Mathematics.math.rotate(previousRotation, axis);
+                            MathUtility.ClosestPtSegmentSegment(previousCenter - previousAxis, previousCenter + previousAxis,
+                                nextpos0, nextpos1, out float capsuleT, out _, out var capsulePoint, out var edgePoint);
+
+                            // 将上一帧的接触法线转到这帧，再用接触处半径构造碰撞平面。
+                            var nextRotation = nextRotList[cindex];
+                            var localNormal = Unity.Mathematics.math.rotate(Unity.Mathematics.math.inverse(previousRotation), edgePoint - capsulePoint);
+                            var normal = Unity.Mathematics.math.normalize(Unity.Mathematics.math.rotate(nextRotation, localNormal));
+                            var nextCenter = nextPosList[cindex];
+                            var nextAxis = Unity.Mathematics.math.rotate(nextRotation, axis);
+                            var planePoint = Unity.Mathematics.math.lerp(nextCenter - nextAxis, nextCenter + nextAxis, capsuleT)
+                                + normal * (Unity.Mathematics.math.lerp(size.y, size.z, capsuleT) + radius);
+                            var distance0 = Unity.Mathematics.math.dot(normal, nextpos0 - planePoint);
+                            var distance1 = Unity.Mathematics.math.dot(normal, nextpos1 - planePoint);
+                            if (distance0 < 0f) corr0 += (nextpos0 - normal * distance0) - nextpos0;
+                            if (distance1 < 0f) corr1 += (nextpos1 - normal * distance1) - nextpos1;
+                            return distance0 < 0f || distance1 < 0f;
+                        }
+            """, "EdgeCollisionCalcJob.CapsuleColliderDetection");
 
     static string ReplaceOnce(string source, string pattern, MatchEvaluator replacement, string method)
     {

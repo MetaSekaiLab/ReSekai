@@ -23,8 +23,19 @@ static class Export
             var model = ModelBuilder.Load(Path.Join(work, "libil2cpp.so"), Path.Join(work, "global-metadata.dat")).Model;
             Packages packages = new();
             await packages.Prepare(options, model, output);
-            if (options.Full && model.Assemblies.Any(a => a.AssemblyName == CriWareSdk.Assembly))
-                CriWareSdk.WriteAndroid(apk, output);
+            if (options.Full)
+            {
+                apk.WriteNativePlugins(output);
+                if (model.Assemblies.Any(a => a.AssemblyName == "Firebase.Messaging"))
+                    await Packages.WriteFirebaseMessagingBridge(output);
+                if (model.Assemblies.Any(a => a.AssemblyName == "Firebase.App"))
+                {
+                    const string path = "Assets/Editor/ReSekaiFirebaseAndroidBuild.cs";
+                    using var source = new StreamReader(typeof(Export).Assembly.GetManifestResourceStream("FirebaseAndroidBuild.cs")!);
+                    output.Write(path, source.ReadToEnd());
+                    output.Meta(path, Output.Guid("android:firebase-build"), "MonoImporter");
+                }
+            }
             Scripts scripts = new(model, packages, output);
             recovery = scripts.Write(work, options.Full, stagedScripts);
             Project project = new(output, scripts, new(model), packages);

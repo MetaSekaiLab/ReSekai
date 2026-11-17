@@ -17,6 +17,7 @@ static class Attributes
 
 sealed class ScriptLayout(ProgramModel model)
 {
+    readonly SerializedFieldNames fieldNames = new(model);
     readonly Dictionary<string, TypeDef> types = model.Types.Where(t => t.DeclaringType is null)
         .ToDictionary(t => new ScriptName(t.Assembly, t.Namespace, t.Name).Key);
     readonly Dictionary<ScriptName, Schema[]> cache = [];
@@ -54,7 +55,7 @@ sealed class ScriptLayout(ProgramModel model)
             bool reference = field.CustomAttributes.HasAttribute("UnityEngine.SerializeReference");
             if ((field.Attributes & FieldAttributes.FieldAccessMask) != FieldAttributes.Public && !field.CustomAttributes.HasAttribute("UnityEngine.SerializeField") && !reference) continue;
             if (reference || field.CustomAttributes.HasAttribute("System.Runtime.CompilerServices.FixedBufferAttribute")) throw new NotSupportedException($"不支持的序列化字段：{type.Definition.FullName}.{field.Name}");
-            if (Field(field.Type.Substitute(type.Arguments, []), field.Name, ancestors) is { } schema) result.Add(schema);
+            if (Field(field.Type.Substitute(type.Arguments, []), fieldNames.Name(field), ancestors) is { } schema) result.Add(schema);
         }
         return result.ToArray();
     }

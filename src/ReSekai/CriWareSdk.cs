@@ -119,26 +119,4 @@ sealed class CriWareSdk(byte[] windows, Dictionary<string, string> sources, Json
             """);
     }
 
-    public static void WriteAndroid(Apk apk, Output output)
-    {
-        const string path = "Assets/Plugins/Android/libs/arm64-v8a/libcri_ware_unity.so";
-        output.Write(path, apk.Read("lib/arm64-v8a/libcri_ware_unity.so"));
-        output.Meta(path, Output.Guid("native-plugin:criware:android-arm64"), "PluginImporter",
-            """
-              serializedVersion: 2
-              platformData:
-              - first:
-                  Any:
-                second:
-                  enabled: 0
-                  settings: {}
-              - first:
-                  Android: Android
-                second:
-                  enabled: 1
-                  settings:
-                    CPU: ARM64
-
-            """);
-    }
 }

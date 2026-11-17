@@ -60,6 +60,45 @@ sealed class Packages
         }
     }
 
+    public static async Task WriteFirebaseMessagingBridge(Output output)
+    {
+        const string revision = "603996d2da96f22f56ef3255104808c8709ebc91";
+        const string root = "com.google.firebase.messaging-" + revision + "/";
+        const string folder = "Assets/Plugins/Android/";
+        const string name = "firebase-messaging-cpp.aar";
+        using HttpClient client = new() { Timeout = TimeSpan.FromMinutes(1) };
+        using var archive = await SourcePackages.OpenArchive(client, "com.google.firebase.messaging@12.10.0",
+            "https://codeload.github.com/RageAgainstThePixel/com.google.firebase.messaging/zip/" + revision,
+            "282DD1CF9FE80594602D75B9AA9DC691584B8C1ACCF48B7C8269D17BD1F43D26");
+        Write("Firebase/Plugins/Android/" + name, folder + name);
+        Write("LICENSE.md", folder + "Firebase-Messaging-LICENSE.md");
+        output.Meta(folder + name, Output.Guid("native-plugin:android:" + name), "PluginImporter",
+            """
+              serializedVersion: 2
+              platformData:
+              - first:
+                  Any:
+                second:
+                  enabled: 0
+                  settings: {}
+              - first:
+                  Android: Android
+                second:
+                  enabled: 1
+                  settings:
+                    CPU: AnyCPU
+
+            """);
+
+        void Write(string source, string destination)
+        {
+            using var input = (archive.GetEntry(root + source) ?? throw new InvalidDataException("Firebase Messaging SDK 缺少 " + source)).Open();
+            using MemoryStream bytes = new();
+            input.CopyTo(bytes);
+            output.Write(destination, bytes.ToArray());
+        }
+    }
+
     public async Task Prepare(Options options, ProgramModel model, Output output)
     {
         var input = model.Assemblies.Select(a => a.AssemblyName).ToHashSet();

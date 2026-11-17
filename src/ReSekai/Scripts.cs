@@ -11,13 +11,18 @@ sealed class Scripts(ProgramModel model, Packages packages, Output output)
 {
     readonly Dictionary<string, string> targets = [];
     readonly Dictionary<string, bool> stripped = [];
+    readonly Dictionary<string, TypeDef> scriptTypes = model.Types.Where(t => t.DeclaringType is null)
+        .ToDictionary(t => new ScriptName(t.Assembly, t.Namespace, t.Name).Key);
     public static bool Engine(string name) => name is "mscorlib" or "netstandard" or "Mono.Security" or "System" or "UnityEngine" or "__Generated"
         || name.StartsWith("System.", StringComparison.Ordinal)
         || name.StartsWith("UnityEngine.", StringComparison.Ordinal) && name.EndsWith("Module", StringComparison.Ordinal);
 
-    public (string Guid, long Id)? Target(ScriptName name)
+    public (string Guid, long Id)? Target(ScriptName name, bool component)
     {
         if (packages.Scripts.TryGetValue(name.Key, out var package)) return package;
+        if (scriptTypes.TryGetValue(name.Key, out var type) && !Packages.IsScript(type)
+            && type.Fields.Count == 0 && type.Methods.All(m => m.Name == ".ctor" && m.Parameters.Count == 0))
+            return Stripped(name, component);
         if (targets.TryGetValue(name.Key, out string? guid)) return (guid, 11500000);
         return null;
     }
@@ -42,6 +47,7 @@ sealed class Scripts(ProgramModel model, Packages packages, Output output)
 
     public RecoveryRunResult? Write(string work, bool full, string? stagedScripts = null)
     {
+        SerializedFieldNames fieldNames = new(model);
         var recover = model.Assemblies.Where(a => !Engine(a.AssemblyName) && !packages.Assemblies.ContainsKey(a.AssemblyName)).ToArray();
         foreach (var assembly in model.Assemblies)
             output.AssemblySources[assembly.AssemblyName] = packages.Assemblies.TryGetValue(assembly.AssemblyName, out var package)
@@ -49,7 +55,7 @@ sealed class Scripts(ProgramModel model, Packages packages, Output output)
                 : packages.WriteManagedRuntime(assembly.AssemblyName, output) ?? (Engine(assembly.AssemblyName) ? "Unity" : full ? "反编译" : "空桩");
         if (recover.Length == 0) return null;
         string stage = stagedScripts ?? Path.Join(work, "scripts");
-        string assemblies = Path.Join(stage, "assemblies"), sources = Path.Join(stage, "src");
+        string assemblies = Path.Join(stage, "assemblies"), sources = Path.Join(stagedScripts is null ? stage : work, "src");
         RecoveryRunResult? result = null;
         if (stagedScripts is not null)
         {
@@ -82,11 +88,12 @@ sealed class Scripts(ProgramModel model, Packages packages, Output output)
             new Skeleton(model).Write(directory);
             return directory;
         });
-        foreach (var assembly in stagedScripts is null ? recover : [])
+        // 复用机器码恢复结果，但源码必须经过当前版本的转换规则。
+        foreach (var assembly in recover)
         {
             Console.WriteLine($"串行生成{(full ? "源码" : "空桩")} {assembly.AssemblyName}");
             SourceProject.Write(Path.Join(assemblies, assembly.Name), assemblies, sources, _ => true,
-                stubs: full ? () => stubs.Value : null, jobs: 1);
+                transforms: fieldNames, stubs: full ? () => stubs.Value : null, jobs: 1);
         }
         var available = recover.Select(a => a.AssemblyName).Concat(packages.Assemblies.Keys).ToHashSet();
         foreach (var assembly in recover)
@@ -124,6 +131,10 @@ sealed class Scripts(ProgramModel model, Packages packages, Output output)
                 string guid = Output.Guid("source:" + assembly.AssemblyName + "/" + relative);
                 foreach (var type in declared) targets[new ScriptName(assembly.AssemblyName, type.Namespace, type.Name).Key] = guid;
                 string? recovered = generated.TryGetValue(relative, out string? file) ? File.ReadAllText(file) : null;
+                if (full && assembly.AssemblyName == CriWareSdk.Assembly && relative == "CriWare/CriDisposableObjectManager.cs" && recovered is not null)
+                    recovered = GeneratedSource.CriDisposableRegistration(recovered);
+                if (full && assembly.AssemblyName == CriWareSdk.Assembly && relative == "CriWare/CriAtomEx.cs" && recovered is not null)
+                    recovered = GeneratedSource.CriCueInfoLayout(recovered);
                 string code = sdkSources is null ? upstream.GetValueOrDefault(relative) ?? recovered!
                     : CriWareSdk.PlatformSource(relative, recovered, sdkSources.GetValueOrDefault(relative));
                 if (full && assembly.AssemblyName == "spine-csharp" && relative == "Spine/SequenceTimeline.cs"
@@ -137,10 +148,14 @@ sealed class Scripts(ProgramModel model, Packages packages, Output output)
                     code = GeneratedSource.MagicaClothCulling(code);
                 if (full && assembly.AssemblyName == "MagicaCloth" && relative == "MagicaCloth/PhysicsManagerTeamData.cs")
                     code = GeneratedSource.MagicaClothPostProcess(code);
+                if (full && assembly.AssemblyName == "MagicaCloth" && relative == "MagicaCloth/EdgeCollisionConstraint.cs")
+                    code = GeneratedSource.MagicaClothEdgeCapsule(code);
                 if (full && assembly.AssemblyName == "Unity.RenderPipelines.Core.Runtime" && relative == "UnityEngine.Rendering/CoreUtils.cs")
                     code = GeneratedSource.EditorRenderCleanup(code);
                 if (full && assembly.AssemblyName == "Assembly-CSharp" && relative == "Sekai/TitleController.cs")
                     code = GeneratedSource.EditorDirectTitle(code);
+                if (full && assembly.AssemblyName == "Assembly-CSharp" && relative == "Sekai/EnvironmentConfig.cs")
+                    code = GeneratedSource.DevelopmentLogging(code);
                 if (full && assembly.AssemblyName == "Assembly-CSharp" && relative == "Sekai/SekaiSingletonManager.cs")
                     code = GeneratedSource.RegisterFormatters(code);
                 if (full && assembly.AssemblyName == "FastAES" && relative == "FastAESAlgorithmFactory.cs")
