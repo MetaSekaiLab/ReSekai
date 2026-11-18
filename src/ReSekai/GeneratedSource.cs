@@ -52,6 +52,12 @@ static class GeneratedSource
             RegexOptions.CultureInvariant);
     }
 
+    public static string CriMovieInfoLayout(string source) => ReplaceOnce(source.ReplaceLineEndings("\n"),
+        @"(?m)^(\t\t)public AudioInfo\[\] audioPrm;$",
+        match => match.Groups[1].Value +
+            "[global::System.Runtime.InteropServices.MarshalAs(global::System.Runtime.InteropServices.UnmanagedType.ByValArray, SizeConst = 32)]\n" +
+            match.Value, "MovieInfo.audioPrm");
+
     public static string EditorRenderCleanup(string source) => ReplaceOnce(source.ReplaceLineEndings("\n"),
         @"(?m)^(\t\tpublic static void Destroy\(global::UnityEngine.Object obj\)\n\t\t\{\n\t\t\tif \(obj != null\)\n\t\t\t\{\n)(\t\t\t\tglobal::UnityEngine.Object.Destroy\(obj\);)$",
         match => match.Groups[1].Value + """

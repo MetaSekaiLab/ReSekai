@@ -135,6 +135,8 @@ sealed class Scripts(ProgramModel model, Packages packages, Output output)
                     recovered = GeneratedSource.CriDisposableRegistration(recovered);
                 if (full && assembly.AssemblyName == CriWareSdk.Assembly && relative == "CriWare/CriAtomEx.cs" && recovered is not null)
                     recovered = GeneratedSource.CriCueInfoLayout(recovered);
+                if (full && assembly.AssemblyName == CriWareSdk.Assembly && relative == "CriWare.CriMana/MovieInfo.cs" && recovered is not null)
+                    recovered = GeneratedSource.CriMovieInfoLayout(recovered);
                 string code = sdkSources is null ? upstream.GetValueOrDefault(relative) ?? recovered!
                     : CriWareSdk.PlatformSource(relative, recovered, sdkSources.GetValueOrDefault(relative));
                 if (full && assembly.AssemblyName == "spine-csharp" && relative == "Spine/SequenceTimeline.cs"
