@@ -5,6 +5,7 @@ using ICSharpCode.Decompiler.CSharp;
 using ICSharpCode.Decompiler.CSharp.OutputVisitor;
 using ICSharpCode.Decompiler.CSharp.Syntax;
 using ICSharpCode.Decompiler.CSharp.Transforms;
+using ICSharpCode.Decompiler.IL;
 using ICSharpCode.Decompiler.IL.ControlFlow;
 using ICSharpCode.Decompiler.IL.Transforms;
 using ICSharpCode.Decompiler.Metadata;
@@ -41,6 +42,7 @@ public static partial class Decompilation
         decompiler.ILTransforms.Insert(decompiler.ILTransforms.ToList().FindIndex(t => t is AsyncAwaitDecompiler) + 2, new ImplicitChecks());
         decompiler.AstTransforms.Insert(decompiler.AstTransforms.ToList().FindIndex(t => t is DeclareVariables), new GotoCleanup());
         decompiler.AstTransforms.Insert(decompiler.AstTransforms.ToList().FindIndex(t => t is DeclareVariables), new DistinctLocalNames());
+        decompiler.AstTransforms[decompiler.AstTransforms.ToList().FindIndex(t => t is DeclareVariables)] = new LabelAwareDeclarations();
         transforms?.Register(decompiler, DecompilePosition.BeforeLegality);
         decompiler.AstTransforms.Add(new InitializerOrder());
         decompiler.AstTransforms.Add(new ConstructorCalls());
@@ -70,6 +72,28 @@ public static partial class Decompilation
         decompiler.AstTransforms.Add(new TerminalValues());
         transforms?.Register(decompiler, DecompilePosition.AfterEvents);
         return decompiler;
+    }
+
+    private static SyntaxTree DecompileTypes(DecompilerTypeSystem typeSystem, DecompilerSettings settings,
+        IDecompileTransformProvider? transforms, TypeDefinitionHandle[] handles)
+    {
+        var tree = CreateDecompiler(typeSystem, settings, transforms).DecompileTypes(handles);
+        var unsafeIterators = tree.Descendants.OfType<MethodDeclaration>()
+            .Where(method => method.Annotation<ILFunction>() is { IsIterator: true } function
+                && function.Variables.Any(variable => variable is
+                {
+                    Kind: VariableKind.Local, Index: null, UsesInitialValue: true, LoadCount: > 0,
+                    StoreInstructions.Count: 0, AddressCount: 0,
+                }))
+            .ToHashSet<EntityDeclaration>();
+        if (unsafeIterators.Count == 0) return tree;
+
+        // 状态机提升后，新增的局部只剩隐式初值。保留原状态机对恢复点和捕获值的访问。
+        var explicitSettings = settings.Clone();
+        explicitSettings.YieldReturn = false;
+        var expanded = CreateDecompiler(typeSystem, explicitSettings, transforms).DecompileTypes(handles);
+        MergeHidden(tree, expanded, unsafeIterators.Contains);
+        return tree;
     }
 
     /// <summary>unbox 得到的可写引用不能用 C# 强制转换作左值；目标库有对应接口时输出 Unsafe.Unbox。</summary>
@@ -154,14 +178,14 @@ public static partial class Decompilation
                     selected = settings.Clone();
                     selected.AnonymousTypes = false;
                 }
-                var tree = CreateDecompiler(typeSystem, selected, transforms).DecompileTypes(handles);
+                var tree = DecompileTypes(typeSystem, selected, transforms, handles);
                 // ILSpy 可能把同一个局部函数重复声明在同一块。重新反编译该类型，保留原来的辅助方法和调用。
                 if (selected.LocalFunctions && tree.Descendants.OfType<BlockStatement>().Any(block => block.Statements
                     .OfType<LocalFunctionDeclarationStatement>().GroupBy(local => local.Declaration.Name).Any(group => group.Skip(1).Any())))
                 {
                     selected = selected.Clone();
                     selected.LocalFunctions = false;
-                    tree = CreateDecompiler(typeSystem, selected, transforms).DecompileTypes(handles);
+                    tree = DecompileTypes(typeSystem, selected, transforms, handles);
                 }
                 var source = Print(tree, selected);
                 // 大类型在补出隐藏成员时直接复用同一份语法树，避免用相同设置重复反编译。
@@ -220,7 +244,7 @@ public static partial class Decompilation
             var visible = settings.Clone();
             configure(visible);
             var index = files.FindIndex(f => f.TypeName == type.Name && f.Namespace == type.Namespace);
-            var source = new SourceFile(type.Name, type.Namespace, Print(CreateDecompiler(typeSystem, visible, transforms).DecompileTypes(type.Handles), visible));
+            var source = new SourceFile(type.Name, type.Namespace, Print(DecompileTypes(typeSystem, visible, transforms, type.Handles), visible));
             if (index >= 0) files[index] = source; else files.Add(source);
         }
         // 反编译器有时折叠不了某个方法的闭包，留下对隐藏类型的引用。只把这些成员换成不折叠的写法，再补上它们用到的闭包，其余成员保持折叠。
@@ -229,21 +253,24 @@ public static partial class Decompilation
         void Expose((TypeDefinitionHandle[] Handles, string Namespace, string Name) type, bool closures, bool iterators)
         {
             var folded = foldedTypes.TryGetValue(type.Handles[0], out var saved)
-                ? saved : CreateDecompiler(typeSystem, settings, transforms).DecompileTypes(type.Handles);
+                ? saved : DecompileTypes(typeSystem, settings, transforms, type.Handles);
             if (closures)
             {
                 var visible = settings.Clone();
                 visible.AnonymousMethods = false;
                 visible.AnonymousTypes = false;
                 visible.LocalFunctions = false;
-                MergeHidden(folded, CreateDecompiler(typeSystem, visible, transforms).DecompileTypes(type.Handles),
-                    text => ClosureReference.IsMatch(text) || ClosureThis.IsMatch(text) || LambdaMethod.IsMatch(text));
+                MergeHidden(folded, DecompileTypes(typeSystem, visible, transforms, type.Handles), member =>
+                {
+                    var text = member.ToString();
+                    return ClosureReference.IsMatch(text) || ClosureThis.IsMatch(text) || LambdaMethod.IsMatch(text);
+                });
             }
             if (iterators)
             {
                 var visible = settings.Clone();
                 visible.YieldReturn = false;
-                MergeHidden(folded, CreateDecompiler(typeSystem, visible, transforms).DecompileTypes(type.Handles), BrokenIterator.IsMatch);
+                MergeHidden(folded, CreateDecompiler(typeSystem, visible, transforms).DecompileTypes(type.Handles), member => BrokenIterator.IsMatch(member.ToString()));
             }
             files[files.FindIndex(f => f.TypeName == type.Name && f.Namespace == type.Namespace)] = new SourceFile(type.Name, type.Namespace, Print(folded, settings));
         }
@@ -285,7 +312,7 @@ public static partial class Decompilation
     /// folded 里 <paramref name="broken"/> 匹配的成员换成 expanded 里对应的写法，再把用到的闭包类、状态机、lambda 方法和字段按需加进来。
     /// 没提升的状态机是嵌套类型，它的成员用到的闭包声明在外层，所以名字要沿外层类型查找。
     /// </summary>
-    private static void MergeHidden(SyntaxTree folded, SyntaxTree expanded, Func<string, bool> broken)
+    private static void MergeHidden(SyntaxTree folded, SyntaxTree expanded, Func<EntityDeclaration, bool> broken)
     {
         const string Shared = "_003C_003Ec";
         static int Token(AstNode node) => node.GetSymbol() is IEntity entity ? System.Reflection.Metadata.Ecma335.MetadataTokens.GetToken(entity.MetadataToken) : 0;
@@ -308,7 +335,7 @@ public static partial class Decompilation
             foreach (var member in type.Members.ToArray())
             {
                 if (member is TypeDeclaration) continue;
-                if (!broken(member.ToString()) || !candidates.TryGetValue(Token(member), out var replacement)) continue;
+                if (!broken(member) || !candidates.TryGetValue(Token(member), out var replacement)) continue;
                 Scan(replacement, twin);
                 member.ReplaceWith(replacement.Clone());
             }

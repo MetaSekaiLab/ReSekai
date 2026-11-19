@@ -1,4 +1,5 @@
 using ICSharpCode.Decompiler.CSharp;
+using ICSharpCode.Decompiler.CSharp.Resolver;
 using ICSharpCode.Decompiler.CSharp.Syntax;
 using ICSharpCode.Decompiler.CSharp.Transforms;
 using ICSharpCode.Decompiler.Semantics;
@@ -56,7 +57,7 @@ public static partial class Decompilation
             }
             foreach (var creation in rootNode.Descendants.OfType<ObjectCreateExpression>().Reverse().ToArray())
             {
-                NestedEnumerator(creation);
+                NestedEnumerator(creation, context);
                 InlinedConstructor(creation);
                 SpanFromReference(creation);
             }
@@ -250,11 +251,17 @@ public static partial class Decompilation
             _ => null,
         };
 
-        /// <summary>集合的枚举器构造函数不公开：new List&lt;T&gt;.Enumerator(list) 是 GetEnumerator 展开后的形状。</summary>
-        private static void NestedEnumerator(ObjectCreateExpression creation)
+        /// <summary>只把调用方无法访问的枚举器构造函数还原为 GetEnumerator。集合自身的实现可能正是这个构造调用。</summary>
+        private static void NestedEnumerator(ObjectCreateExpression creation, TransformContext context)
         {
-            if (creation.Annotation<ResolveResult>() is not InvocationResolveResult { Member: IMethod { IsConstructor: true, DeclaringTypeDefinition: { Name: "Enumerator", DeclaringTypeDefinition: { } collection } } }) return;
-            if (creation.Arguments.Count != 1 || creation.Arguments.First().Annotation<ResolveResult>()?.Type.GetDefinition() is not { } source || !source.Equals(collection)) return;
+            if (creation.Annotation<ResolveResult>() is not InvocationResolveResult
+                { Member: IMethod { IsConstructor: true, DeclaringTypeDefinition: { Name: "Enumerator", DeclaringTypeDefinition: { } collection } } constructor }) return;
+            if (creation.Arguments.Count != 1 || creation.Arguments.First().GetResolveResult().Type is not { } source
+                || !collection.Equals(source.GetDefinition())) return;
+            var caller = creation.GetParent<TypeDeclaration>()?.GetSymbol() as ITypeDefinition ?? context.CurrentTypeDefinition;
+            var lookup = new MemberLookup(caller, context.CurrentModule, false);
+            if (lookup.IsAccessible(constructor, false) || !source.GetMethods(m => m is { Name: "GetEnumerator", IsStatic: false, Accessibility: Accessibility.Public, Parameters.Count: 0 }
+                && m.ReturnType.Equals(constructor.DeclaringType)).Any()) return;
             creation.ReplaceWith(new InvocationExpression(new MemberReferenceExpression(creation.Arguments.First().Clone(), "GetEnumerator")));
         }
 

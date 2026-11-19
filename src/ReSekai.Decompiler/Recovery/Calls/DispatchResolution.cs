@@ -102,7 +102,7 @@ internal static class DispatchResolution
             return generic;
         return oracle.Decompose(target.Address) is (_, var offset, null, _) && offset >= RuntimeLayout.ClassVtable
             && (offset - RuntimeLayout.ClassVtable) % RuntimeLayout.VirtualInvokeDataSize == 0 && Receiver(call, values) is { } receiver
-            ? oracle.VirtualMethod(target, receiver) : null;
+            ? oracle.VirtualMethod(target, receiver, call) : null;
     }
 
     private static Sym? Receiver(Call call, ValueModel values)

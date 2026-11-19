@@ -138,6 +138,9 @@ internal sealed class EffectAnalysis(ValueModel values, TypeOracle oracle, IRead
                     case Define or Branch when (semantics.Statement(statement, nonNull).Exceptions & ~ExceptionEffect.NullReference) == 0
                         && (semantics.Statement(statement, nonNull).Kinds & ~EffectKind.Read) == 0: continue;
                     case Store store: return aliases.Contains(oracle.Decompose(values.Operands(store)[0]).Root);
+                    // 字段地址下降为 ldflda，和直接字段读写一样检查接收者。
+                    case Call { Op.Kind: OpKind.FieldAddress } address when Receiver(1) && oracle.FieldOperand(address, 1) is not null:
+                        return true;
                     case Call { Op: null } call:
                         // 直接调用可覆盖的虚方法可能是 base 调用，不能为了判空改成动态分派；其他方法 IL 里本来就是 callvirt。
                         return receivers is not null && oracle.Callee(call) is { Method: { IsStatic: false, IsOverridable: false } } && call.Arguments.Length > 0 && Receiver(1);

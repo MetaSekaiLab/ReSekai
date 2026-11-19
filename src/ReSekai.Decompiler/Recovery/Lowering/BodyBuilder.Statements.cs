@@ -18,8 +18,13 @@ internal sealed partial class BodyBuilder
         var operands = values.Operands(statement);
         if (statement is Store && oracle.Decided(operands[0], block) is var decided && !ReferenceEquals(decided, operands[0]))
             operands = [decided, .. operands.Skip(1)];
-        // 地址选择分发成条件读取时，只能快照整个选择，不能提前读取未选中的字段。
-        if (statement is Define && operands is [OpSym { Op.Kind: OperatorKind.Select } selection]
+        // 地址选择分发成条件读取时，只快照选择结果。AArch64 窄读取还可能外包寄存器的高位清零。
+        if (statement is Define && (operands switch
+            {
+                [OpSym { Op.Kind: OperatorKind.Select } direct] => direct,
+                [ConcatSym { Parts: [OpSym { Op.Kind: OperatorKind.Select } low, ConstSym { Value: 0 }] }] => low,
+                _ => null,
+            }) is { } selection
             && Reads(statement).Any(materialized.Contains))
         {
             // 直接方法的元数据在两路都无运行时读取，只有条件需要保留在原机器位置。

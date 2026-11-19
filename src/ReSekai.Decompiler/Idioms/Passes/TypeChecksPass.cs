@@ -30,15 +30,24 @@ internal static class TypeChecksPass
             if (next.Predecessors.Count != 1 || next.IsLandingPad)
                 continue;
             // 继承链比较：*(klass->typeHierarchy + depth*8 - 8) == T
-            var hierarchy = Fold.Simplify(new Load(Fold.Simplify(new Binary(BinOp.Add, state.defs.Expand(klass), Expr.C(RuntimeLayout.ClassTypeHierarchy, 64), 64)), 64));
-            bool IsHierarchyTest(Expr e, out bool equal)
+            // 保留类指针的 SSA 定义。否则两边展开到接收者时的剩余深度不同，复杂接收者的同一个类指针会被误判为不同。
+            bool ExpandThrough(Variable variable) => klass is not Use anchor || variable != anchor.Variable;
+            static Expr Hierarchy(Expr owner) =>
+                Fold.Simplify(new Load(Fold.Simplify(new Binary(BinOp.Add, owner, Expr.C(RuntimeLayout.ClassTypeHierarchy, 64), 64)), 64));
+            var hierarchy = Hierarchy(state.defs.Expand(klass, ExpandThrough));
+            var expandedHierarchy = Hierarchy(state.defs.Expand(klass));
+            bool IsHierarchyTest(Expr e, out bool equal) =>
+                Matches(state.defs.Expand(e, ExpandThrough), hierarchy, out equal)
+                || Matches(state.defs.Expand(e), expandedHierarchy, out equal);
+
+            bool Matches(Expr e, Expr expectedHierarchy, out bool equal)
             {
                 equal = false;
-                if (state.defs.Expand(e) is not Compare { Cond: Cond.Eq or Cond.Ne } c)
+                if (e is not Compare { Cond: Cond.Eq or Cond.Ne } c)
                     return false;
                 var (entry, symbol) = c.Right is Symbol ? (c.Left, c.Right) : (c.Right, c.Left);
                 equal = c.Cond == Cond.Eq;
-                return symbol == type && entry is Load { Width: 64 } entryLoad && TermsPass.Terms(entryLoad.Address).Contains(hierarchy);
+                return symbol == type && entry is Load { Width: 64 } entryLoad && TermsPass.Terms(entryLoad.Address).Contains(expectedHierarchy);
             }
 
             var result = state.Fresh();

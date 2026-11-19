@@ -370,7 +370,7 @@ public static class AsyncForms
             foreach (var (block, call) in sites)
                 if (!Await(block, call)) return null;
             SignedRangeChecks();
-            return HoistThis() && StateReads() ? Layout(region) : null;
+            return HoistThis() && StateReads() ? Layout(region, splitResumes: true) : null;
         }
 
         /// <summary>
@@ -1033,8 +1033,35 @@ public static class AsyncForms
             return true;
         }
 
+        /// <summary>内层 try 的入口可能同时分派主 try 的恢复点。主 try 先按状态直达这些恢复点，内层分派仍负责自己的入口。</summary>
+        private ulong[] OuterResumeDispatch(ulong first, ulong innerEntry, ManagedRegion[] inner, List<ManagedStatement> prefix)
+        {
+            if (num is not { } state || !inner.Any(region => region.Try.Contains(first))
+                || !prefix.OfType<ManagedAssignment>().Any(read => read.Target.Variable.Equals(state.Variable))) return [];
+            var resumes = new List<(long State, ulong Target)>();
+            foreach (long value in code.Values.SelectMany(statements => statements).Select(StateStored).OfType<long>().Where(value => value >= 0).Distinct())
+            {
+                if (Dispatch(value) is not var (target, index)) return [];
+                if (inner.Any(region => region.Try.Contains(target) || region.Handler.Contains(target))) continue;
+                if (index != 0 || code[target][0] is not ManagedAssignment { Value: var restored } || !IsAwaiterField(restored)) return [];
+                resumes.Add((value, target));
+            }
+            var blocks = new ulong[resumes.Count];
+            ulong address = code[innerEntry].FirstOrDefault()?.Address ?? innerEntry;
+            ulong otherwise = innerEntry;
+            for (int i = resumes.Count - 1; i >= 0; i--)
+            {
+                var (value, target) = resumes[i];
+                var test = new ComparisonValue(Cond.Eq, state, new ConstantValue((uint)value, state.Type, state.Width), types.Boolean);
+                ulong at = Fresh();
+                code[at] = [new ManagedBranch(address, test, new ManagedEdge(target, []), new ManagedEdge(otherwise, []))];
+                blocks[i] = otherwise = at;
+            }
+            return blocks;
+        }
+
         /// <summary>入口只留读状态和 this；其余都进 try；try、处理块、收尾依次排列。</summary>
-        private ManagedBody? Layout(ManagedRegion main)
+        private ManagedBody? Layout(ManagedRegion main, bool splitResumes = false)
         {
             if (Predecessors(entry).Length != 0)
             {
@@ -1062,8 +1089,11 @@ public static class AsyncForms
                 head = Fresh();
                 code[head] = code[first].Skip(index).ToList();
             }
+            var inner = body.Regions.Where(r => !ReferenceEquals(r, main)).ToArray();
+            var outerDispatch = splitResumes ? OuterResumeDispatch(first, head, inner, kept) : [];
+            ulong start = outerDispatch.Length > 0 ? outerDispatch[0] : head;
             var address = code[head].FirstOrDefault()?.Address ?? entry;
-            code[entry] = [.. kept, new ManagedJump(address, new ManagedEdge(head, []))];
+            code[entry] = [.. kept, new ManagedJump(address, new ManagedEdge(start, []))];
 
             // 内层 try 的入口可能就是方法入口：它从读状态之后开始，读字段不会抛出。
             var handler = main.Handler.ToHashSet();
@@ -1082,10 +1112,9 @@ public static class AsyncForms
                 code[at] = [.. code[at].Take(finish), new ManagedJump(code[rest][0].Address, new ManagedEdge(rest, []))];
             }
             IEnumerable<ulong> Moved(IEnumerable<ulong> list) => list.Select(a => a == first ? head : a).Where(a => a != entry);
-            var inner = body.Regions.Where(r => !ReferenceEquals(r, main)).ToArray();
             var inTry = new HashSet<ulong>();
             var work = new Stack<ulong>();
-            work.Push(head);
+            work.Push(start);
             // 主 try 到 state = -2 为止，后面的收尾在 try 外。
             var finishing = new HashSet<ulong>();
             while (work.TryPop(out var at))
@@ -1120,7 +1149,7 @@ public static class AsyncForms
             // 新块跟在来源之后；来源可能已不可达，这里按原有块序定位。
             var followers = added.ToLookup(a => a.Origin, a => a.Block);
             IEnumerable<ulong> Placed(ulong block) => followers[block].SelectMany(Placed).Prepend(block);
-            var placed = Placed(head).Concat(body.Blocks.Select(b => b.Address).Where(a => a != head).SelectMany(Placed)).ToArray();
+            var placed = outerDispatch.Concat(Placed(head)).Concat(body.Blocks.Select(b => b.Address).Where(a => a != head).SelectMany(Placed)).ToArray();
             var order = placed.Where(a => a != entry && inTry.Contains(a)).ToList();
             var layout = new List<ulong> { entry };
             layout.AddRange(order);

@@ -117,7 +117,8 @@ internal sealed partial class BodyBuilder
             output.Add(new ManagedAssignment(call.Address, Local(construction, callee.DeclaringType), new NewObjectValue(callee, managed)));
             return call.Kind == CallKind.Tail ? new Statement(new ManagedReturn(call.Address, null)) : null;
         }
-        var dispatched = shape.IsDispatch || call.Resolved is not null && call.Kind is CallKind.Indirect or CallKind.TailIndirect;
+        // MethodInfo.methodPointer 指向已选中的实现。经指针调用该实现也可能是 base 调用。
+        var dispatched = shape.IsDispatch || call.Op is null && call.Resolved is not null && call.Kind is CallKind.Indirect or CallKind.TailIndirect;
         var invocation = new ManagedInvocation(callee, receiver, managed, Virtual: receiver is not null
             && (dispatched || !callee.Method.IsOverridable && absorbedChecks.Contains(contents[0]))) { Constraint = TypeOracle.ConstraintOf(call) };
         LocalValue? result = null;
@@ -215,15 +216,34 @@ internal sealed partial class BodyBuilder
             .Select(location => location!.Base!)
             .Where(owner => oracle.TypeOf(owner) is { } known && (known.Equals(type) || types.IsAssignable(known, type)))
             .Distinct().ToArray();
-        if (receivers is [var receiver] && templates.UnusedParameter(callee, target.Value, -1)) return View(receiver, type, call.Address);
-        // 未使用的 this 寄存器可以被 clang 丢弃；紧邻的原生判空仍指名了该接收者。
-        if (index != 0 || block.Predecessors is not [var previous] || !previous.NormalSuccessors.Contains(block)
-            || previous.Statements.LastOrDefault(s => s is not (Ir.Jump or Nop)) is not Call { Op.Kind: OpKind.NullCheck } check
-            || values.Operands(check) is not [_, var checkedReceiver]
-            || oracle.TypeOf(checkedReceiver) is not { } checkedType || !ManagedTypes.IsReferenceType(checkedType)
-            || !(types.IsAssignable(type, checkedType) || types.IsAssignable(checkedType, type))
-            || !templates.UnusedParameter(callee, target.Value, -1)) return null;
-        return View(checkedReceiver, type, call.Address);
+        if (receivers is [var argumentOwner] && templates.UnusedParameter(callee, target.Value, -1)) return View(argumentOwner, type, call.Address);
+        // 未使用的 this 寄存器可以被 clang 丢弃；前驱的判空或非空分支可指名接收者。
+        if (index != 0 || block.Predecessors is not [var previous] || !previous.NormalSuccessors.Contains(block)) return null;
+        return previous.Statements.LastOrDefault(s => s is not (Ir.Jump or Nop)) switch
+        {
+            Call { Op.Kind: OpKind.NullCheck } check when values.Operands(check) is [_, var receiver]
+                && oracle.TypeOf(receiver) is { } known && ManagedTypes.IsReferenceType(known)
+                && (types.IsAssignable(type, known) || types.IsAssignable(known, type))
+                && templates.UnusedParameter(callee, target.Value, -1) => View(receiver, type, call.Address),
+            Ir.Branch branch when !callee.Method.IsOverridable && NonNullOnEdge(branch, block) is { } receiver
+                && oracle.TypeOf(receiver) is { } known && (known.Equals(type) || types.IsAssignable(known, type))
+                && templates.UnusedParameter(callee, target.Value, -1) => View(receiver, type, call.Address),
+            _ => null,
+        };
+    }
+
+    private Sym? NonNullOnEdge(Ir.Branch branch, Block successor)
+    {
+        if (branch.Target == branch.Fallthrough || values.Operands(branch) is not
+            [OpSym { Op: { Kind: OperatorKind.Compare, Cond: Cond.Eq or Cond.Ne } comparison, Args: [var left, var right] }])
+            return null;
+        if (successor.Start != (comparison.Cond == Cond.Ne ? branch.Target : branch.Fallthrough)) return null;
+        return (left, right) switch
+        {
+            (ConstSym { Value: 0 }, var receiver) => receiver,
+            (var receiver, ConstSym { Value: 0 }) => receiver,
+            _ => null,
+        };
     }
 
     /// <summary>直接调用同类型值方法时，未使用的 this 可以留在被覆盖的寄存器中。</summary>

@@ -125,7 +125,7 @@ public static partial class Decompilation
 
         private enum EvaluationKind { Stable, Read, Effect }
 
-        /// <summary>只有常量和局部可以和任何东西交换；只读的表达式之间可以交换，判空的先后只影响同一种异常先由谁抛出。</summary>
+        /// <summary>常量和未取地址的局部可以和任何表达式交换。取过地址的局部可能被调用改写，读取必须保留求值顺序。</summary>
         private static bool Commute(EvaluationKind a, EvaluationKind b) =>
             a == EvaluationKind.Stable || b == EvaluationKind.Stable || a == EvaluationKind.Read && b == EvaluationKind.Read;
 
@@ -136,7 +136,8 @@ public static partial class Decompilation
                 case null or PrimitiveExpression or NullReferenceExpression or ThisReferenceExpression or BaseReferenceExpression or TypeOfExpression or DefaultValueExpression or TypeReferenceExpression:
                     return EvaluationKind.Stable;
                 case IdentifierExpression identifier:
-                    return identifier.GetILVariable() is not null ? EvaluationKind.Stable
+                    return identifier.GetILVariable() is { } variable
+                        ? variable.AddressCount == 0 ? EvaluationKind.Stable : EvaluationKind.Read
                         : identifier.Annotation<MemberResolveResult>()?.Member is IField ? EvaluationKind.Read : EvaluationKind.Effect;
                 case DirectionExpression { Expression: IdentifierExpression local } when local.GetILVariable() is not null:
                     return EvaluationKind.Stable;
@@ -545,8 +546,25 @@ public static partial class Decompilation
         {
             if (cast.Parent is not MemberReferenceExpression member || member.Target != cast) return;
             var target = (cast.Annotation<ResolveResult>()?.Type ?? cast.Type.Annotation<ResolveResult>()?.Type)?.GetDefinition();
+            if (target is null) return;
+            if (member.Parent is InvocationExpression call
+                && call.Annotation<ResolveResult>() is InvocationResolveResult { Member: IMethod { IsStatic: false, IsVirtual: false, IsOverride: false, IsAbstract: false } }
+                && call.Parent is BinaryOperatorExpression { Operator: BinaryOperatorType.ConditionalAnd } condition
+                && condition.Right == call)
+            {
+                var check = condition.Left is BinaryOperatorExpression { Operator: BinaryOperatorType.ConditionalAnd } prefix
+                    ? prefix.Right : condition.Left;
+                if (check is BinaryOperatorExpression { Operator: BinaryOperatorType.InEquality, Left: { } checkedReceiver, Right: NullReferenceExpression }
+                    && check.GetResolveResult() is OperatorResolveResult { UserDefinedOperatorMethod: null }
+                    && IsStableRead(checkedReceiver) && target.Equals(StaticType(checkedReceiver)?.GetDefinition()))
+                {
+                    // 短路条件保证直接调用之前已经检查了同类型的接收者。
+                    cast.ReplaceWith(checkedReceiver.Clone());
+                    return;
+                }
+            }
             var statement = cast.Ancestors.OfType<Statement>().FirstOrDefault(a => a.Parent is BlockStatement);
-            if (target is null || statement?.Parent is not BlockStatement block) return;
+            if (statement?.Parent is not BlockStatement block) return;
             var before = block.Statements.TakeWhile(a => a != statement).Reverse().Take(8).ToArray();
             for (var i = 0; i < before.Length; i++)
             {

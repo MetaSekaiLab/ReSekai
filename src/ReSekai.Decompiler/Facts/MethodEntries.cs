@@ -38,15 +38,32 @@ public sealed class MethodEntries
     public IEnumerable<NativeMethodEntry> Definitions => definitions.Values.OrderBy(e => e.Instance.Method.Index);
 
     // 保留引用共享入口的优先级。类型参数没有 struct 约束时，优先使用保留类型参数自身 ABI 的完全共享入口。
-    internal static NativeMethodEntry SelectDefinition(IEnumerable<NativeMethodEntry> candidates) => candidates
-        .OrderBy(e => e.Instance.TypeArguments.Concat(e.Instance.MethodArguments)
-            .Any(a => !ManagedTypes.IsReferenceType(a) || FieldLayouts.IsFullyShared(a)))
-        .ThenBy(e => CopiesNativeArrayIntoView(e.Instance.Method) && !e.Instance.TypeArguments.Any(FieldLayouts.IsFullyShared)
-            || SortsGenericPointerElements(e.Instance.Method) && !e.Instance.MethodArguments.All(FieldLayouts.IsFullyShared))
-        .ThenBy(e => e.Instance.Method.Owner.GenericParameters.Concat(e.Instance.Method.GenericParameters)
-            .Any(p => (p.Attributes & System.Reflection.GenericParameterAttributes.NotNullableValueTypeConstraint) != 0)
-            || e.Instance.TypeArguments.Concat(e.Instance.MethodArguments).Any(a => !FieldLayouts.IsFullyShared(a) && !ManagedTypes.IsReferenceType(a)))
-        .ThenBy(e => e.Address).ThenBy(e => NativeBindings.Key(e.Instance), StringComparer.Ordinal).First();
+    internal static NativeMethodEntry SelectDefinition(IEnumerable<NativeMethodEntry> candidates)
+    {
+        var entries = candidates.ToArray();
+        int? sharedReturnSlot = SharedEnumReturnSlot(entries);
+        return entries.OrderBy(e => e.Instance.TypeArguments.Concat(e.Instance.MethodArguments)
+                .Any(a => !ManagedTypes.IsReferenceType(a) || FieldLayouts.IsFullyShared(a)))
+            .ThenBy(e => CopiesNativeArrayIntoView(e.Instance.Method) && !e.Instance.TypeArguments.Any(FieldLayouts.IsFullyShared)
+                || SortsGenericPointerElements(e.Instance.Method) && !e.Instance.MethodArguments.All(FieldLayouts.IsFullyShared))
+            .ThenBy(e => sharedReturnSlot is int slot && (e.Instance.MethodArguments.ElementAtOrDefault(slot) is not { } argument
+                || !FieldLayouts.IsFullyShared(argument)))
+            .ThenBy(e => e.Instance.Method.Owner.GenericParameters.Concat(e.Instance.Method.GenericParameters)
+                .Any(p => (p.Attributes & System.Reflection.GenericParameterAttributes.NotNullableValueTypeConstraint) != 0)
+                || e.Instance.TypeArguments.Concat(e.Instance.MethodArguments).Any(a => !FieldLayouts.IsFullyShared(a) && !ManagedTypes.IsReferenceType(a)))
+            .ThenBy(e => e.Address).ThenBy(e => NativeBindings.Key(e.Instance), StringComparer.Ordinal).First();
+    }
+
+    /// <summary>同一个 T 既按值传入又按值返回时，完全共享入口保留跨枚举宽度的值复制。</summary>
+    private static int? SharedEnumReturnSlot(NativeMethodEntry[] entries)
+    {
+        var method = entries[0].Instance.Method;
+        if (method.ReturnType is not GenericParameterRef { IsMethod: true } result
+            || !method.Parameters.Any(p => p.Type.Equals(result))) return null;
+        var arguments = entries.Select(e => e.Instance.MethodArguments.ElementAtOrDefault(result.Position)).OfType<DefinitionRef>();
+        return arguments.Where(a => a.Definition.IsEnum && a.Definition.Size > 0)
+            .Select(a => a.Definition.Size).Distinct().Skip(1).Any() ? result.Position : null;
+    }
 
     /// <summary>从 NativeArray&lt;T&gt; 建立值类型视图时，完整共享实现保留 sizeof(T) 的来源。</summary>
     private static bool CopiesNativeArrayIntoView(MethodDef method) => method is

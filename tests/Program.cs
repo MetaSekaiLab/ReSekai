@@ -6,6 +6,7 @@ if (args is ["textures", var textureApk, var textureOutput]) return ResourceChec
 if (args is ["controllers", var controllerApk, var controllerOutput]) return ResourceChecks.Controllers(controllerApk, controllerOutput);
 if (args is ["animations", var animationApk, var metadata, var animationResources, var animationOutput]) return AnimationChecks.Run(animationApk, metadata, animationResources, animationOutput);
 if (args is ["serial-sources", var stubAssemblies, var sourceOutput]) return SerialSourceChecks.Run(stubAssemblies, sourceOutput);
+if (args is ["live-recovery", var binary, var liveMetadata]) return LiveRecoveryChecks.Run(binary, liveMetadata);
 
 static void Assert(bool condition, string reason) { if (!condition) throw new Exception(reason); }
 static void Reject(Action action)
@@ -15,6 +16,7 @@ static void Reject(Action action)
 }
 AnimationChecks.Basic();
 TerminalValueChecks.Run();
+LiveRecoveryChecks.AddressTakenArgument();
 SerialSourceChecks.Timeout();
 Reject(() => Output.Under(Environment.CurrentDirectory, "../escape"));
 Reject(() => new Binary([1, 2, 3]).U32());

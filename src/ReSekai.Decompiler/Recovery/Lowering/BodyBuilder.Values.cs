@@ -461,7 +461,10 @@ internal sealed partial class BodyBuilder
         var copy = NewLocal(structure);
         currentOutput!.Add(new ManagedAssignment(address, copy, source));
         foreach (var (field, value) in writes)
-            currentOutput.Add(new ManagedStore(address, FieldAccess(new AddressValue(copy), field, value.Type, true, address), value));
+        {
+            var type = FieldType(field, null);
+            currentOutput.Add(new ManagedStore(address, FieldAccess(new AddressValue(copy), field, type, true, address), Coerce(value, type, address)));
+        }
         return copy;
     }
 
@@ -627,7 +630,10 @@ internal sealed partial class BodyBuilder
         var copy = NewLocal(structure);
         currentOutput!.Add(new ManagedAssignment(address, copy, source));
         foreach (var (field, value) in changed)
-            currentOutput.Add(new ManagedStore(address, FieldAccess(new AddressValue(copy), field, value.Type, true, address), value));
+        {
+            var type = FieldType(field, null);
+            currentOutput.Add(new ManagedStore(address, FieldAccess(new AddressValue(copy), field, type, true, address), Coerce(value, type, address)));
+        }
         return copy;
     }
 

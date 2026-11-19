@@ -161,16 +161,28 @@ public sealed partial class TypeOracle : Runtime.IRuntimeTyping
     public ManagedTypes Types => types;
 
     /// <summary>从接收者运行时类的虚表读取的方法；绑定仍需虚分派，不能当作静态类型上的直接方法。</summary>
-    public MethodRef? VirtualMethod(Sym pointer, Sym receiver)
+    public MethodRef? VirtualMethod(Sym pointer, Sym receiver, Call? at = null)
     {
         if (SymTable.Resolve(pointer) is not ReadSym { Width: 64 } read
             || Decompose(read.Address) is not (ReadSym { Width: 64 } klass, var offset, null, _)
             || offset < RuntimeLayout.ClassVtable
             || (offset - RuntimeLayout.ClassVtable) % RuntimeLayout.VirtualInvokeDataSize is not (0 or 8)
             || Decompose(klass.Address) is not (var instance, 0, null, _)
-            || !ReferenceEquals(SymTable.Resolve(instance), SymTable.Resolve(receiver))
+            || !ReferenceEquals(SymTable.Resolve(instance), VirtualReceiver(receiver, at))
             || TypeOf(receiver) is not { } owner || !ManagedTypes.IsReferenceType(owner)) return null;
         return DispatchResolution.VirtualSlot(owner, (int)((offset - RuntimeLayout.ClassVtable) / RuntimeLayout.VirtualInvokeDataSize), types, Substitute);
+    }
+
+    // 虚表指针可以在类型检查前读取，实际接收者则在成功分支上收窄为 isinst 的结果。
+    private Sym VirtualReceiver(Sym receiver, Call? at)
+    {
+        var resolved = SymTable.Resolve(receiver);
+        if (at is null || resolved is not ResultSym { Site: { Op.Kind: OpKind.IsInst } cast }
+            || values.Operands(cast) is not [_, var operand] || ClassOperand(cast) is not { } type)
+            return resolved;
+        var root = SymTable.Resolve(operand);
+        var block = values.BlockOf(at);
+        return Guards(root, block, block.Statements.IndexOf(at)).Any(g => g.Result is null && g.Type.Equals(type)) ? root : resolved;
     }
 
     public TypeRef? LocationType(Call call, int argument, int width) => argument < call.OriginalArgumentCount
@@ -658,6 +670,7 @@ public sealed partial class TypeOracle : Runtime.IRuntimeTyping
         long offset = 0;
         Sym? root = null, index = null;
         var scale = 0;
+        var hasUnconsumedTerm = false;
         var variable = terms.Where(t => t is not ConstSym).ToArray();
         foreach (var term in terms)
         {
@@ -671,7 +684,14 @@ public sealed partial class TypeOracle : Runtime.IRuntimeTyping
             if (variable.Length == 1) { root = term; continue; }
             if (root is null && IsAddressRoot(term)) { root = term; continue; }
             if (index is null) { (index, scale) = (term, 1); continue; }
-            root ??= term;
+            if (root is null) root = term;
+            else hasUnconsumedTerm = true;
+        }
+        if (hasUnconsumedTerm && root is not null && ArrayView(root) is { IsVector: true } array)
+        {
+            var size = ElementSize(array.Element);
+            var sum = size > 0 ? SumArrayOffsets(variable, root, size) : null;
+            return sum is null ? (address, 0, null, 0) : (root, offset, sum, size);
         }
         if (root is not null && TypeOf(root) is PointerRef && variable.Length > 2)
         {
@@ -682,6 +702,31 @@ public sealed partial class TypeOracle : Runtime.IRuntimeTyping
             scale = 1;
         }
         return (root ?? address, offset, index, scale);
+    }
+
+    /// <summary>把每个动态字节偏移按元素大小换算后相加，保留独立的下标项。</summary>
+    private Sym? SumArrayOffsets(Sym[] terms, Sym root, int size)
+    {
+        var syms = values.Syms;
+        var scales = new List<(Sym Index, int Scale)>();
+        var rootIndex = Array.IndexOf(terms, root);
+        for (var i = 0; i < terms.Length; i++)
+        {
+            if (i == rootIndex) continue;
+            var (index, scale) = Scaled(terms[i]) ?? (terms[i], 1);
+            var existing = scales.FindIndex(term => SameIndex(term.Index, index));
+            if (existing < 0) scales.Add((index, scale));
+            else scales[existing] = (scales[existing].Index, scales[existing].Scale + scale);
+        }
+        var sum = syms.Const(0, 64);
+        foreach (var (index, scale) in scales)
+        {
+            if (scale % size != 0) return null;
+            var factor = syms.Const((ulong)(scale / size), 64);
+            var scaled = syms.Binary(BinOp.Mul, syms.ZeroExtend(index, 64), factor, 64);
+            sum = syms.Binary(BinOp.Add, sum, scaled, 64);
+        }
+        return sum;
     }
 
     private static void Flatten(Sym sym, List<Sym> terms)
