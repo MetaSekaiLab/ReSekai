@@ -26,15 +26,11 @@ static class Export
             if (options.Full)
             {
                 apk.WriteNativePlugins(output);
+                WriteAndroidEditorScript(output, "ReSekaiAndroidBuild", "AndroidBuild.cs", "android:build");
                 if (model.Assemblies.Any(a => a.AssemblyName == "Firebase.Messaging"))
                     await Packages.WriteFirebaseMessagingBridge(output);
                 if (model.Assemblies.Any(a => a.AssemblyName == "Firebase.App"))
-                {
-                    const string path = "Assets/Editor/ReSekaiFirebaseAndroidBuild.cs";
-                    using var source = new StreamReader(typeof(Export).Assembly.GetManifestResourceStream("FirebaseAndroidBuild.cs")!);
-                    output.Write(path, source.ReadToEnd());
-                    output.Meta(path, Output.Guid("android:firebase-build"), "MonoImporter");
-                }
+                    WriteAndroidEditorScript(output, "ReSekaiFirebaseAndroidBuild", "FirebaseAndroidBuild.cs", "android:firebase-build");
             }
             Scripts scripts = new(model, packages, output);
             recovery = scripts.Write(work, options.Full, stagedScripts);
@@ -117,6 +113,14 @@ static class Export
         Console.WriteLine($"导出 {output.Files} 个文件，错误 {output.Errors}：{output.Root}");
         if (output.Errors != 0) Console.WriteLine($"未完成项：{Path.Join(work, "report.json")}");
         return output.Errors == 0 ? 0 : 1;
+    }
+
+    static void WriteAndroidEditorScript(Output output, string name, string resource, string guidKey)
+    {
+        string path = $"Assets/Editor/{name}.cs";
+        using var source = new StreamReader(typeof(Export).Assembly.GetManifestResourceStream(resource)!);
+        output.Write(path, source.ReadToEnd());
+        output.Meta(path, Output.Guid(guidKey), "MonoImporter");
     }
 
     static readonly HashSet<string> ModuleNames = ["ai", "androidjni", "animation", "assetbundle", "audio", "cloth", "director", "imageconversion", "imgui", "jsonserialize", "particlesystem", "physics", "physics2d", "screencapture", "terrain", "terrainphysics", "tilemap", "ui", "uielements", "umbra", "unityanalytics", "unitywebrequest", "unitywebrequestassetbundle", "unitywebrequestaudio", "unitywebrequesttexture", "unitywebrequestwww", "vehicles", "video", "vr", "wind", "xr"];

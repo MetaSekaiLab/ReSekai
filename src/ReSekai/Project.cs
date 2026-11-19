@@ -48,7 +48,7 @@ sealed class Project(Output output, Scripts scripts, ScriptLayout layouts, Packa
     AnimationNames? animationNames;
     public AnimationNames Animations => animationNames ??= new(layouts, MonoScripts, output);
     readonly Dictionary<ObjectId, Target> targets = [];
-    readonly Dictionary<ObjectId, string> paths = [];
+    readonly Dictionary<ObjectId, (string Path, bool ResourceKey)> paths = [];
     readonly HashSet<string> usedPaths = new(StringComparer.OrdinalIgnoreCase);
     readonly HashSet<string> files = [];
     readonly HashSet<ObjectId> componentScripts = [];
@@ -110,7 +110,7 @@ sealed class Project(Output output, Scripts scripts, ScriptLayout layouts, Packa
                         if (classId == 147) path = "Assets/Resources/" + path;
                         else if (path.StartsWith("assets/", StringComparison.OrdinalIgnoreCase)) path = "Assets/" + path[7..];
                         else path = "Assets/Resources/" + path;
-                        paths.TryAdd(file.Reference(pointer), path);
+                        paths.TryAdd(file.Reference(pointer), (path, classId == 147));
                     }
                 if (classId == 687078895)
                     foreach (Value pair in value["m_RenderDataMap"].Items)
@@ -156,7 +156,10 @@ sealed class Project(Output output, Scripts scripts, ScriptLayout layouts, Packa
             else if (Regex.IsMatch(file.Name, @"^[0-9a-f]{32}$") && objects.Length > 0)
             {
                 bool prefab = objects.Any(i => file.Types[i.Type].ClassId == 1);
-                var main = prefab ? Root(file, objects) : objects.OrderBy(i => Priority(file.Types[i.Type].ClassId)).ThenBy(i => i.Id).First();
+                var main = prefab ? Root(file, objects) : objects
+                    .OrderBy(i => Priority(file.Types[i.Type].ClassId))
+                    .ThenByDescending(i => paths.ContainsKey(new(file.Name, i.Id)))
+                    .ThenBy(i => i.Id).First();
                 Add(main, objects, file.Name, prefab);
             }
             else
@@ -230,8 +233,10 @@ sealed class Project(Output output, Scripts scripts, ScriptLayout layouts, Packa
                 else
                 {
                     string extension = prefab ? ".prefab" : cls switch { 21 => ".mat", 48 => ".shader", 49 => ".bytes", 72 => ".compute", 74 => ".anim", 83 => ".wav", 91 => ".controller", 128 => ".ttf", 221 => ".overrideController", 319 => ".mask", 687078895 => ".spriteatlas", _ => ".asset" };
-                    string path = paths.GetValueOrDefault(new(file.Name, main.Id)) ?? $"Assets/Objects/{Output.Safe(name.Length == 0 ? "Object" : name)}_{guid[..8]}";
-                    if (Path.HasExtension(path)) path = path[..^Path.GetExtension(path).Length];
+                    var original = paths.GetValueOrDefault(new(file.Name, main.Id));
+                    string path = original.Path ?? $"Assets/Objects/{Output.Safe(name.Length == 0 ? "Object" : name)}_{guid[..8]}";
+                    // ResourceManager 保存加载键，键尾的点号和后缀属于资源名。
+                    if (!original.ResourceKey && Path.HasExtension(path)) path = path[..^Path.GetExtension(path).Length];
                     path = Canonical(path + extension);
                     if (!usedPaths.Add(path)) { path = path[..^extension.Length] + "_" + guid[..8] + extension; if (!usedPaths.Add(path)) throw new InvalidDataException($"资源路径重复：{path}"); }
                     documents.Add(new(file.Name, main.Id, cls, guid, children.Select(i => i.Id).ToArray()) { Prefab = prefab, Path = path, Bundle = file.Bundle });
@@ -309,6 +314,14 @@ sealed class Project(Output output, Scripts scripts, ScriptLayout layouts, Packa
         {
             if (document.Path.EndsWith(".png", StringComparison.Ordinal)) return;
             string path = Path.ChangeExtension(document.Path, ".png");
+            // 单 Sprite 的导入名称取自 PNG 文件名；没有资源路径的纹理用目录消歧，保留图集查找的名字。
+            if (document.Texture?.Sprites is [var sprite] && !paths.ContainsKey(new(document.File, document.Main))
+                && atlas.ContainsKey(SpriteKey(sprite.Value["m_RenderDataKey"]))
+                && sprite.Value["m_Name"].Text is { Length: > 0 } name && Output.Safe(name) == name)
+            {
+                path = $"Assets/Objects/Sprites/{name}.png";
+                if (usedPaths.Contains(path)) path = $"Assets/Objects/Sprites/{document.Guid}/{name}.png";
+            }
             if (!usedPaths.Add(path))
             {
                 path = Path.ChangeExtension(path, null) + "_" + document.Guid[..8] + ".png";
@@ -365,6 +378,17 @@ sealed class Project(Output output, Scripts scripts, ScriptLayout layouts, Packa
         {
             int common = Schemas.Classes[114].Player!.Children.Length;
             schema = schema with { Fields = [.. schema.Children, .. value.Schema.Children.Skip(common)] };
+            if (MonoScripts.TryGetValue(file.Reference(value["m_Script"]), out var script))
+            {
+                // 渲染管线会重新应用资源设置。恢复的 GLSL 使用独立的对象矩阵 uniform。
+                string? batcher = script switch
+                {
+                    { Namespace: "UnityEngine.Rendering.Universal", Name: "UniversalRenderPipelineAsset" } => "m_UseSRPBatcher",
+                    { Namespace: "Sekai.Core.Rendering", Name: "SekaiRenderPipelineAsset" } => "useSRPBatcher",
+                    _ => null,
+                };
+                if (batcher is not null && value.Find(batcher) is not null) Set(batcher, false);
+            }
         }
         if (cls == 1)
         {

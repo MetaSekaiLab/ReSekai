@@ -4,6 +4,54 @@ namespace ReSekai;
 
 static class GeneratedSource
 {
+    public static string SpineMeshGenerator(string source, string runtime)
+    {
+        string original = source.ReplaceLineEndings("\n");
+        string code = original;
+        string upstream = runtime.ReplaceLineEndings("\n");
+        foreach (var (name, address) in new[] { ("GenerateSingleSubmeshInstruction", 172783504), ("BuildMeshWithArrays", 172788204), ("FillVertexData", 172795124) })
+        {
+            string recovered = SpineRuntimeMethod(code, upstream, name, address);
+            if (name == "GenerateSingleSubmeshInstruction" && recovered != code)
+                recovered = "#define SPINE_TRIANGLECHECK\n" + recovered;
+            code = recovered;
+        }
+        return code == original ? source : code;
+    }
+
+    public static string SpineEventQueue(string source, string runtime)
+    {
+        string original = source.ReplaceLineEndings("\n");
+        string code = SpineRuntimeMethod(original, runtime.ReplaceLineEndings("\n"), "Drain", 172500904);
+        return code == original ? source : code;
+    }
+
+    private static string SpineRuntimeMethod(string source, string runtime, string name, int address)
+    {
+        string signature = $@"\t\t(?:public|internal)(?: static)? void {name}";
+        string stub = $@"(?m)^({signature}\([^\n]*\)\n\t\t\{{\n)\t{{3}}throw global::ReSekai\.Decompiler\.Unrecovered\.Fail\({address}uL\);$";
+        if (!Regex.IsMatch(source, stub, RegexOptions.CultureInvariant)) return source;
+        var method = Regex.Match(runtime, $@"(?ms)^{signature} \([^\n]*\) \{{\n(.*?)^\t\t\}}$", RegexOptions.CultureInvariant);
+        if (!method.Success) throw new InvalidDataException($"Spine 源码缺少对应的 {name}");
+        return ReplaceOnce(source, stub, match => match.Groups[1].Value + method.Groups[1].Value.TrimEnd(), name);
+    }
+
+    public static string HomeNewsAndroid(string source) => ReplaceOnce(source.ReplaceLineEndings("\n"),
+        @"(?m)^\t\tprivate NewsDialog OpenUnreadNews\([^\n]+\)\n\t\t\{\n",
+        match => match.Value + """
+        #if UNITY_ANDROID && !UNITY_EDITOR
+                    try
+                    {
+                        using var webViewInterface = new global::UnityEngine.AndroidJavaClass("com.onevcat.uniwebview.UniWebViewInterface");
+                    }
+                    catch (global::UnityEngine.AndroidJavaException)
+                    {
+                        return null;
+                    }
+        #endif
+
+        """.ReplaceLineEndings("\n"), "ScreenLayerHome.OpenUnreadNews");
+
     public static string PaletteEditor(string source)
     {
         source = source.ReplaceLineEndings("\n");
@@ -74,6 +122,55 @@ static class GeneratedSource
     public static string EditorDirectTitle(string source) => ReplaceOnce(source.ReplaceLineEndings("\n"),
         @"(?m)^\t\tprotected override void Awake\(\)\n\t\t\{\n",
         match => match.Value + "#if UNITY_EDITOR\n\t\t\tSekaiSingletonManager.RegisterFormatters();\n#endif\n", "TitleController.Awake");
+
+    public static string AppLovinStub(string source) => """
+        #if UNITY_ANDROID
+        [global::Beebyte.Obfuscator.SkipAttribute]
+        public class AppLovinManager : global::CP.SingletonMonoBehaviour<AppLovinManager>
+        {
+            public enum AppLovinAdState
+            {
+                NotReady,
+                Canceled,
+                ReceivedReward
+            }
+
+            public void CheckATT(global::System.Action callback) => callback?.Invoke();
+
+            public void StartSDKInitialize(global::System.Action initCallback)
+            {
+                global::CP.SingletonMonoBehaviour<global::Sekai.UserAccountManager>.Instance.LoadOrCreateGudids();
+                initCallback?.Invoke();
+            }
+
+            public static bool IsSDKInitialized() => false;
+            public bool IsChangeIOBufferDuration(double currentIOBufferDuration) => false;
+            public void ResetIOBufferDuration(double preferredIOBufferDuration, double currentIOBufferDuration) { }
+            public void TryRestoreAudio() { }
+            public void DisplayMeditationDebugger() { }
+
+            public void InheritSuccessProgress(global::System.Action callback)
+            {
+                global::Sekai.ApplicationLocalSettings.DeleteSettingsInherit();
+                StartSDKInitialize(callback);
+            }
+
+            public void LoadAd(global::System.Action onSucceededAdLoad, global::System.Action onFailedAdLoadOneTime)
+                => onFailedAdLoadOneTime?.Invoke();
+
+            public void ShowRewardedAd(global::System.Action onSucceededAdDisplay, global::System.Action onFailedAdDisplay,
+                string placement = null)
+                => global::CP.SingletonMonoBehaviour<global::Sekai.AdRewardManager>.Instance.CompleteDisplayAd(AppLovinAdState.NotReady);
+        }
+        #else
+        """ + "\n" + source.TrimEnd() + "\n#endif\n";
+
+    public static string RegisterWithoutAds(string source) => ReplaceOnce(source.ReplaceLineEndings("\n"),
+        @"(?ms)^(\t\tprivate static void OnFinishRegisterUser\(bool isSucccess\)\n\t\t\{\n\t\t\tif \(isSucccess\)\n\t\t\t\{\n)(.*?)(^\t\t\t\}\n\t\t\telse\n)",
+        match => match.Groups[1].Value + "#if UNITY_ANDROID\n"
+            + "\t\t\t\tglobal::CP.SingletonMonoBehaviour<global::AppLovinManager>.Instance.StartSDKInitialize(Authentication);\n"
+            + "#else\n" + match.Groups[2].Value + "#endif\n" + match.Groups[3].Value,
+        "TitleController.OnFinishRegisterUser");
 
     public static string DevelopmentLogging(string source) => ReplaceOnce(source.ReplaceLineEndings("\n"),
         @"(?m)^\t\t\tglobal::UnityEngine\.Debug\.unityLogger\.logEnabled = false;$",

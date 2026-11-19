@@ -120,6 +120,8 @@ sealed class Scripts(ProgramModel model, Packages packages, Output output)
             }
             else if (full && assembly.AssemblyName == CriWareSdk.Assembly)
                 output.AssemblySources[assembly.AssemblyName] = "反编译 + Android APK 原生库";
+            var spineSource = packages.SpineSource;
+            List<string> spinePatches = [];
             var sdkOnly = sdkSources?.Keys.Where(path => !generated.ContainsKey(path)) ?? [];
             foreach (string relative in generated.Keys.Where(path => !replaced.Contains(path)).Concat(upstream.Keys).Concat(sdkOnly).Order(StringComparer.Ordinal))
             {
@@ -140,12 +142,31 @@ sealed class Scripts(ProgramModel model, Packages packages, Output output)
                 string code = sdkSources is null ? upstream.GetValueOrDefault(relative) ?? recovered!
                     : CriWareSdk.PlatformSource(relative, recovered, sdkSources.GetValueOrDefault(relative));
                 if (full && assembly.AssemblyName == "spine-csharp" && relative == "Spine/SequenceTimeline.cs"
-                    && packages.SpineSource is { } spine && code.Contains("base._002Ector(frameCount, array);", StringComparison.Ordinal))
+                    && spineSource is not null && code.Contains("base._002Ector(frameCount, array);", StringComparison.Ordinal))
                 {
-                    code = SpineSequenceTimeline(spine);
-                    output.Write(folder + "/LICENSE-Spine.txt", File.ReadAllBytes(Path.Join(spine, "LICENSE")));
-                    output.AssemblySources[assembly.AssemblyName] = $"反编译 + Spine {SourcePackages.Spine.Version} SequenceTimeline";
+                    code = SpineSequenceTimeline(spineSource);
+                    spinePatches.Add("SequenceTimeline");
                 }
+                if (full && assembly.AssemblyName == "spine-unity" && relative == "Spine.Unity/MeshGenerator.cs" && spineSource is not null)
+                {
+                    string fixedMesh = GeneratedSource.SpineMeshGenerator(code, File.ReadAllText(Path.Join(spineSource, SourcePackages.SpineMeshGeneratorFile)));
+                    if (fixedMesh != code)
+                    {
+                        code = fixedMesh;
+                        spinePatches.Add("MeshGenerator");
+                    }
+                }
+                if (full && assembly.AssemblyName == "spine-csharp" && relative == "Spine/EventQueue.cs" && spineSource is not null)
+                {
+                    string fixedQueue = GeneratedSource.SpineEventQueue(code, File.ReadAllText(Path.Join(spineSource, "AnimationState.cs")));
+                    if (fixedQueue != code)
+                    {
+                        code = fixedQueue;
+                        spinePatches.Add("EventQueue");
+                    }
+                }
+                if (full && assembly.AssemblyName == "Assembly-CSharp" && relative == "Sekai/ScreenLayerHome.cs")
+                    code = GeneratedSource.HomeNewsAndroid(code);
                 if (full && assembly.AssemblyName == "MagicaCloth" && relative == "MagicaCloth/BaseCloth.cs")
                     code = GeneratedSource.MagicaClothCulling(code);
                 if (full && assembly.AssemblyName == "MagicaCloth" && relative == "MagicaCloth/PhysicsManagerTeamData.cs")
@@ -154,8 +175,14 @@ sealed class Scripts(ProgramModel model, Packages packages, Output output)
                     code = GeneratedSource.MagicaClothEdgeCapsule(code);
                 if (full && assembly.AssemblyName == "Unity.RenderPipelines.Core.Runtime" && relative == "UnityEngine.Rendering/CoreUtils.cs")
                     code = GeneratedSource.EditorRenderCleanup(code);
+                if (full && assembly.AssemblyName == "Assembly-CSharp" && relative == "AppLovinManager.cs")
+                    code = GeneratedSource.AppLovinStub(code);
                 if (full && assembly.AssemblyName == "Assembly-CSharp" && relative == "Sekai/TitleController.cs")
+                {
                     code = GeneratedSource.EditorDirectTitle(code);
+                    if (scriptTypes.ContainsKey(new ScriptName("Assembly-CSharp", "", "AppLovinManager").Key))
+                        code = GeneratedSource.RegisterWithoutAds(code);
+                }
                 if (full && assembly.AssemblyName == "Assembly-CSharp" && relative == "Sekai/EnvironmentConfig.cs")
                     code = GeneratedSource.DevelopmentLogging(code);
                 if (full && assembly.AssemblyName == "Assembly-CSharp" && relative == "Sekai/SekaiSingletonManager.cs")
@@ -174,6 +201,11 @@ sealed class Scripts(ProgramModel model, Packages packages, Output output)
                     code = NativeMathSource.ForUnity(code, Path.Join(assemblies, assembly.Name));
                 output.Write(path, code);
                 output.Meta(path, guid, "MonoImporter", "  serializedVersion: 2\n  defaultReferences: []\n  executionOrder: 0\n");
+            }
+            if (spineSource is not null && spinePatches.Count > 0)
+            {
+                output.Write(folder + "/LICENSE-Spine.txt", File.ReadAllBytes(Path.Join(spineSource, "LICENSE")));
+                output.AssemblySources[assembly.AssemblyName] = $"反编译 + Spine {SourcePackages.Spine.Version} {string.Join(" / ", spinePatches)}";
             }
             if (assembly.AssemblyName is "Assembly-CSharp" or "Assembly-CSharp-firstpass") continue;
             using var module = ModuleDefinition.ReadModule(Path.Join(assemblies, assembly.Name));
@@ -242,6 +274,14 @@ sealed class Scripts(ProgramModel model, Packages packages, Output output)
         if (root.GetProperty("status").GetString() != "complete"
             || !assemblies.ToHashSet().IsSubsetOf(request.GetProperty("Assemblies").EnumerateArray().Select(a => a.GetString()!)))
             throw new InvalidDataException("恢复产物未完成或程序集范围不一致");
+        var engine = typeof(RecoverySession).Assembly;
+        using (var stream = File.OpenRead(engine.Location))
+        {
+            if (!root.TryGetProperty("implementation", out var implementation)
+                || !implementation.TryGetProperty(engine.GetName().Name!, out var hash)
+                || Convert.ToHexString(SHA256.HashData(stream)) != hash.GetString())
+                throw new InvalidDataException("恢复产物使用了不同版本的反编译器，请重新恢复或直接全量导出");
+        }
         var inputs = root.GetProperty("inputs");
         foreach (var (key, file) in new[] { ("binary", "libil2cpp.so"), ("metadata", "global-metadata.dat") })
         {
