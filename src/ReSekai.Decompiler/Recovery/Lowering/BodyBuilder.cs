@@ -68,6 +68,7 @@ internal sealed partial class BodyBuilder
         regions = plan.Regions;
         effects = new(values, oracle, regions, function.Blocks);
         order = plan.Order;
+        PlanGuardedReceivers();
         PlanSharedValues();
         return LowerBlocks();
     }

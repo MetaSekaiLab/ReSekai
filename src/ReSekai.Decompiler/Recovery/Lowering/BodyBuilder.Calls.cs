@@ -17,6 +17,7 @@ internal sealed partial class BodyBuilder
         IReadOnlyDictionary<BoundDelegateTarget, int> Methods);
 
     private readonly List<DelegateChoice> delegateChoices = [];
+    private readonly Dictionary<Call, Sym> guardedReceivers = [];
 
     private Terminator? LowerCall(Block block, int index, Call call, IReadOnlyList<Sym> operands, List<ManagedStatement> output)
     {
@@ -217,6 +218,7 @@ internal sealed partial class BodyBuilder
             .Where(owner => oracle.TypeOf(owner) is { } known && (known.Equals(type) || types.IsAssignable(known, type)))
             .Distinct().ToArray();
         if (receivers is [var argumentOwner] && templates.UnusedParameter(callee, target.Value, -1)) return View(argumentOwner, type, call.Address);
+        if (guardedReceivers.TryGetValue(call, out var guarded)) return View(guarded, type, call.Address);
         // 未使用的 this 寄存器可以被 clang 丢弃；前驱的判空或非空分支可指名接收者。
         if (index != 0 || block.Predecessors is not [var previous] || !previous.NormalSuccessors.Contains(block)) return null;
         return previous.Statements.LastOrDefault(s => s is not (Ir.Jump or Nop)) switch
@@ -230,6 +232,49 @@ internal sealed partial class BodyBuilder
                 && templates.UnusedParameter(callee, target.Value, -1) => View(receiver, type, call.Address),
             _ => null,
         };
+    }
+
+    // 原生调用不读取 this，但 C# 调用会判空。复用支配调用点的非空值，
+    // 在原读取位置保存字段，避免中间有其他调用时重新读取可能已经改变的字段。
+    private void PlanGuardedReceivers()
+    {
+        foreach (var block in order)
+        for (int i = 0; i < block.Statements.Count; i++)
+        {
+            if (block.Statements[i] is not Call { Kind: CallKind.Direct, Op: null, Target: Const target } call) continue;
+            var shape = analysis.Environment.Shape(call);
+            if (shape.Signature?.Arguments is not [{ Index: -1, Transfer: Transfer.Value, Pieces: [var piece] } slot, ..]
+                || !shape.Unused.Contains(piece.Register) || shape.IsDispatch
+                || oracle.Callee(call) is not { Method.IsOverridable: false, Method.IsStatic: false } callee
+                || !ManagedTypes.IsReferenceType(callee.DeclaringType)) continue;
+            var contents = values.ArgumentContent(call, slot, values.Operands(call).Skip(1).Take(call.Arguments.Length).ToArray());
+            if (oracle.Supply(shape, slot, callee.DeclaringType, contents) != ArgumentSupply.Default
+                || !templates.UnusedParameter(callee, target.Value, -1)
+                || FindGuardedReceiver(block, i, callee.DeclaringType) is not { } receiver) continue;
+            guardedReceivers.Add(call, receiver);
+            if (receiver is ReadSym read) materialized.Add(read);
+        }
+    }
+
+    private Sym? FindGuardedReceiver(Block use, int index, TypeRef type)
+    {
+        bool Compatible(Sym candidate) => candidate is ArgSym or ReadSym
+            && oracle.TypeOf(candidate) is { } known && (known.Equals(type) || types.IsAssignable(known, type));
+        var block = use;
+        var dominance = sharedDominance ??= Machine.Ssa.Dominators.Compute(analysis.Function);
+        while (true)
+        {
+            // 能经异常边到达使用点时，没有证据说明此前的判空成功。
+            if (block == use || block.Handler is null || block.NormalSuccessors.Any(s => s.Predecessors.Count == 1 && dominance.Dominates(s.Index, use.Index)))
+                for (var i = index - 1; i >= 0; i--)
+                    if (block.Statements[i] is Call { Op.Kind: OpKind.NullCheck } check && values.Operands(check) is [_, var checkedValue]
+                        && SymTable.Resolve(checkedValue) is var value && Compatible(value)) return value;
+            if (block.Index == 0) return null;
+            if (block.Predecessors is [var from] && from.Statements.LastOrDefault() is Ir.Branch branch
+                && NonNullOnEdge(branch, block) is { } nonNull && SymTable.Resolve(nonNull) is var edgeValue && Compatible(edgeValue)) return edgeValue;
+            block = analysis.Function.Blocks[dominance.Idom[block.Index]];
+            index = block.Statements.Count;
+        }
     }
 
     private Sym? NonNullOnEdge(Ir.Branch branch, Block successor)

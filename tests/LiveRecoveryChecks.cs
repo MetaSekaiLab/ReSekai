@@ -24,6 +24,11 @@ static class LiveRecoveryChecks
         CheckNumber(Recover(0x63f2354, "Sekai.NumberView.UpdateNumber"));
         CheckDispose(Recover(0xab705fc, "Sekai.Rendering.SekaiUIBlurSetupPass.Dispose"));
         CheckSelectedField(Recover(0x656e5e0, "Sekai.ScreenLayerGachaResult.InitializeDisplay"));
+        var home = Recover(0x5aebfb0, "Sekai.Mysekai.ScreenLayerMysekaiHomeView.Setup");
+        var submitQueries = home.Blocks.SelectMany(b => b.Statements).OfType<ManagedCall>()
+            .Where(c => c.Invocation.Method.Method.Name == "GetMysekaiHousingCompetitionSubmitData").ToArray();
+        if (submitQueries.Length != 2 || submitQueries.Any(c => c.Invocation.Receiver is not ArgumentValue { Index: 0 }))
+            throw new Exception("MySEKAI 主页两次查询必须分别在传入的 model 上执行");
         CheckResolutionDescriptor(Recover(0xa468aa4, "ResoDynamix.Runtime.Scripts.ResoDynamixController.Update"));
         var moveNext = facts.EntriesAt(0x4cdd3d0).Select(candidate => candidate.Method).OfType<MethodRef>()
             .Single(candidate => candidate.ToString() == "Sekai.OutGameController.<CreateScreenCore>d__52.MoveNext");
