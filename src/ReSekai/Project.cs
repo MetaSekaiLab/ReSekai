@@ -66,6 +66,7 @@ sealed class Project(Output output, Scripts scripts, ScriptLayout layouts, Packa
     };
     const string Builtin = "0000000000000000f000000000000000";
     const string Default = "0000000000000000e000000000000000";
+    internal const string AndroidApplicationIdentifier = "com.metamiku.resekai";
 
     public void Scan(List<AssetFile> batch)
     {
@@ -427,11 +428,13 @@ sealed class Project(Output output, Scripts scripts, ScriptLayout layouts, Packa
             if (packages.Versions.GetValueOrDefault("com.unity.purchasing") == "4.15.1"
                 && (value.Find("AndroidMinSdkVersion")?.Number ?? 0) < 23)
                 Set("AndroidMinSdkVersion", 23);
-            foreach (var setting in new[] { ("apiCompatibilityLevelPerPlatform", 3), ("scriptingBackend", 1) })
+            foreach (var setting in new (string, object)[] { ("apiCompatibilityLevelPerPlatform", 3), ("scriptingBackend", 1), ("applicationIdentifier", AndroidApplicationIdentifier) })
             {
                 var pair = schema.Children.First(c => c.Name == setting.Item1).Element!;
                 Set(setting.Item1, new[] { new Value(pair, new[] { new Value(pair.Children[0], "Android"), new Value(pair.Children[1], setting.Item2) }) });
             }
+            // 游戏数据不含包名；不覆盖时 Unity 会由公司名与日文产品名推导。
+            Set("overrideDefaultApplicationIdentifier", true);
         }
         if (cls == 687078895)
         {

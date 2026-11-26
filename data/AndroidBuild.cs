@@ -18,8 +18,9 @@ public static class ReSekaiAndroidBuild
         string sdk = Environment.GetEnvironmentVariable("RESEKAI_LOCAL_ANDROID_SDK");
         if (!string.IsNullOrEmpty(sdk)) UnityEditor.Android.AndroidExternalToolsSettings.sdkRootPath = sdk;
 #endif
-        PlayerSettings.SetApplicationIdentifier(BuildTargetGroup.Android,
-            Environment.GetEnvironmentVariable("RESEKAI_ANDROID_ID") ?? "net.resekai.rebuilt");
+        // 默认沿用导出项目设置里的包名；需要其他包名时用环境变量覆盖。
+        string identifier = Environment.GetEnvironmentVariable("RESEKAI_ANDROID_ID");
+        if (!string.IsNullOrEmpty(identifier)) PlayerSettings.SetApplicationIdentifier(BuildTargetGroup.Android, identifier);
         PlayerSettings.SetScriptingBackend(BuildTargetGroup.Android, ScriptingImplementation.IL2CPP);
         PlayerSettings.Android.targetArchitectures = AndroidArchitecture.ARM64;
         PlayerSettings.Android.useCustomKeystore = false;
