@@ -131,8 +131,8 @@ sealed class Yaml(Func<Value?, string> reference)
     static string Number(object? number) => number switch
     {
         null => "0", bool flag => flag ? "1" : "0",
-        float f when float.IsNaN(f) => ".nan", float f when float.IsPositiveInfinity(f) => ".inf", float f when float.IsNegativeInfinity(f) => "-.inf",
-        double d when double.IsNaN(d) => ".nan", double d when double.IsPositiveInfinity(d) => ".inf", double d when double.IsNegativeInfinity(d) => "-.inf",
+        float f when float.IsNaN(f) => ".nan", float f when float.IsPositiveInfinity(f) => "Infinity", float f when float.IsNegativeInfinity(f) => "-Infinity",
+        double d when double.IsNaN(d) => ".nan", double d when double.IsPositiveInfinity(d) => "Infinity", double d when double.IsNegativeInfinity(d) => "-Infinity",
         float f => f.ToString("R", CultureInfo.InvariantCulture), double d => d.ToString("R", CultureInfo.InvariantCulture),
         IFormattable value => value.ToString(null, CultureInfo.InvariantCulture), _ => throw new InvalidDataException("无效数值")
     };

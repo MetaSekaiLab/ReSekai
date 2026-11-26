@@ -8,8 +8,8 @@ static class AnimationChecks
     {
         static Value V(string name, object data) => new(new("test", name), data);
         static Value S(string name, params Value[] fields) => V(name, fields);
-        static Value Clip(float stop, byte[] stream, int streamed, float[] dense, bool pointer = false) => S("clip",
-            V("m_SampleRate", 2), S("m_ClipBindingConstant", V("genericBindings", new[] { S("binding", V("typeID", 20), V("attribute", 1), V("isPPtrCurve", pointer)) })),
+        static Value Clip(float stop, byte[] stream, int streamed, float[] dense, bool pointer = false, bool active = false) => S("clip",
+            V("m_SampleRate", 2), S("m_ClipBindingConstant", V("genericBindings", new[] { S("binding", V("typeID", active ? 1 : 20), V("attribute", active ? AnimationNames.Hash("m_IsActive") : 1u), V("isPPtrCurve", pointer)) })),
             S("m_MuscleClip", V("m_StopTime", stop), S("m_Clip", S("data",
                 S("m_StreamedClip", V("curveCount", pointer ? 0 : streamed), V("discreteCurveCount", pointer ? streamed : 0), V("data", stream)),
                 S("m_DenseClip", V("m_CurveCount", dense.Length > 0 ? 1 : 0), V("m_FrameCount", dense.Length), V("m_SampleRate", 2f), V("m_BeginTime", 0f), V("m_SampleArray", dense.Select(x => V("data", x)).ToArray())),
@@ -33,6 +33,14 @@ static class AnimationChecks
         Frame(float.NegativeInfinity, 0, 0, 0, 2); Frame(.5f, 0, 0, 0, 3); Frame(float.PositiveInfinity);
         var pointers = Animation.Decode(Clip(.5f, bytes.ToArray(), 1, [], true))[0].Channels[0];
         Require(pointers.Count == 2 && pointers[0].Time == 0 && pointers[0].Number == 2 && pointers[1].Number == 3);
+        bytes.SetLength(0); bytes.Position = 0;
+        Frame(float.NegativeInfinity, 0, 0, 0, 0); Frame(0, 0, 0, 0, 1);
+        Frame(.5f, 0, 0, 0, 0); Frame(1, 0, 0, 0, 1); Frame(float.PositiveInfinity);
+        var active = Animation.Decode(Clip(1, bytes.ToArray(), 1, [], active: true))[0].Channels[0];
+        Require(active.Select(k => (k.Time, k.Number)).SequenceEqual([(0f, 1f), (.5f, 0f), (1f, 1f)])
+            && active.All(k => k.ConstantTangents && float.IsPositiveInfinity(k.In) && float.IsPositiveInfinity(k.Out)));
+        string yaml = Yaml.Mapping("curve", new() { ["inSlope"] = float.PositiveInfinity, ["outSlope"] = float.NegativeInfinity });
+        Require(yaml.Contains("inSlope: Infinity") && yaml.Contains("outSlope: -Infinity"));
         Require(AnimationNames.Hash("Parameters/ParamBrowRX") == 0x71f42c84 && AnimationNames.Hash("") == 0 && Animation.MuscleName(199) == "RightHandTDOF.z" && Animation.MuscleName(200) is null);
 
         uint first = AnimationNames.Hash("Root/Score/Label");

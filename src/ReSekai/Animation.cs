@@ -5,6 +5,7 @@ static class Animation
     internal sealed class Key(float time, float value)
     {
         public float Time = time, Number = value, In, Out;
+        public bool ConstantTangents;
     }
     internal sealed record Curve(Value Binding, List<Key>[] Channels);
     sealed record Segment(int Frame, float Time, float A, float B, float C, float D);
@@ -16,7 +17,7 @@ static class Animation
         List<Curve> curves = bindings.Select(b => new Curve(b,
             Enumerable.Range(0, Transform(b) ? b["attribute"].Number == 2 ? 4 : 3 : 1).Select(_ => new List<Key>()).ToArray())).ToList();
         var channels = curves.SelectMany(c => c.Channels).ToArray();
-        bool[] pointers = curves.SelectMany(c => c.Channels.Select(_ => c.Binding["isPPtrCurve"].Number != 0)).ToArray();
+        var channelBindings = curves.SelectMany(c => c.Channels.Select(_ => c.Binding)).ToArray();
         var muscle = clip["m_MuscleClip"];
         var data = muscle["m_Clip"]["data"];
         var stream = data["m_StreamedClip"];
@@ -49,14 +50,28 @@ static class Animation
         for (int channel = 0; channel < segments.Length; channel++)
         {
             var source = segments[channel];
+            var binding = channelBindings[channel];
+            bool pointer = binding["isPPtrCurve"].Number != 0;
+            // GameObject 显隐的恒值段直接保存当前段的开关值，包含最后一次跳变。
+            if (binding["typeID"].Number == 1 && binding["attribute"].Number == AnimationNames.Hash("m_IsActive")
+                && !pointer && source.All(s => s.A == 0 && s.B == 0 && s.C == 0 && s.D is 0 or 1))
+            {
+                foreach (var s in source)
+                {
+                    if (s.Frame == frame - 1 || s.Frame == 0 && source.Count > 1 && source[1].Time == 0) continue;
+                    channels[channel].Add(new Key(s.Frame == 0 ? 0 : s.Time, s.D)
+                        { In = float.PositiveInfinity, Out = float.PositiveInfinity, ConstantTangents = true });
+                }
+                continue;
+            }
             var keys = source.Select(s => new Key(s.Frame == 0 ? 0 : s.Time, s.D)).ToArray();
             double left = source.Count > 0 ? source[0].D : 0;
             for (int i = 0; i < source.Count; i++)
             {
                 var s = source[i]; var key = keys[i];
                 if (s.Frame == frame - 1) continue;
-                if (s.Frame == 0 && !pointers[channel]) { left = i + 1 < source.Count ? source[i + 1].D : 0; continue; }
-                if (!pointers[channel] && i + 1 < source.Count && s.Frame < frame - 2)
+                if (s.Frame == 0 && !pointer) { left = i + 1 < source.Count ? source[i + 1].D : 0; continue; }
+                if (!pointer && i + 1 < source.Count && s.Frame < frame - 2)
                 {
                     var next = source[i + 1];
                     if (s.A != 0 || s.B != 0 || s.C != 0)
@@ -103,7 +118,7 @@ static class Animation
         }
         float clipRate = clip["m_SampleRate"].Float;
         if (frame > 1 && MathF.Round(stop * clipRate) - MathF.Round(Math.Max(0, lastTime) * clipRate) == 1 &&
-            segments.Where((s, i) => pointers[i]).Any(s => s.Any(k => k.Frame == frame - 2))) stop = Math.Max(0, lastTime);
+            segments.Where((s, i) => channelBindings[i]["isPPtrCurve"].Number != 0).Any(s => s.Any(k => k.Frame == frame - 2))) stop = Math.Max(0, lastTime);
         for (int i = 0; i < constants.Length; i++)
         {
             var keys = channels[streamedCount + denseCount + i];
@@ -171,7 +186,7 @@ static class Animation
                 : Value.Make(Child(keySchema, name), channels.Select((c, d) => ("xyzw"[d].ToString(), (object?)get(c[i]))).ToArray());
             return Value.Make(keySchema, ("time", key.Time), ("value", Vector("value", k => k.Number)),
                 ("inSlope", Vector("inSlope", k => k.In)), ("outSlope", Vector("outSlope", k => k.Out)),
-                ("tangentMode", 1), ("weightedMode", 0), ("inWeight", Vector("inWeight", _ => 1f / 3)), ("outWeight", Vector("outWeight", _ => 1f / 3)));
+                ("tangentMode", key.ConstantTangents ? 103 : 1), ("weightedMode", 0), ("inWeight", Vector("inWeight", _ => 1f / 3)), ("outWeight", Vector("outWeight", _ => 1f / 3)));
         }).ToArray();
         return Value.Make(schema, ("m_Curve", keys), ("m_PreInfinity", 2), ("m_PostInfinity", 2), ("m_RotationOrder", order));
     }
