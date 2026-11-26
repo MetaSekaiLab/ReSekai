@@ -47,6 +47,7 @@ public static partial class Decompilation
             }
             foreach (var direction in rootNode.Descendants.OfType<DirectionExpression>().ToArray()) ReadOnlyParameterByReference(direction);
             foreach (var statement in rootNode.Descendants.OfType<ThrowStatement>().ToArray()) ThrowObject(statement);
+            foreach (var allocation in rootNode.Descendants.OfType<StackAllocExpression>().ToArray()) StackAllocation(allocation);
             foreach (var declaration in rootNode.Descendants.OfType<VariableDeclarationStatement>().ToArray()) ReferenceLocal(declaration);
             foreach (var lambda in rootNode.Descendants.Where(n => n is LambdaExpression or AnonymousMethodExpression).ToArray()) StructCapture(lambda, context);
             foreach (var text in rootNode.Descendants.OfType<InterpolatedStringExpression>().ToArray()) MultilineInterpolation(text);
@@ -296,6 +297,21 @@ public static partial class Decompilation
         private static IType? StaticType(Expression expression) => expression is IdentifierExpression identifier && identifier.GetILVariable() is { } variable
             ? variable.Type
             : expression.Annotation<ResolveResult>()?.Type;
+
+        /// <summary>C# 的 stackalloc 只在指针局部的初始化里是指针：赋值改为先声明局部再赋值。</summary>
+        private static void StackAllocation(StackAllocExpression allocation)
+        {
+            if (allocation.Parent is not AssignmentExpression { Operator: AssignmentOperatorType.Assign, Parent: ExpressionStatement statement } assignment
+                || assignment.Right != allocation || statement.Parent is not BlockStatement block
+                || StaticType(assignment.Left) is not PointerType || allocation.Type is not { } element) return;
+            var scope = (AstNode?)statement.GetParent<EntityDeclaration>() ?? block;
+            var names = scope.Descendants.OfType<Identifier>().Select(i => i.Name).ToHashSet();
+            var name = "buffer";
+            for (var n = 2; names.Contains(name); n++) name = "buffer" + n;
+            allocation.Remove();
+            block.Statements.InsertBefore(statement, new VariableDeclarationStatement(new ComposedType { BaseType = element.Clone(), PointerRank = 1 }, name, allocation));
+            assignment.Right = new IdentifierExpression(name);
+        }
 
         /// <summary>固定缓冲区的首元素可用下标取引用；反编译器给出的 ref *buffer 要求先固定缓冲区。</summary>
         private static void FixedBufferFirstElement(InvocationExpression call)

@@ -68,6 +68,7 @@ internal sealed partial class BodyBuilder
         regions = plan.Regions;
         effects = new(values, oracle, regions, function.Blocks);
         order = plan.Order;
+        PlanSharedValues();
         return LowerBlocks();
     }
 
@@ -82,7 +83,7 @@ internal sealed partial class BodyBuilder
         {
             var output = new List<ManagedStatement>();
             Terminator? exit = null;
-            currentBlock = block;
+            currentBlock = sharedBlock = block;
             var holesBefore = holes.Count;
             currentOutput = output;
             for (var i = 0; i < block.Statements.Count && exit is null; i++)
@@ -115,6 +116,7 @@ internal sealed partial class BodyBuilder
         {
             currentOutput = from.Handler != to ? outputs.GetValueOrDefault(from) : null;
             sharedEdge = from.NormalSuccessors.Skip(1).Any();
+            sharedBlock = from;
         }
         while (true)
         {

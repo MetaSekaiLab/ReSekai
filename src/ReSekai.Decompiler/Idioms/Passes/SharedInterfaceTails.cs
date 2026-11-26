@@ -172,7 +172,7 @@ internal static class SharedInterfaceTails
             var tail = cut ? merge.Statements.Take(invokeEnd).ToArray() : merge.Statements.ToArray();
             if (!cut && exits.Length == 0 && tail.LastOrDefault() is not (Return or Call { Kind: CallKind.TailIndirect })) continue;
             if (slow.Statements.Any(s => s is not (Phi or Define or Call or Jump or Nop))
-                || tail.Any(s => s is not (Phi or Define or Call or Jump or Nop or Return))) continue;
+                || tail.Any(s => s is not (Phi or Define or Store or Call or Jump or Nop or Return))) continue;
             // 切开时只有合流块自己的定义能在调用之后使用（它们支配续接块）；查找两臂的定义到不了合流块之外。
             var armDefined = shared.Where(b => b != merge).SelectMany(b => b.Statements).SelectMany(Defines).ToHashSet();
             if (cut && function.Blocks.Except(shared).Any(b => b.Statements.Any(s => s is Phi p

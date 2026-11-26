@@ -357,6 +357,7 @@ internal sealed class RegionProver(ManagedTypes types, InlineEvidence evidence, 
             if (failed.Where(o => o.Path.Stalled).Select(o => o.Path.Waiting).OfType<(Program, int, int)>().Count(eager.Add) > 0) continue;
             var next = attempt.Solver.Snapshot();
             foreach (var (formal, value) in Narrowing(attempt, failed)) next.TryAdd(formal, value);
+            if (next.Count == seed.Count && !next.ContainsKey(attempt.Formals[0]) && LocalReceiverSeed(attempt) is { } local) next[attempt.Formals[0]] = local;
             if (next.Count == seed.Count) return null;
             seed = next;
         }
@@ -398,6 +399,17 @@ internal sealed class RegionProver(ManagedTypes types, InlineEvidence evidence, 
         }
         attempt.WrappedReceiver = (terms.Address(cell), source, field.Path[0], wrapper);
         return attempt.WrappedReceiver.Value.Address;
+    }
+
+    /// <summary>区域以改写某个结构体局部的不可访问字段开始：接收者只能是这个局部。</summary>
+    private static Term? LocalReceiverSeed(Attempt attempt)
+    {
+        var method = attempt.Candidate.Method;
+        if (attempt.Candidate.Kind != ReplacementKind.Call || method.Method.IsStatic || !method.Method.Owner.IsValueType) return null;
+        var receivers = attempt.Caller.Blocks[attempt.Block].Statements.Skip(attempt.Index).Take(3).OfType<ManagedStore>()
+            .Select(s => s.Target is FieldValue { Pending: not null, Receiver: AddressValue { Target: LocalValue local } } && local.Type.Equals(method.DeclaringType) ? local : null)
+            .OfType<LocalValue>().DistinctBy(l => l.Variable).ToArray();
+        return receivers is [var receiver] && attempt.Entry.Evaluate(new AddressValue(receiver)) is { Kind: TermKind.Address } address ? address : null;
     }
 
     /// <summary>形参的缩窄：失败路径的条件里只含未绑定形参的文字，取使它不成立的常量。</summary>
@@ -669,9 +681,21 @@ internal sealed class RegionProver(ManagedTypes types, InlineEvidence evidence, 
             return local;
         // 逐叶子组成，缺的叶子为零。
         var parts = new List<(IReadOnlyList<FieldRef> Path, ManagedValue Value)>();
+        // 内层结构体的全部叶子仍是一个整体（同一位置、同一局部）时按整体写：它的字段可以对调用方不可访问。
+        var covered = new HashSet<int>();
+        foreach (var group in own.Where(i => leaves[i].Path.Count > 1 && leaves.Length == tuple.Args.Length).GroupBy(i => leaves[i].Path.Fields[0]).ToArray())
+        {
+            if (FieldType(group.Key) is not DefinitionRef nested || attempt.Interpreter.Leaves(nested) is not { } inner || inner.Length != group.Count()
+                || group.All(i => tuple.Args[i].IsConstant) || group.All(i => leaves[i].Path.Fields.All(f => evidence.Accessible(f, f.DeclaringType)))
+                || Enumerable.Range(0, inner.Length).Any(i => attempt.Terms.IsView(nested, i))
+                || !group.Zip(inner).All(p => leaves[p.First].Path.Fields.Skip(1).SequenceEqual(p.Second.Path.Fields))
+                || Reify(attempt, moment, attempt.Terms.Tuple(nested, group.Select(i => tuple.Args[i]).ToArray()), nested) is not { } whole) continue;
+            parts.Add(([group.Key], whole));
+            covered.UnionWith(group);
+        }
         foreach (var i in own)
         {
-            if (tuple.Args[i].IsConstant && tuple.Args[i].Bits == 0) continue;
+            if (covered.Contains(i) || tuple.Args[i].IsConstant && tuple.Args[i].Bits == 0) continue;
             if (leaves[i].Path.Count == 0 || Reify(attempt, moment, tuple.Args[i], leaves[i].Type) is not { } value) return null;
             parts.Add((leaves[i].Path.Fields, value));
         }
@@ -889,6 +913,8 @@ internal sealed class RegionProver(ManagedTypes types, InlineEvidence evidence, 
             if (noExit is not null) return Done(new(null, $"没有出口：{noExit}", progress, ""));
         }
         string? last = null;
+        // 改写出口块的替换把值留在别的块里使用，常常留下待证访问：只在其他写法都不成立时用。
+        Outcome? split = null;
         foreach (var chosen in Choices(exits))
         {
             notes.Add($"出口 {string.Join(" ", chosen.Select(e => $"{e.Point.Block:x}:{e.Point.Statement}/{e.Covered}"))}");
@@ -914,9 +940,12 @@ internal sealed class RegionProver(ManagedTypes types, InlineEvidence evidence, 
                             notes.Add($"  替换为 {line}");
                     continue;
                 }
-                return Done(new(replaced, null, progress, form));
+                var proved = new Outcome(replaced, null, progress, form);
+                if (!form.EndsWith("+split", StringComparison.Ordinal)) return Done(proved);
+                split ??= proved;
             }
         }
+        if (split is not null) return Done(split);
         return Done(new(null, last ?? "没有可合成的替换", progress, ""));
     }
 
@@ -1024,7 +1053,17 @@ internal sealed class RegionProver(ManagedTypes types, InlineEvidence evidence, 
                 var leaf = leaves[i];
                 var location = attempt.Terms.CellRoot(0, variable, leaf.Path);
                 var content = interpreter.ReadScalar(attempt.Entry.Heap, location, leaf, false);
-                if (content is null || exit is not null && !ReferenceEquals(interpreter.ReadScalar(Snapshot(exit.Point), location, leaf, false), content))
+                if (exit is not null && interpreter.ReadScalar(Snapshot(exit.Point), location, leaf, false) is { } now && !ReferenceEquals(now, content))
+                {
+                    // 区域改写过的叶子：调用也把它写成同一个值时，调用后它就存着这个值。
+                    if (!Written(attempt, exit, location, leaf, now))
+                    {
+                        whole = false;
+                        continue;
+                    }
+                    content = now;
+                }
+                else if (content is null || exit is not null && interpreter.ReadScalar(Snapshot(exit.Point), location, leaf, false) is null)
                 {
                     whole = false;
                     continue;
@@ -1036,6 +1075,11 @@ internal sealed class RegionProver(ManagedTypes types, InlineEvidence evidence, 
             if (whole && leaves.Length > 0 && leaves[0].Path.Count > 0 && contents.Any(c => !c.IsConstant)) locals.TryAdd(attempt.Terms.Tuple(structure, contents), local);
         }
     }
+
+    /// <summary>模板（代入绑定后）在这条路径上把位置写成了 now。</summary>
+    private static bool Written(Attempt attempt, Exit exit, Term location, Leaf leaf, Term now) =>
+        attempt.Interpreter.ReadScalar(Applied(attempt.Solver, exit.Path.Path.A), location, leaf, false) is { } after
+        && ReferenceEquals(attempt.Solver.Fold(exit.Path.Path.Phi, after), attempt.Solver.Fold(exit.Path.Path.Phi, now));
 
     /// <summary>局部持有的值：标量就是局部；结构体局部的各叶子是局部的字段（不重读局部的来源，重读会带来原代码没有的隐式抛出）。</summary>
     private void Hold(Attempt attempt, Dictionary<Term, ManagedValue> locals, Term term, LocalValue local)
@@ -1141,6 +1185,7 @@ internal sealed class RegionProver(ManagedTypes types, InlineEvidence evidence, 
         var statements = new List<ManagedStatement>();
         var edges = new List<ManagedEdge>();
         IReadOnlyList<ManagedStatement>? tail = null;
+        var tails = new Dictionary<ulong, IReadOnlyList<ManagedStatement>>();
         List<ManagedCopy>? prior = null;
         for (var t = 0; t < plan.Targets.Count; t++)
         {
@@ -1162,7 +1207,17 @@ internal sealed class RegionProver(ManagedTypes types, InlineEvidence evidence, 
             var needsTail = target.Index > 0 || target.Block == attempt.Block || rewritten is not null || stores.Count > 0;
             if (needsTail)
             {
-                if (plan.Targets.Count > 1) { failure = "分派的出口在块中间"; return null; }
+                if (plan.Targets.Count > 1)
+                {
+                    // 分派到块中间：区域已覆盖这个块的前半，块只经区域到达时就从出口处开始。
+                    if (target.Block == attempt.Block || plan.Targets.Where((_, other) => other != t).Any(o => o.Block == target.Block)
+                        || caller.HandlerOf(target.Block)?.HandlerEntry != caller.HandlerOf(attempt.Block)?.HandlerEntry)
+                    { failure = "分派的出口在块中间"; return null; }
+                    tails[target.Block] = [.. Sequential(copies, at), .. stores, .. rewritten is null ? [] : new[] { rewritten },
+                        .. caller.Blocks[target.Block].Statements.Skip(target.Index + (rewritten is null ? 0 : 1))];
+                    edges.Add(new ManagedEdge(target.Block, []));
+                    continue;
+                }
                 // 出口块余下的语句并入起点块，须在同一个异常处理上下文中：不把语句搬进或搬出 try。
                 if (caller.HandlerOf(target.Block)?.HandlerEntry != caller.HandlerOf(attempt.Block)?.HandlerEntry)
                 { failure = "出口块与起点块的异常处理上下文不同，余下的语句不能并入起点块"; return null; }
@@ -1216,8 +1271,15 @@ internal sealed class RegionProver(ManagedTypes types, InlineEvidence evidence, 
             statements.Add(new ManagedBranch(at, written, edges[0], edges[1]));
         }
         else statements.Add(new ManagedJump(at, edges[0]));
-        var blocks = caller.Body.Blocks.Select(b => b.Address == attempt.Block ? new ManagedBlock(b.Address, statements) : b).ToList();
-        return Prune(caller.Body with { Blocks = blocks });
+        var blocks = caller.Body.Blocks.Select(b => b.Address == attempt.Block ? new ManagedBlock(b.Address, statements)
+            : tails.TryGetValue(b.Address, out var rest) ? new ManagedBlock(b.Address, rest) : b).ToList();
+        var replaced = Prune(caller.Body with { Blocks = blocks });
+        // 还有别的来路的块要从头执行，不能只留后半。
+        if (tails.Count > 0 && (replaced.Regions.Any(r => tails.ContainsKey(r.HandlerEntry)) || replaced.Blocks.Where(b => b.Address != attempt.Block)
+                .SelectMany(b => b.Statements).SelectMany(ManagedValues.Edges).Any(e => tails.ContainsKey(e.Target))))
+        { failure = "分派的出口在块中间，块另有来路"; return null; }
+        if (tails.Count > 0) form += "+split";
+        return replaced;
     }
 
     private ManagedValue? ConstructWrappedReceiver(Attempt attempt, Moment before, Term bound)
@@ -1371,6 +1433,15 @@ internal sealed class RegionProver(ManagedTypes types, InlineEvidence evidence, 
                 if (attempt.Interpreter.ReadValue(Snapshot(exit.Point), attempt.Terms.CellRoot(0, variable, FieldPath.Empty), local.Type, false) is not { } content)
                 { failure = $"局部 {variable} 的内容不可判定"; return default; }
                 now = content;
+                // 调用经地址把局部改成了同样的内容：调用之后就是这个局部，不用再赋值。
+                if (!ReferenceEquals(now, entryValue) && local.Type is DefinitionRef structure && attempt.Interpreter.IsStruct(structure) && now.Kind == TermKind.Tuple
+                    && attempt.Interpreter.Leaves(structure) is var leaves && leaves.Length == now.Args.Length
+                    && leaves.Select((leaf, i) => Written(attempt, exit, attempt.Terms.CellRoot(0, variable, leaf.Path), leaf, now.Args[i])).All(same => same))
+                {
+                    changed = true;
+                    if (!written.Contains(local)) written.Add(local);
+                    continue;
+                }
             }
             else now = exit.Point.Env.TryGetValue(variable, out var assigned) ? assigned : entryValue;
             if (ReferenceEquals(now, entryValue) && !changed) continue;
@@ -1554,6 +1625,8 @@ internal sealed class RegionProver(ManagedTypes types, InlineEvidence evidence, 
         var unchanged = new HashSet<ulong>(replaced.Blocks.Where(b => b.Address != attempt.Block && oldProgram.Blocks.TryGetValue(b.Address, out var old) && ReferenceEquals(old, b))
             .Select(b => b.Address));
         if (Introduced(oldProgram, newProgram, unchanged) is { } unfaithful) return unfaithful;
+        // 绕回起点的循环里没有未改动的块：两侧带着相同的状态再到起点，就回到了已在比较的情形。
+        if (Reenters(newProgram, attempt.Block, unchanged)) unchanged.Add(attempt.Block);
         var solver = new Solver(attempt.Terms, types);
         var interpreter = new Interpreter(types, solver, evidence) { Meter = attempt.Interpreter.Meter, SplitFieldAliases = true };
         var validation = new Attempt
@@ -1607,6 +1680,20 @@ internal sealed class RegionProver(ManagedTypes types, InlineEvidence evidence, 
             }
         }
         return null;
+    }
+
+    /// <summary>从块出发不经过未改动的块能再到这个块。</summary>
+    private static bool Reenters(Program program, ulong start, IReadOnlySet<ulong> unchanged)
+    {
+        var seen = new HashSet<ulong>();
+        var pending = new Stack<ulong>([start]);
+        while (pending.TryPop(out var block))
+            foreach (var edge in program.Blocks[block].Statements.SelectMany(ManagedValues.Edges))
+            {
+                if (edge.Target == start) return true;
+                if (!unchanged.Contains(edge.Target) && seen.Add(edge.Target)) pending.Push(edge.Target);
+            }
+        return false;
     }
 
     private static SideState WithUnchanged(SideState side, IReadOnlySet<ulong> unchanged) => new()

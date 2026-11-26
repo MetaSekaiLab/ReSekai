@@ -39,7 +39,7 @@ internal static class ExceptionNormalization
                     }
         // selector 常量先折叠分支，再收缩落地链：收缩把链上的常量移到各抛出点，之后不再参与折叠。
         Machine.Ssa.Lowering.Cleanup(function);
-        while (FoldBranches(function))
+        while (FoldBranches(function) | DropFalseChecks(function))
             Machine.Ssa.Lowering.Cleanup(function);
         ContractLandingChains(function);
         // 收缩后成为落地块的目标可能只是终止或继续展开。
@@ -48,6 +48,22 @@ internal static class ExceptionNormalization
                 MachineFunction.RemoveEdgeAt(block, block.Successors.Count - 1);
         var errors = Machine.Ssa.Lowering.Cleanup(function);
         if (errors.Count > 0) throw new InvalidOperationException($"异常入口规范化后 SSA 不成立：{errors[0]}");
+    }
+
+    /// <summary>
+    /// selector 定下之后恒不成立的检查。清理路径里对同一空引用的判空会被 clang 合到落地块的 selector 判断上，
+    /// 对托管异常它不会抛出；块里没有别的调用时也不再有异常边。
+    /// </summary>
+    private static bool DropFalseChecks(MachineFunction function)
+    {
+        var changed = false;
+        foreach (var block in function.Blocks)
+        {
+            if (block.Statements.RemoveAll(s => s is Call { Op.Kind: OpKind.ThrowIf, Arguments: [var condition] } && Fold.Simplify(condition) is Const { Value: 0 }) == 0) continue;
+            changed = true;
+            if (block.Handler is not null && !block.Statements.Any(s => s is Call)) MachineFunction.RemoveEdgeAt(block, block.Successors.Count - 1);
+        }
+        return changed;
     }
 
     /// <summary>块中的调用都是结束 catch。</summary>

@@ -235,7 +235,13 @@ public sealed partial class TypeOracle
 
     /// <summary>结构体 φ 的每条入边都能整体取得：值与写入都整体进行，不需要逐个访问叶子。</summary>
     public IReadOnlyList<(ValueProjection Projection, PhiSym Phi, int Low)>? WholeStructPhi(AggregatePlan plan, DefinitionRef structure) =>
-        StructPhiLeaves(plan) is { } leaves && Enumerable.Range(0, leaves[0].Phi.Sources.Length).All(j => StructPhiWhole(leaves, structure, j) is not null) ? leaves : null;
+        StructPhiLeaves(plan) is { } leaves && Enumerable.Range(0, leaves[0].Phi.Sources.Length).ToArray() is var edges
+            && edges.Any(j => StructPhiWhole(leaves, structure, j) is not null)
+            && edges.All(j => StructPhiWhole(leaves, structure, j) is not null || StructPhiDefault(leaves, j)) ? leaves : null;
+
+    /// <summary>结构体 φ 的这条入边是默认值：各叶子的来源都是零或未定义。</summary>
+    private bool StructPhiDefault(IReadOnlyList<(ValueProjection Projection, PhiSym Phi, int Low)> leaves, int index) =>
+        leaves.All(l => l.Phi.Sources[index] is { } source && SymTable.Segments(values.Syms.Slice(source, l.Low, l.Projection.Width)).All(s => SymTable.IsZero(s) || SymTable.Resolve(s) is UndefSym));
 
     /// <summary>直接字段的位来源，供值组成与逐字段写入共用。</summary>
     public IReadOnlyList<ProjectedSym>? FieldValues(Sym bits, DefinitionRef structure)

@@ -47,7 +47,11 @@ internal static class JumpTables
         var jump = (IndirectJump)block.Statements[^1];
         var resolver = new EntryConstants(machine, entry);
         // 表基址常在循环外算好放在被调用者保存的寄存器里：把能沿前驱确定为常量的入口值代入
-        var target = Fold.Simplify(ExprMap.Map(state.Eval(jump.Target), e => e is Read r ? resolver.Resolve(r, block) : null));
+        // 下标是前驱检查过上界的寄存器：循环的回边还没探索到时它会暂时像个常量，不能代入。
+        var symbolic = state.Eval(jump.Target);
+        var indices = ExprMap.Walk(symbolic).OfType<Read>().Where(r => r.Storage.Bank == Bank.Gpr).Distinct()
+            .Where(r => block.Predecessors.Any(p => Bound(machine.Convention, p, block, r) is not null)).ToHashSet();
+        var target = Fold.Simplify(ExprMap.Map(symbolic, e => e is Read r && !indices.Contains(r) ? resolver.Resolve(r, block) : null));
         // 查表是最外层的读取；下标本身也可以来自读取（栈槽里的副本），嵌在查表地址里。
         var loads = ExprMap.Walk(target).OfType<Load>().ToList();
         var outer = loads.Where(l => !loads.Any(o => !ReferenceEquals(o, l) && ExprMap.Walk(o.Address).Any(e => ReferenceEquals(e, l)))).ToList();
@@ -56,13 +60,15 @@ internal static class JumpTables
         if (!Decompose(load.Address, out var tableBase, out var index, out var scale)) return null;
         var root = StripExtensions(index);
         // 上界由前驱的检查给出时，下标要是能和检查对上的寄存器；个数已在别处证明时不需要。
-        if (knownCount is null && root is not Read { Storage.Bank: Bank.Gpr }
-            && !(root is Binary { Op: BinOp.And, Left: var masked, Right: Const { Value: <= uint.MaxValue } } && StripExtensions(masked) is Read { Storage.Bank: Bank.Gpr })) return null;
-
-        if (knownCount is null && block.Start == entry) return null;
-        var bounds = knownCount is { } given ? [given] : block.Predecessors.Select(predecessor => Bound(machine.Convention, predecessor, block, root)).ToArray();
-        if (bounds.Length == 0 || bounds.Any(bound => bound is null)) return null;
-        var count = bounds.Max()!.Value;
+        if (knownCount is not { } count)
+        {
+            var checks = block.Start == entry ? [] : block.Predecessors.Select(predecessor => Bound(machine.Convention, predecessor, block, root)).ToArray();
+            var checkable = root is Read { Storage.Bank: Bank.Gpr }
+                || root is Binary { Op: BinOp.And, Left: var masked, Right: Const { Value: <= uint.MaxValue } } && StripExtensions(masked) is Read { Storage.Bank: Bank.Gpr };
+            // 下标只有几位（位段或掩码）时自身就有上界：编译器对覆盖全部取值的 switch 不再检查。
+            if ((checkable && checks.Length > 0 && checks.All(bound => bound is not null) ? checks.Max() : SelfBound(index)) is not { } bounded) return null;
+            count = bounded;
+        }
         if (count <= 0 || count > MaxEntries) return null;
         var targets = new ulong[count];
         for (var i = 0; i < count; i++)
@@ -113,6 +119,18 @@ internal static class JumpTables
         return true;
     }
 
+    /// <summary>位段、低位掩码这类下标的取值个数。掩码须是连续低位，否则表项个数不能这样计算。</summary>
+    private static int? SelfBound(Expr index)
+    {
+        while (index is Ir.Convert { Kind: ConvKind.ZeroExtend } extension) index = extension.Operand;
+        return index switch
+        {
+            Extract { Width: > 0 and <= 8 } field => 1 << field.Width,
+            Binary { Op: BinOp.And, Right: Const { Value: > 0 and < 256 } mask } when (mask.Value & (mask.Value + 1)) == 0 => (int)mask.Value + 1,
+            _ => null,
+        };
+    }
+
     private static Expr StripExtensions(Expr expr)
     {
         while (expr is Ir.Convert { Kind: ConvKind.ZeroExtend or ConvKind.SignExtend or ConvKind.Truncate } c) expr = c.Operand;
@@ -133,22 +151,31 @@ internal static class JumpTables
     internal static int? Bound(CallingConvention convention, Block predecessor, Block block, Expr index)
     {
         if (predecessor.Handler == block || predecessor.Statements.LastOrDefault() is not Branch branch) return null;
-        var state = new SymbolicState(convention);
-        foreach (var stmt in predecessor.Statements.Take(predecessor.Statements.Count - 1)) state.Step(stmt);
-        if (state.Eval(branch.Condition) is not Compare { Right: Const limit } compare) return null;
         var takenToBlock = branch.Target == block.Start;
-        var fallToBlock = branch.Fallthrough == block.Start;
-        if (takenToBlock == fallToBlock) return null;
-        var atEnd = state.Eval(index);
-        if (LowBits(atEnd, compare.Left.Width) != compare.Left) return null;
-        var n = limit.Value;
-        ulong? count = (compare.Cond, takenToBlock) switch
+        if (takenToBlock == (branch.Fallthrough == block.Start)) return null;
+        var body = predecessor.Statements.Take(predecessor.Statements.Count - 1).ToArray();
+        // 循环入口还没成为块首时，块前面给下标的初值会把比较折成常量；检查只看末尾几条语句，从其中任一处起算都成立。
+        return Check(body) ?? Enumerable.Range(1, Math.Min(8, body.Length)).Select(tail => Check(body[^tail..])).FirstOrDefault(n => n is not null);
+
+        int? Check(Stmt[] statements)
         {
-            (Cond.Ult, true) or (Cond.Uge, false) => n,
-            (Cond.Ule, true) or (Cond.Ugt, false) => n + 1,
-            _ => null,
-        };
-        return count is { } value && value <= MaxEntries ? (int)value : null;
+            var state = new SymbolicState(convention);
+            foreach (var stmt in statements) state.Step(stmt);
+            if (state.Eval(branch.Condition) is not Compare { Right: Const limit } compare) return null;
+            if (LowBits(state.Eval(index), compare.Left.Width) != compare.Left) return null;
+            return Entries(compare.Cond, limit.Value);
+        }
+
+        int? Entries(Cond cond, ulong n)
+        {
+            ulong? count = (cond, takenToBlock) switch
+            {
+                (Cond.Ult, true) or (Cond.Uge, false) => n,
+                (Cond.Ule, true) or (Cond.Ugt, false) => n + 1,
+                _ => null,
+            };
+            return count is { } value && value <= MaxEntries ? (int)value : null;
+        }
     }
 }
 

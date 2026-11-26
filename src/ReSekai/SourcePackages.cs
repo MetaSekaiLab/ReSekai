@@ -16,11 +16,6 @@ sealed record SourcePackages(string Name, string Version, string Assembly, strin
             "47E9211506D7103274A7A0696E723B06A2E83B8634263A42BC4128559BE6D07A"),
     ];
 
-    public static readonly SourcePackages Spine = new("com.esotericsoftware.spine.spine-csharp", "4.1.2", "spine-csharp", "EsotericSoftware/spine-runtimes",
-        "77a5db0ec6d16331f5efbaa7662bba9355bd3424", "spine-csharp/src", "spine-csharp/LICENSE",
-        "E1F690112FAC802B5A0E016AEB4243243243844AAA44D6B61EF459862EC9DEDD");
-    internal const string SpineMeshGeneratorFile = "MeshGenerator.Unity.cs";
-
     public static readonly SourcePackages Cubism = new("com.live2d.cubism", "5-r.1", "Assembly-CSharp", "Live2D/CubismUnityComponents",
         "9f1012b589b7f24f6a59a9933a3d021febd5ae46", "Assets/Live2D/Cubism", "Assets/Live2D/Cubism/LICENSE.md",
         "AA09B791EF34E553F38069EFA9025EA849C5ACE53C7A8CC5601550A1D4926914");
@@ -52,13 +47,6 @@ sealed record SourcePackages(string Name, string Version, string Assembly, strin
             Extract(entry, relative);
         }
         Extract(license, "LICENSE");
-        if (this == Spine)
-        {
-            var mesh = archive.GetEntry(root + "spine-unity/Assets/Spine/Runtime/spine-unity/Mesh Generation/MeshGenerator.cs")
-                ?? throw new InvalidDataException("Spine 源码包缺少 Unity MeshGenerator");
-            Extract(mesh, SpineMeshGeneratorFile);
-        }
-
         void Extract(ZipArchiveEntry entry, string relative)
         {
             string destination = Output.Under(directory, relative);

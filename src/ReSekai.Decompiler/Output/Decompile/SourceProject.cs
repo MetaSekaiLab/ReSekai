@@ -83,6 +83,8 @@ public static class SourceProject
         ("System.Runtime.InteropServices", "CharSet", "internal enum CharSet { None = 1, Ansi = 2, Unicode = 3, Auto = 4 }"),
         ("System.Runtime.InteropServices", "StructLayoutAttribute", "internal sealed class StructLayoutAttribute : global::System.Attribute { public StructLayoutAttribute(LayoutKind layoutKind) { } public int Pack; public int Size; public CharSet CharSet; }"),
         ("System.Runtime.InteropServices", "FieldOffsetAttribute", "internal sealed class FieldOffsetAttribute : global::System.Attribute { public FieldOffsetAttribute(int offset) { } }"),
+        ("System.Runtime.InteropServices", "UnmanagedType", "internal enum UnmanagedType { U1 = 4, ByValArray = 30 }"),
+        ("System.Runtime.InteropServices", "MarshalAsAttribute", "internal sealed class MarshalAsAttribute : global::System.Attribute { public MarshalAsAttribute(UnmanagedType unmanagedType) { } public int SizeConst; }"),
         ("System.Runtime.CompilerServices", "MethodImplOptions", "internal enum MethodImplOptions { Unmanaged = 4, NoInlining = 8, ForwardRef = 16, Synchronized = 32, NoOptimization = 64, PreserveSig = 128, AggressiveInlining = 256, AggressiveOptimization = 512, InternalCall = 4096 }"),
         ("System.Runtime.CompilerServices", "MethodImplAttribute", "internal sealed class MethodImplAttribute : global::System.Attribute { public MethodImplAttribute() { } public MethodImplAttribute(short value) { } public MethodImplAttribute(MethodImplOptions methodImplOptions) { } }"),
         // 程序集版本由编译器写进程序集表，不是特性实例；元数据里只剩版本号，类型本身被裁掉。

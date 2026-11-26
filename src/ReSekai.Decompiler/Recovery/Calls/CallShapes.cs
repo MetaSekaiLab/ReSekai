@@ -45,6 +45,7 @@ public sealed class CallShapes(ProgramFacts facts, ManagedAbi abi, Func<ulong, S
             var (candidates, signature) = Direct(target.Value);
             var named = signature is null ? Named(call) : null;
             if (named is var (instance, namedSignature)) (candidates, signature) = ([instance], namedSignature);
+            else if (signature is not null) signature = Concrete(call, candidates, signature);
             var ignored = signature?.Arguments.SelectMany(a => a.Pieces).Select(p => p.Register)
                 .Where(r => r.Bank is Bank.Gpr or Bank.Vec && unused(target.Value, r)).ToHashSet() ?? [];
             return new(call, candidates, signature) { Unused = ignored, LocalCopy = named is not null };
@@ -78,6 +79,31 @@ public sealed class CallShapes(ProgramFacts facts, ManagedAbi abi, Func<ulong, S
                 && abi.Machine(method, out _) is { MethodInfo: { } info } signature && info.Register == call.Sources[i])
                 return (method, signature);
         return null;
+    }
+
+    /// <summary>
+    /// 完全共享的实现按指针收发每个 T。隐藏 MethodInfo 给出确切实例时，实例的实参类型决定指针的含义：
+    /// 引用类型就是对象引用本身，大小已知的值类型是已知大小的副本。
+    /// </summary>
+    private MachineSignature Concrete(Call call, MethodRef[] candidates, MachineSignature signature)
+    {
+        if (signature.MethodInfo is not { } info || !signature.Indirections.Any(v => v.Size < 0)) return signature;
+        var position = call.ArgumentIndex(info.Register);
+        if (position < 0 || call.Arguments[position] is not Symbol { Kind: SymbolKind.Method, Value: MethodRef instance }
+            || candidates.Length == 0 || candidates.Any(c => c.Method != instance.Method)) return signature;
+        MachineValue Refined(MachineValue value)
+        {
+            if (value.Size >= 0 || value.Transfer == Transfer.Value) return value;
+            var type = value.Index == MachineSignature.ReturnIndex ? instance.Concrete(instance.Method.ReturnType)
+                : value.Index == -1 ? new ByRefRef(instance.DeclaringType) : instance.Concrete(instance.Method.Parameters[value.Index].Type);
+            // 类型参数本身的含义取决于实例，仍是共享的。
+            if (type is GenericParameterRef || type is ByRefRef { Element: GenericParameterRef }) return value;
+            if (value.Transfer == Transfer.Copy && ManagedTypes.IsReferenceType(type))
+                return value with { Type = type, Transfer = Transfer.Value, Size = 8, Access = MemoryAccess.None };
+            var stored = type is ByRefRef byRef ? byRef.Element : type;
+            return !ManagedAbi.SharedValue(stored) && abi.Size(stored) is > 0 and var size ? value with { Type = type, Size = size } : value;
+        }
+        return signature with { Arguments = signature.Arguments.Select(Refined).ToArray(), Return = signature.Return is { } result ? Refined(result) : null };
     }
 
     /// <summary>直接调用目标的各候选及其机器签名（检查用）。</summary>

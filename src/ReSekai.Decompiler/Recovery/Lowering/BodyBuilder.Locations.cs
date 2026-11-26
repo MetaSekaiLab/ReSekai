@@ -119,6 +119,12 @@ internal sealed partial class BodyBuilder
             case LocationKind.Reference:
                 {
                     var pointer = View(location.Base!, location.Through ?? oracle.TypeOf(location.Base!), address);
+                    if (location.FieldSequence)
+                    {
+                        var start = new PinnedReferenceValue(new AddressValue(Nest(pointer, path, location.Type, store: true, address)), location.Type);
+                        return new IndirectValue(new PointerOffsetValue(start, new BinaryValue(BinOp.Mul, View(location.Index!, types.Int64, address),
+                            new ConversionValue(ConvKind.ZeroExtend, new SizeOfValue(location.Type, types.Int32), types.Int64, 64), types.Int64, 64)), location.Type, Width(location.Type));
+                    }
                     if (location.FixedBuffer)
                     {
                         var first = new AddressValue(Nest(pointer, path, location.Type, store: true, address));

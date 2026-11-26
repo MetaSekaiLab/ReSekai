@@ -11,6 +11,9 @@ internal static class UnboxGuardsPass
     internal static bool Run(MachineFunction function, IdiomRewriter.Defs defs)
     {
         var changed = false;
+        var unboxed = function.Blocks.SelectMany(b => b.Statements).OfType<Call>().Where(c => c.Op?.Kind == OpKind.Unbox)
+            .SelectMany(c => c.Defines.OfType<Variable>()).ToHashSet();
+        bool Transparent(Stmt statement, bool allowStaticReads) => UnboxGuardsPass.Transparent(statement, allowStaticReads, unboxed, defs);
         foreach (var block in function.Blocks)
             for (var i = 0; i < block.Statements.Count; i++)
             {
@@ -21,7 +24,15 @@ internal static class UnboxGuardsPass
                 var following = block.Statements.Skip(i + 1).FirstOrDefault(s => !Transparent(s, allowStaticReads: true));
                 Block? successor = null;
                 var moveUnbox = false;
-                if (following is null && block.NormalSuccessors.ToArray() is [var next]
+                var edge = -1;
+                // 两条路径各自检查之后共用一次拆箱：拆箱的对象是 φ，按这条边的来源与检查的对象对应。
+                if (following is null && block.Handler is null && block.NormalSuccessors.ToArray() is [var join] && join.Predecessors.Count > 1
+                    && !join.IsLandingPad && join.Handler is null)
+                {
+                    edge = join.Predecessors.IndexOf(block);
+                    following = join.Statements.FirstOrDefault(s => s is not Phi && !Transparent(s, allowStaticReads: true));
+                }
+                else if (following is null && block.NormalSuccessors.ToArray() is [var next]
                     && next.Predecessors.Count == 1 && !next.IsLandingPad && block.Handler == next.Handler)
                 {
                     var allowStaticReads = block.Handler is null;
@@ -36,8 +47,11 @@ internal static class UnboxGuardsPass
                     }
                 }
                 if (following is not Call { Op.Kind: OpKind.Unbox, Arguments: [var value, ..] } unbox
-                    || !Equals(unbox.Op.Operand, type) || !Equals(defs.Expand(value), obj))
+                    || !Equals(unbox.Op.Operand, type) || !Equals(defs.Expand(Incoming(value)), obj))
                     continue;
+                Expr Incoming(Expr operand) => edge >= 0 && operand is Use use
+                    && block.NormalSuccessors.Single().Statements.OfType<Phi>().FirstOrDefault(p => p.Target == use.Variable) is { } phi
+                    && phi.Sources.Length > edge ? new Use(phi.Sources[edge], use.Width) : operand;
                 Call? moved = null;
                 if (moveUnbox)
                 {
@@ -75,9 +89,11 @@ internal static class UnboxGuardsPass
             or Binary { Op: BinOp.SDiv or BinOp.UDiv or BinOp.SRem or BinOp.URem });
 
     // beforefieldinit 静态字段读取可在拆箱之后执行；值的定义仍留在原位置。
-    private static bool Transparent(Stmt statement, bool allowStaticReads) => statement is Nop or Jump
+    // 拆箱结果指向已装箱的对象，读取它不会抛出。
+    private static bool Transparent(Stmt statement, bool allowStaticReads, HashSet<Variable> unboxed, IdiomRewriter.Defs defs) => statement is Nop or Jump
         || statement is Define define && ExprMap.Walk(define.Value).All(part => part switch
         {
+            Load load when SplitPass.Split(defs.Expand(load.Address)).Item1 is Use root && unboxed.Contains(root.Variable) => true,
             Load load => allowStaticReads && SplitPass.Split(load.Address) is (Symbol { Kind: SymbolKind.StaticFields, Value: DefinitionRef owner }, _)
                 && (owner.Definition.Attributes & System.Reflection.TypeAttributes.BeforeFieldInit) != 0,
             Intrinsic or Unknown or Ir.Read or Binary { Op: BinOp.SDiv or BinOp.UDiv or BinOp.SRem or BinOp.URem } => false,

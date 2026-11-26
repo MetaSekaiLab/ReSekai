@@ -172,9 +172,11 @@ public sealed class Skeleton
         var explicitLayout = (type.Attributes & SR.TypeAttributes.ExplicitLayout) != 0;
         foreach (var field in type.Fields)
         {
-            // 没有封送数据，去掉 HasFieldMarshal
+            // 没有认出封送数据的，去掉 HasFieldMarshal
             var attributes = (FieldAttributes)field.Attributes & ~FieldAttributes.HasFieldMarshal;
             var definition = new FieldDefinition(field.Name, attributes, Reference(module, field.Type, created, null));
+            if (field.Marshal is { } marshal)
+                definition.MarshalInfo = marshal.Kind == FieldMarshalKind.FixedArray ? new FixedArrayMarshalInfo { Size = marshal.Length, ElementType = NativeType.None } : new MarshalInfo(NativeType.U1);
             if (definition.IsLiteral) definition.Constant = field.Constant;
             if (field.InitialValue is not null) definition.InitialValue = field.InitialValue;
             if (explicitLayout && !field.IsStatic && !definition.IsLiteral)

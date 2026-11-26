@@ -311,6 +311,10 @@ public sealed partial class SymTable
         var shift = ConstantAmount(right);
         switch (op)
         {
+            // clang 把乘以 2^j·(2^k+1) 拆成移位与加法：合回一个乘数，下标的元素大小才看得出来。
+            case BinOp.Shl when shift > 0 && shift < width && left is OpSym { Op: { Kind: OperatorKind.Binary, Binary: BinOp.Mul }, Args: [var scaled, ConstSym { Value: not 0 } by] }
+                && left.Width == width && scaled.Width == width && !System.Numerics.BitOperations.IsPow2(by.Value):
+                return Binary(BinOp.Mul, scaled, Const(by.Value << shift, width), width);
             case BinOp.Shl when shift >= 0:
                 return shift >= width ? Zero(width) : Concat(Zero(shift), Slice(left, 0, width - shift));
             case BinOp.LShr when shift >= 0:
@@ -325,6 +329,10 @@ public sealed partial class SymTable
                 return bits;
             case BinOp.Add or BinOp.Sub when right is ConstSym { Value: 0 }:
                 return left;
+            case BinOp.Add when width is 32 or 64 && Multiple(left, right, width) is { } product:
+                return product;
+            case BinOp.Add when width is 32 or 64 && Multiple(right, left, width) is { } swapped:
+                return swapped;
             // InstCombine 把 sext(x + c) << k 写成 ((x << n) + (c << n)) asr (n - k)。低半部分全零的加减不产生进位，只作用于高半部分。
             case BinOp.Add or BinOp.Sub when left.Width == width && right.Width == width && Math.Min(LowZeros(left), LowZeros(right)) is var zeros && zeros >= width / 2:
                 return Concat(Zero(zeros), Binary(op, Slice(left, zeros, width - zeros), Slice(right, zeros, width - zeros), width - zeros));
@@ -339,6 +347,12 @@ public sealed partial class SymTable
         }
         return Op(Operator.Of(op), width, left, right);
     }
+
+    /// <summary>x + (x &lt;&lt; k) = x·(2^k + 1)。</summary>
+    private Sym? Multiple(Sym single, Sym shifted, int width) =>
+        single is not ConstSym && single.Width == width && shifted is ConcatSym { Parts: [ConstSym { Value: 0, Width: > 0 and <= 6 } zeros, ..] }
+        && ReferenceEquals(Resolve(Concat(Zero(zeros.Width), Slice(single, 0, width - zeros.Width))), shifted)
+            ? Binary(BinOp.Mul, single, Const((1UL << zeros.Width) + 1, width), width) : null;
 
     /// <summary>常量移位量；向量宽度的常量是低 64 位与全零高位的拼接。其余为 -1。</summary>
     private static int ConstantAmount(Sym amount) => amount switch
@@ -435,6 +449,9 @@ public sealed partial class SymTable
             if (constant is { Value: 0 or 1 } && Bit(value) is { } bit)
                 return (cond == Cond.Ne) == (constant.Value == 0) ? bit : Not(bit);
         }
+        // 与高半全一、低半全零的常量做无符号比较，只看高半是否全一（打包的小结构体按整个寄存器比较）。
+        if (cond is Cond.Ult or Cond.Uge && right is ConstSym { Width: 64, Value: 0xFFFFFFFF_00000000 })
+            return Compare(cond == Cond.Ult ? Cond.Ne : Cond.Eq, Slice(left, 32, 32), Const(uint.MaxValue, 32));
         return Op(Operator.Of(cond), 1, left, right);
     }
 

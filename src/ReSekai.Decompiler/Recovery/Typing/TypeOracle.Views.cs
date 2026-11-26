@@ -53,22 +53,36 @@ public sealed partial class TypeOracle
     {
         if (phi.Projection is not { } projection) return null;
         var (whole, low) = projection;
-        var candidates = whole.Sources.OfType<Sym>().Select(TypeOf).OfType<DefinitionRef>().Distinct().ToArray();
-        if (candidates.Where(s => types.Kind(s) == TypeKind.Struct && types.StorageBits(s) == whole.Width)
-                .OrderByDescending(s => Representation(s).Count).FirstOrDefault() is not { } structure
-            || !whole.Sources.All(source => source is not null && (TypeOf(source)?.Equals(structure) == true
-                || WholeRead(source, structure) is not null || TypeOf(source) is { } sourceType
-                    && Representation(structure).Any(t => t.Type.Equals(sourceType))))
-            || types.Project(structure, low, phi.Width) is not { } field) return null;
+        if (StructureOf(whole) is not { } structure || types.Project(structure, low, phi.Width) is not { } field) return null;
         Use(whole, structure);
         return (whole, structure, field.Path, field.Type);
+    }
+
+    /// <summary>合流的每个来源都是同一结构体的整个值。</summary>
+    private DefinitionRef? StructureOf(PhiSym whole)
+    {
+        var candidates = whole.Sources.OfType<Sym>().Select(TypeOf).OfType<DefinitionRef>().Distinct().ToArray();
+        return candidates.Where(s => types.Kind(s) == TypeKind.Struct && types.StorageBits(s) == whole.Width)
+                .OrderByDescending(s => Representation(s).Count).FirstOrDefault() is { } structure
+            && whole.Sources.All(source => source is not null && (TypeOf(source)?.Equals(structure) == true
+                || WholeRead(source, structure) is not null || TypeOf(source) is { } sourceType
+                    && Representation(structure).Any(t => t.Type.Equals(sourceType)))) ? structure : null;
     }
 
     /// <summary>标量合流的投影复用完整载体，避免为循环中的每一级截断建立新的合流。</summary>
     public (PhiSym Whole, TypeRef Type, int Low)? ProjectedScalar(PhiSym phi)
     {
-        if (phi.Width is not (> 1 and < 64 and not (8 or 16 or 32)) || phi.Projection is not { } projection) return null;
+        if (phi.Projection is not { } projection) return null;
         var (whole, low) = projection;
+        // 结构体合流里一个标量字段的位段：先取这个字段，再移位与掩码。
+        if (StructureOf(whole) is { } structure && types.Project(structure, low, phi.Width) is null
+            && types.Projections(structure).FirstOrDefault(p => types.Kind(p.Type) is TypeKind.Int or TypeKind.Bool && low >= p.Bit && low + phi.Width <= p.Bit + p.Width) is { } enclosing)
+            return (values.Syms.Projection(whole, enclosing.Bit, enclosing.Width), enclosing.Type, low - enclosing.Bit);
+        // 结构体局部的各段混着改写与原值合流时没有整体类型：取所在的 32 位整数段。
+        if (whole.Width > 64 && phi.Width is > 1 and < 32 and not (8 or 16) && low % 32 + phi.Width <= 32
+            && values.Syms.Slice(whole, low / 32 * 32, 32) is PhiSym lane32 && IntegerLane(lane32))
+            return (lane32, TypeOf(lane32) is { } laneType && types.Kind(laneType) == TypeKind.Int ? laneType : types.UInt32, low % 32);
+        if (phi.Width is not (> 1 and < 64 and not (8 or 16 or 32))) return null;
         // SIMD 寄存器用整宽合流；只在较窄的载体类型已由来源证明时取其低段。
         if (whole.Width > 64 && low + phi.Width <= 32)
         {
@@ -89,7 +103,12 @@ public sealed partial class TypeOracle
     public PhiSym? CarrierPhi(PhiSym phi, int low, int width)
     {
         if (phi.Projection is not null || low != 0 || width is <= 0 or >= 32 || phi.Width <= 32) return null;
-        if (values.Syms.Slice(phi, 0, 32) is not PhiSym carrier) return null;
+        return values.Syms.Slice(phi, 0, 32) is PhiSym carrier && IntegerLane(carrier) ? carrier : null;
+    }
+
+    /// <summary>32 位合流的各个来源（沿合流与加减乘）都是整数。</summary>
+    private bool IntegerLane(PhiSym carrier)
+    {
         var seen = new HashSet<Sym>();
         bool Integer(Sym value)
         {
@@ -104,7 +123,7 @@ public sealed partial class TypeOracle
                 _ => false,
             });
         }
-        return Integer(carrier) ? carrier : null;
+        return Integer(carrier);
     }
 
     /// <summary>

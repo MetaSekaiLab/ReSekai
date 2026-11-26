@@ -9,6 +9,7 @@ internal sealed partial class CilBodyWriter(Skeleton skeleton, ManagedTypes type
 {
     private readonly Dictionary<Variable, VariableDefinition> locals = new();
     private readonly Dictionary<PinnedArrayValue, VariableDefinition> pinnedArrays = new();
+    private readonly Dictionary<PinnedReferenceValue, VariableDefinition> pinnedReferences = new();
     private readonly Dictionary<ulong, Instruction> labels = new();
     private Dictionary<ModuleDefinition, (MethodReference At, MethodReference Fail, MethodDefinition Value, MethodReference TimeOut)> unrecovered => symbols.Unrecovered;
     private Dictionary<ModuleDefinition, (MethodDefinition Of, MethodDefinition Do, MethodDefinition Result, MethodDefinition Completed, MethodDefinition CompletedVoid)> awaits => symbols.Awaits;
@@ -37,6 +38,13 @@ internal sealed partial class CilBodyWriter(Skeleton skeleton, ManagedTypes type
             var local = new VariableDefinition(new PinnedType(TypeReference(pinned.ArrayType)));
             body.Variables.Add(local);
             pinnedArrays.Add(pinned, local);
+        }
+        foreach (var pinned in recovered.Blocks.SelectMany(b => b.Statements).SelectMany(s => ManagedValues.Of(s).Concat(ManagedValues.CopiedValues(s)))
+            .SelectMany(ManagedValues.Walk).OfType<PinnedReferenceValue>().Distinct())
+        {
+            var local = new VariableDefinition(new PinnedType(new ByReferenceType(TypeReference(pinned.Element))));
+            body.Variables.Add(local);
+            pinnedReferences.Add(pinned, local);
         }
         foreach (var block in recovered.Blocks) labels.Add(block.Address, Instruction.Create(OpCodes.Nop));
         foreach (var block in recovered.Blocks)

@@ -51,7 +51,9 @@ internal sealed class TypeUseAnalysis(MethodAnalysis analysis, TypeOracle oracle
                     break;
                 }
                 // 缓冲区约定了元素类型的单个写入：与同一位置的读取按同一元素定位。
-                if (Untyped(operands[0], store.Value.Width) && oracle.BufferElement(operands[0]) is { } element)
+                // 写入的值就是类型形参 T：指针按 T 步进，元素即 T。
+                if (Untyped(operands[0], store.Value.Width)
+                    && (oracle.BufferElement(operands[0]) ?? oracle.TypeOf(operands[1]) as GenericParameterRef) is { } element)
                 {
                     if (Types.StorageBits(element) == store.Value.Width && oracle.ExactStride(operands[0], element)) oracle.PointerElement(operands[0], element);
                     else oracle.PointerElementField(operands[0], element, store.Value.Width);
@@ -200,7 +202,8 @@ internal sealed class TypeUseAnalysis(MethodAnalysis analysis, TypeOracle oracle
                 // 结构体 φ 的每条入边都能整体取得（与下降相同的判定）：只用入边上的整个值，叶子的读取不单独落成局部。
                 if (aggregate.Snapshot is null && oracle.WholeStructPhi(aggregate, structure) is { } leaves)
                 {
-                    for (var j = 0; j < leaves[0].Phi.Sources.Length; j++) Use(oracle.StructPhiWhole(leaves, structure, j)!, structure, null);
+                    for (var j = 0; j < leaves[0].Phi.Sources.Length; j++)
+                        if (oracle.StructPhiWhole(leaves, structure, j) is { } incoming) Use(incoming, structure, null);
                     return;
                 }
                 foreach (var field in aggregate.Fields) Use(field.Value, field.Projection.Type, user);
@@ -212,7 +215,7 @@ internal sealed class TypeUseAnalysis(MethodAnalysis analysis, TypeOracle oracle
             case ReadSym read:
                 // 无类型指针上的步进读取：元素按缓冲区的约定，没有约定时按使用的类型（与下降、模板的同一读取一致）；步长须恰为元素大小。
                 if (Untyped(read.Address, read.Width)
-                    && (oracle.BufferElement(read.Address) ?? (expected is not null && Types.Kind(expected) != TypeKind.Struct ? expected : null)) is { } element
+                    && (oracle.BufferElement(read.Address) ?? (expected is not null && (Types.Kind(expected) != TypeKind.Struct || expected is GenericParameterRef) ? expected : null)) is { } element
                     && Types.StorageBits(element) == read.Width && oracle.ExactStride(read.Address, element)) oracle.PointerElement(read.Address, element);
                 // 约定元素是结构体、只读它的一个字段（元素的整体读取被拆成各字段的读取）。
                 else if (Untyped(read.Address, read.Width) && oracle.BufferElement(read.Address) is { } buffered) oracle.PointerElementField(read.Address, buffered, read.Width);

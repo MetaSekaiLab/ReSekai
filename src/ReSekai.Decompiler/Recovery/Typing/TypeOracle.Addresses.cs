@@ -346,11 +346,21 @@ public sealed partial class TypeOracle
         return bufferCursors[phi] = FindCursor(phi, 0, 0, nativeBuffer: true);
     }
 
+    private readonly Dictionary<(PhiSym, TypeRef), ElementCursor?> typedCursors = [];
+
+    /// <summary>无类型指针自身按元素 T 的大小递推（for (p = buffer; …; p += sizeof(T))）：元素类型由读写的值给出。</summary>
+    private ElementCursor? TypedCursor(PhiSym phi, TypeRef element)
+    {
+        if (typedCursors.TryGetValue((phi, element), out var known)) return known;
+        typedCursors[(phi, element)] = null;
+        return typedCursors[(phi, element)] = FindCursor(phi, 0, 0, nativeBuffer: true, element);
+    }
+
     /// <summary>
     /// φ 的每条边是自身加步长，或从下标计算的值：数组上（可带比例下标）或外层游标上的地址；elementSize 不为零时只有字节偏移。
     /// 步长是元素大小的倍数，各初值落在元素内的同一偏移。
     /// </summary>
-    private ElementCursor? FindCursor(PhiSym phi, int elementSize, long start = RuntimeLayout.ArrayData, bool nativeBuffer = false)
+    private ElementCursor? FindCursor(PhiSym phi, int elementSize, long start = RuntimeLayout.ArrayData, bool nativeBuffer = false, TypeRef? pointee = null)
     {
         if (phi.Width != 64 || phi.Projection is not null || phi.Sources.Any(s => s is null)) return null;
         var edges = phi.Sources.Select(s => AddressTerms(s!)).ToArray();
@@ -373,10 +383,11 @@ public sealed partial class TypeOracle
             }
             else
             {
-                if (root is PhiSym outer && index is null && (nativeBuffer ? BufferCursor(outer) : Cursor(outer)) is { } nested)
+                if (root is PhiSym outer && index is null && (pointee is not null ? TypedCursor(outer, pointee) : nativeBuffer ? BufferCursor(outer) : Cursor(outer)) is { } nested)
                     (root, offset, index, scale) = (nested.Base!, offset + nested.Offset, nested.Index, nested.Size);
                 var span = nativeBuffer ? null : SpanSource(root);
-                var element = nativeBuffer ? BufferElementOf(root) : span?.Type.Arguments[0] ?? ArrayView(root)?.Element;
+                var element = pointee is not null ? TypeOf(root) is PointerRef { Element: var untyped } && ManagedTypes.IsVoid(untyped) ? pointee : null
+                    : nativeBuffer ? BufferElementOf(root) : span?.Type.Arguments[0] ?? ArrayView(root)?.Element;
                 if (element is null || (nativeBuffer ? BufferElementSize(element) : ElementSize(element)) is not (var bytes and > 0)
                     || basis is not null && !ReferenceEquals(basis, root)) return null;
                 (basis, size, dataStart) = (root, bytes, span is null ? start : 0);

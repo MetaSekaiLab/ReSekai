@@ -203,6 +203,11 @@ public sealed class TypeDef
     public override string ToString() => FullName;
 }
 
+public enum FieldMarshalKind { FixedArray, Byte }
+
+/// <summary>字段的封送描述：内嵌定长数组（Length 为元素数）或单字节。</summary>
+public sealed record FieldMarshal(FieldMarshalKind Kind, int Length);
+
 public sealed class FieldDef
 {
     public required int Index { get; init; }
@@ -215,6 +220,8 @@ public sealed class FieldDef
     public object? Constant { get; init; }
     /// <summary>HasFieldRVA 字段的初始数据（数组初始化器的源数据），长度为字段类型的大小；其他字段为 null。</summary>
     public byte[]? InitialValue { get; internal set; }
+    /// <summary>封送描述；没有或没有认出时为 null。</summary>
+    public FieldMarshal? Marshal { get; internal set; }
     public uint Token { get; init; }
     public IReadOnlyList<CustomAttributeDef> CustomAttributes { get; internal set; } = [];
     public bool IsStatic => (Attributes & FieldAttributes.Static) != 0;

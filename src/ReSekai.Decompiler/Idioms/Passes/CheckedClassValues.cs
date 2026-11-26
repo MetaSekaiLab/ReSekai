@@ -63,6 +63,18 @@ internal static class CheckedClassValues
                     changed = true;
                 }
         }
+        // 几条路径共用一次拆箱：每条入边各自证明了同一个类型。
+        foreach (var block in function.Blocks)
+            for (var index = 0; index < block.Statements.Count; index++)
+            {
+                if (block.Statements[index] is not Call { Op: { Kind: OpKind.Unbox, Operand: null } op, Arguments: [Use obj, ..] } unbox
+                    || block.Statements.OfType<Phi>().FirstOrDefault(p => p.Target == obj.Variable) is not { } merged
+                    || merged.Sources.Length != block.Predecessors.Count) continue;
+                var known = merged.Sources.Select((source, i) => Proven(block.Predecessors[i], block, source, definition)).Distinct().ToArray();
+                if (known is not [{ } common]) continue;
+                block.Statements[index] = unbox with { Op = op with { Operand = common }, Arguments = [obj, new Symbol(SymbolKind.Class, common)], Sources = unbox.Sources.Length == unbox.Arguments.Length ? [.. unbox.Sources.Take(2)] : [] };
+                changed = true;
+            }
         foreach (var block in function.Blocks)
             for (var index = 0; index < block.Statements.Count; index++)
             {
@@ -92,6 +104,31 @@ internal static class CheckedClassValues
                 changed = true;
             }
         return changed;
+    }
+
+    /// <summary>经这条边到达时，对象的类已由比较（精确类相等，或拆箱前的 element_class 检查）确定。</summary>
+    private static TypeRef? Proven(Block block, Block target, Variable source, Func<Use, Expr?> definition)
+    {
+        Expr Expand(Expr value) => value is Use use && definition(use) is { } known ? known : value;
+        bool ClassOf(Expr value) => Expand(value) is Load { Width: 64, Address: Use { Variable: var owner } } && owner == source;
+        var visited = new HashSet<Block>();
+        for (; visited.Add(block); (target, block) = (block, block.Predecessors[0]))
+        {
+            foreach (var check in block.Statements.OfType<Call>())
+                if (check is { Op: { Kind: OpKind.ThrowIf, Operand: "System.InvalidCastException" }, Arguments: [Compare { Cond: Cond.Ne } mismatch] }
+                    && Expand(mismatch.Left) is Load { Width: 64, Address: Binary { Op: BinOp.Add, Left: var klass, Right: Const { Value: Facts.RuntimeLayout.ClassElementClass } } }
+                    && ClassOf(klass)
+                    && Expand(mismatch.Right) is Load { Width: 64, Address: Binary { Op: BinOp.Add, Left: Symbol { Kind: SymbolKind.Class, Value: DefinitionRef { Definition.IsValueType: true } element }, Right: Const { Value: Facts.RuntimeLayout.ClassElementClass } } })
+                    return element;
+            if (block.Statements.LastOrDefault() is Branch { Condition: Compare { Cond: Cond.Eq or Cond.Ne } compare } branch && branch.Target != branch.Fallthrough)
+            {
+                var (left, right) = compare.Left is Symbol ? (compare.Right, compare.Left) : (compare.Left, compare.Right);
+                if (right is Symbol { Kind: SymbolKind.Class, Value: DefinitionRef { Definition.IsValueType: true } exact } && ClassOf(left)
+                    && exact.Definition.FullName != "System.Nullable" && target.Start == (compare.Cond == Cond.Eq ? branch.Target : branch.Fallthrough)) return exact;
+            }
+            if (block.Predecessors.Count != 1) return null;
+        }
+        return null;
     }
 
     // 成功边直接进入合流时，转换只作用于该入边，不能覆盖其他来源。

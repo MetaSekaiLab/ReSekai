@@ -76,6 +76,9 @@ public static class Fold
                     return left;
             }
         }
+        // c - (d - x) = x + (c - d)
+        if (op == BinOp.Sub && left is Const minuend && right is Binary { Op: BinOp.Sub, Left: Const taken, Right: var kept } && kept.Width == width)
+            return Binary(BinOp.Add, kept, C(minuend.Value - taken.Value, width), width);
         if (op == BinOp.Xor && left == right) return C(0, width);
         if (op is BinOp.And or BinOp.Or && left == right) return left;
         if (op == BinOp.Sub && left == right) return C(0, width);

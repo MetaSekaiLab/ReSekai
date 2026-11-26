@@ -108,7 +108,8 @@ public sealed class FunctionLifter
             Use { Variable: { Version: 0 } variable } => variable.Storage,
             _ => null,
         };
-        bool IsBase(Expr value) => Input(value) == first || value is Binary { Op: BinOp.Add, Right: Const } offset && Input(offset.Left) == first;
+        // 成对读取的第二个地址是（捕获区起点 + 偏移）+ 偏移。
+        bool IsBase(Expr value) => Input(value) == first || value is Binary { Op: BinOp.Add, Right: Const } offset && IsBase(offset.Left);
         var bases = 0;
         var inputs = 0;
         foreach (var block in lifted.Function.Blocks)

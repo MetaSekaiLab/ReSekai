@@ -71,7 +71,7 @@ sealed class Scripts(ProgramModel model, Packages packages, Output output)
                 NoSource = true,
                 KeepGoing = true,
                 Jobs = 1,
-                MethodTimeoutSeconds = 120,
+                MethodTimeoutSeconds = 600,
             }, Console.WriteLine);
         }
         else
@@ -120,8 +120,6 @@ sealed class Scripts(ProgramModel model, Packages packages, Output output)
             }
             else if (full && assembly.AssemblyName == CriWareSdk.Assembly)
                 output.AssemblySources[assembly.AssemblyName] = "反编译 + Android APK 原生库";
-            var spineSource = packages.SpineSource;
-            List<string> spinePatches = [];
             var sdkOnly = sdkSources?.Keys.Where(path => !generated.ContainsKey(path)) ?? [];
             foreach (string relative in generated.Keys.Where(path => !replaced.Contains(path)).Concat(upstream.Keys).Concat(sdkOnly).Order(StringComparer.Ordinal))
             {
@@ -133,46 +131,10 @@ sealed class Scripts(ProgramModel model, Packages packages, Output output)
                 string guid = Output.Guid("source:" + assembly.AssemblyName + "/" + relative);
                 foreach (var type in declared) targets[new ScriptName(assembly.AssemblyName, type.Namespace, type.Name).Key] = guid;
                 string? recovered = generated.TryGetValue(relative, out string? file) ? File.ReadAllText(file) : null;
-                if (full && assembly.AssemblyName == CriWareSdk.Assembly && relative == "CriWare/CriDisposableObjectManager.cs" && recovered is not null)
-                    recovered = GeneratedSource.CriDisposableRegistration(recovered);
-                if (full && assembly.AssemblyName == CriWareSdk.Assembly && relative == "CriWare/CriAtomEx.cs" && recovered is not null)
-                    recovered = GeneratedSource.CriCueInfoLayout(recovered);
-                if (full && assembly.AssemblyName == CriWareSdk.Assembly && relative == "CriWare.CriMana/MovieInfo.cs" && recovered is not null)
-                    recovered = GeneratedSource.CriMovieInfoLayout(recovered);
                 string code = sdkSources is null ? upstream.GetValueOrDefault(relative) ?? recovered!
                     : CriWareSdk.PlatformSource(relative, recovered, sdkSources.GetValueOrDefault(relative));
-                if (full && assembly.AssemblyName == "spine-csharp" && relative == "Spine/SequenceTimeline.cs"
-                    && spineSource is not null && code.Contains("base._002Ector(frameCount, array);", StringComparison.Ordinal))
-                {
-                    code = SpineSequenceTimeline(spineSource);
-                    spinePatches.Add("SequenceTimeline");
-                }
-                if (full && assembly.AssemblyName == "spine-unity" && relative == "Spine.Unity/MeshGenerator.cs" && spineSource is not null)
-                {
-                    string fixedMesh = GeneratedSource.SpineMeshGenerator(code, File.ReadAllText(Path.Join(spineSource, SourcePackages.SpineMeshGeneratorFile)));
-                    if (fixedMesh != code)
-                    {
-                        code = fixedMesh;
-                        spinePatches.Add("MeshGenerator");
-                    }
-                }
-                if (full && assembly.AssemblyName == "spine-csharp" && relative == "Spine/EventQueue.cs" && spineSource is not null)
-                {
-                    string fixedQueue = GeneratedSource.SpineEventQueue(code, File.ReadAllText(Path.Join(spineSource, "AnimationState.cs")));
-                    if (fixedQueue != code)
-                    {
-                        code = fixedQueue;
-                        spinePatches.Add("EventQueue");
-                    }
-                }
                 if (full && assembly.AssemblyName == "Assembly-CSharp" && relative == "Sekai/ScreenLayerHome.cs")
                     code = GeneratedSource.HomeNewsAndroid(code);
-                if (full && assembly.AssemblyName == "MagicaCloth" && relative == "MagicaCloth/BaseCloth.cs")
-                    code = GeneratedSource.MagicaClothCulling(code);
-                if (full && assembly.AssemblyName == "MagicaCloth" && relative == "MagicaCloth/PhysicsManagerTeamData.cs")
-                    code = GeneratedSource.MagicaClothPostProcess(code);
-                if (full && assembly.AssemblyName == "MagicaCloth" && relative == "MagicaCloth/EdgeCollisionConstraint.cs")
-                    code = GeneratedSource.MagicaClothEdgeCapsule(code);
                 if (full && assembly.AssemblyName == "Unity.RenderPipelines.Core.Runtime" && relative == "UnityEngine.Rendering/CoreUtils.cs")
                     code = GeneratedSource.EditorRenderCleanup(code);
                 if (full && assembly.AssemblyName == "Assembly-CSharp" && relative == "AppLovinManager.cs")
@@ -202,11 +164,6 @@ sealed class Scripts(ProgramModel model, Packages packages, Output output)
                 output.Write(path, code);
                 output.Meta(path, guid, "MonoImporter", "  serializedVersion: 2\n  defaultReferences: []\n  executionOrder: 0\n");
             }
-            if (spineSource is not null && spinePatches.Count > 0)
-            {
-                output.Write(folder + "/LICENSE-Spine.txt", File.ReadAllBytes(Path.Join(spineSource, "LICENSE")));
-                output.AssemblySources[assembly.AssemblyName] = $"反编译 + Spine {SourcePackages.Spine.Version} {string.Join(" / ", spinePatches)}";
-            }
             if (assembly.AssemblyName is "Assembly-CSharp" or "Assembly-CSharp-firstpass") continue;
             using var module = ModuleDefinition.ReadModule(Path.Join(assemblies, assembly.Name));
             string[] references = module.AssemblyReferences.Select(r => r.Name).Where(r => available.Contains(r) && !packages.Dlls.Contains(r)).Order(StringComparer.Ordinal).ToArray();
@@ -228,16 +185,6 @@ sealed class Scripts(ProgramModel model, Packages packages, Output output)
             output.Meta(asmdef, Output.Guid("assembly:" + assembly.AssemblyName), "AssemblyDefinitionImporter");
         }
         return result;
-    }
-
-    static string SpineSequenceTimeline(string source)
-    {
-        string animation = File.ReadAllText(Path.Join(source, "Animation.cs"));
-        int ns = animation.IndexOf("namespace Spine", StringComparison.Ordinal);
-        int type = animation.IndexOf("\tpublic class SequenceTimeline : Timeline, ISlotTimeline", StringComparison.Ordinal);
-        if (ns < 0 || type < ns) throw new InvalidDataException("Spine SequenceTimeline 源码结构不匹配");
-        // 上游 4.1.2 将 SequenceTimeline 放在 Animation.cs 末尾。
-        return animation[..ns] + "namespace Spine {\n" + animation[type..];
     }
 
     static bool Predefined(string name) => name is "Assembly-CSharp" or "Assembly-CSharp-firstpass";

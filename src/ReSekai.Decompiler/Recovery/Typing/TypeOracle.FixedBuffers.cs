@@ -37,6 +37,33 @@ public sealed partial class TypeOracle
         return null;
     }
 
+    /// <summary>
+    /// 结构体引用上按下标访问的一段连续同型字段：源码用 fixed (T* p = &amp;first) 取首字段地址后按 T 步进，没有边界检查。
+    /// 元素大小、步长与访问宽度都等于字段的大小，起点恰是一段至少两个同型字段的第一个。
+    /// </summary>
+    private Location? FieldSequenceLocation(Sym root, long offset, Sym? index, int scale, int width)
+    {
+        if (index is null || TypeOf(root) is not ByRefRef { Element: DefinitionRef owner } || types.Kind(owner) != TypeKind.Struct
+            || !ManagedAccess.Type(types, method.Method.Owner, owner) || types.Layouts.Of(owner) is not { } layout) return null;
+        var fields = layout.Fields.OrderBy(f => f.Offset).ToArray();
+        for (var i = 0; i + 1 < fields.Length; i++)
+        {
+            if (fields[i].Offset - RuntimeLayout.ObjectHeaderSize != offset) continue;
+            var element = fields[i].Type;
+            var size = BufferElementSize(element);
+            if (size <= 0 || width != size * 8 || ManagedTypes.IsReferenceType(element)
+                || !types.Unmanaged(element) && element is not GenericParameterRef { Binding.Kind: NativeBindingKind.Scalar or NativeBindingKind.Aggregate }
+                || i > 0 && fields[i - 1].Type.Equals(element)
+                || !fields[i + 1].Type.Equals(element) || fields[i + 1].Offset - fields[i].Offset != size
+                || !ManagedAccess.Field(types, method, new(fields[i].Field, owner), owner)) return null;
+            (index, scale) = Rescaled(index, scale, size);
+            // 步长丢弃的高位不影响 64 位的字节偏移。
+            index = WithoutDroppedBits(index, size);
+            return scale == size ? new Location(LocationKind.Reference, root, index, 0, null, [new(fields[i].Field, owner)], element) { FieldSequence = true } : null;
+        }
+        return null;
+    }
+
     private long? ConstantCursorSeed(PhiSym phi)
     {
         var edges = phi.Sources.Where(s => s is not null).Select(s => AddressTerms(s!)).ToArray();

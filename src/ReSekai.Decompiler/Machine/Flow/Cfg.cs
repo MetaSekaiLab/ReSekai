@@ -315,12 +315,16 @@ public sealed class CfgBuilder
             }
         }
 
+        /// <summary>跳回序言（首条指令分配栈帧）：栈帧此时已经拆除，是对自身的尾调用，不是循环。</summary>
+        private bool Reenters(ulong target) => target == entry && insns.TryGetValue(entry, out var first)
+            && first.Statements.OfType<Assign>().Any(a => a.Target == owner.machine.Convention.StackPointer);
+
         private void Classify(Insn insn)
         {
             var statements = insn.Statements;
             switch (statements.LastOrDefault())
             {
-                case Jump jump when InRange(jump.Target):
+                case Jump jump when InRange(jump.Target) && !Reenters(jump.Target):
                     insn.Targets = [jump.Target];
                     insn.Ends = true;
                     break;
@@ -330,7 +334,7 @@ public sealed class CfgBuilder
                     break;
                 case Branch branch:
                     {
-                        var target = InRange(branch.Target) ? branch.Target : branch.Target | Synthetic;
+                        var target = InRange(branch.Target) && !Reenters(branch.Target) ? branch.Target : branch.Target | Synthetic;
                         if (branch.Target == branch.Fallthrough)
                         {
                             statements[^1] = new Nop(branch.Address, "branch to next");

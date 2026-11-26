@@ -135,10 +135,58 @@ internal static class SharedValuesPass
         return changed;
     }
 
+    /// <summary>同一类型的 IsValueType 在支配它的那条出边上已有定论：后一个分支只有一条出边可走。</summary>
+    private static bool RepeatedValueTests(IdiomState state)
+    {
+        static (ClassProperty Property, bool ValueTaken)? Test(Block block) => block.Statements.LastOrDefault() is Branch branch && block.NormalSuccessors.Count() == 2
+            ? branch.Condition switch
+            {
+                ClassProperty { Kind: ClassPropertyKind.IsValueType } property => (property, true),
+                Not { Operand: ClassProperty { Kind: ClassPropertyKind.IsValueType } property } => (property, false),
+                _ => null,
+            } : null;
+        var tests = state.function.Blocks.Where(b => Test(b) is not null).ToArray();
+        if (tests.Length < 2) return false;
+        foreach (var block in tests)
+        {
+            var (property, valueTaken) = Test(block)!.Value;
+            foreach (var earlier in tests)
+            {
+                if (earlier == block || Test(earlier) is not var (known, knownTaken) || !known.Type.Equals(property.Type)) continue;
+                var arms = earlier.NormalSuccessors.ToArray();
+                for (var side = 0; side < 2; side++)
+                {
+                    if (arms[0] == arms[1] || arms[side].Predecessors is not [var only] || only != earlier || !Dominates(arms[side], block)) continue;
+                    var isValue = side == 0 == knownTaken;
+                    var kept = isValue == valueTaken ? 0 : 1;
+                    var normal = block.NormalSuccessors.ToArray();
+                    block.Statements[^1] = new Jump(block.Statements[^1].Address, normal[kept].Start);
+                    MachineFunction.RemoveEdgeAt(block, 1 - kept);
+                    return true;
+                }
+            }
+        }
+        return false;
+        bool Dominates(Block through, Block target)
+        {
+            if (through == target) return true;
+            var seen = new HashSet<Block> { through };
+            var pending = new Stack<Block>([state.function.Blocks[0]]);
+            while (pending.TryPop(out var current))
+            {
+                if (!seen.Add(current)) continue;
+                if (current == target) return false;
+                foreach (var next in current.Successors) pending.Push(next);
+            }
+            return true;
+        }
+    }
+
     /// <summary>按值类型分支、两臂只有纯定义、合流值都是同一句柄的两种表示时，分支没有托管意义。</summary>
     private static bool ValueBranches(IdiomState state)
     {
-        var changed = false;
+        var changed = RepeatedValueTests(state);
+        if (changed) state.Cleanup();
         foreach (var head in state.function.Blocks)
         {
             if (head.Statements.LastOrDefault() is not Branch branch || head.NormalSuccessors.ToArray() is not [var taken, var fallthrough]) continue;
@@ -150,43 +198,67 @@ internal static class SharedValuesPass
             };
             if (test.Property is not { } classTest) continue;
             var (value, reference) = test.ValueTaken ? (taken, fallthrough) : (fallthrough, taken);
-            static bool SingleArm(Block arm, Block head) => arm.Predecessors is [var only] && only == head && !arm.IsLandingPad && arm.Handler is null;
             static bool Pure(Stmt statement) => statement is Define or Nop or Jump;
-            if (!SingleArm(reference, head) || !reference.Statements.All(Pure) || reference.NormalSuccessors.ToArray() is not [var join]) continue;
-            var direct = value == join;
-            if (!direct && (!SingleArm(value, head) || value.NormalSuccessors.ToArray() is not [var other] || other != join)) continue;
-            var valueEdge = join.Predecessors.IndexOf(direct ? head : value);
-            var referenceEdge = join.Predecessors.IndexOf(reference);
+            // 一臂是只有唯一前驱与唯一后继的块串；几个实参的两臂可能被合并成一组。
+            static List<Block>? Arm(Block first, Block head, out Block? join)
+            {
+                join = null;
+                var arm = new List<Block>();
+                for (var (block, from) = (first, head); ;)
+                {
+                    if (block.Predecessors is not [var only] || only != from || block.IsLandingPad || arm.Contains(block) || block.Statements.Any(s => s is Phi)) { join = block; break; }
+                    if (block.Handler is not null || block.NormalSuccessors.ToArray() is not [var next]) return null;
+                    arm.Add(block);
+                    (block, from) = (next, block);
+                }
+                return arm;
+            }
+            if (Arm(reference, head, out var join) is not { Count: > 0 } held || join is null || !held.SelectMany(b => b.Statements).All(Pure)
+                || Arm(value, head, out var other) is not { } copied || other != join) continue;
+            var valueEdge = join.Predecessors.IndexOf(copied.Count == 0 ? head : copied[^1]);
+            var referenceEdge = join.Predecessors.IndexOf(held[^1]);
             if (valueEdge < 0 || referenceEdge < 0) continue;
             var phis = join.Statements.OfType<Phi>().ToArray();
-            Expr? copyTarget = null, copySource = null;
-            if (!direct && !value.Statements.All(Pure))
+            var copies = new Dictionary<Expr, Expr>();
+            var independent = true;
+            foreach (var statement in copied.SelectMany(b => b.Statements).Where(s => !Pure(s)))
             {
-                if (value.Statements.Where(s => !Pure(s)).ToArray() is not
-                    [Call { Op: { Kind: OpKind.CopyGenericValue, Operand: TypeRef copyType }, Arguments: [var target, var source] }]
-                    || !copyType.Equals(classTest.Type)) continue;
-                copyTarget = state.defs.Expand(target);
-                copySource = state.defs.Expand(source);
-                if (copyTarget is not StackAllocation destination || copySource is not StackAllocation origin || destination == origin
-                    || !destination.Element.Equals(copyType) || !origin.Element.Equals(copyType)) continue;
-                // 复制目标是独占的临时槽，只有值类型分支及其合流实参读取它。
-                bool UsesDestination(Expr expression) => ExprMap.Walk(state.defs.Expand(expression)).Contains(destination);
-                bool Escapes(Stmt statement) => statement switch
+                independent = statement is Call { Op: { Kind: OpKind.CopyGenericValue, Operand: TypeRef copyType }, Arguments: [var target, var source] }
+                    && copyType.Equals(classTest.Type)
+                    && state.defs.Expand(target) is StackAllocation destination && state.defs.Expand(source) is StackAllocation origin && destination != origin
+                    && destination.Element.Equals(copyType) && origin.Element.Equals(copyType)
+                    && !copies.ContainsKey(origin) && !copies.ContainsValue(destination) && copies.TryAdd(destination, origin)
+                    // 合流之后只有合流实参读取复制目标；之前的用法（复用的临时槽）不受影响。
+                    && !After(join).SelectMany(b => b.Statements).Any(s => Escapes(s, destination));
+                if (!independent) break;
+            }
+            if (!independent) continue;
+            static HashSet<Block> After(Block start)
+            {
+                var seen = new HashSet<Block>();
+                var pending = new Stack<Block>([start]);
+                while (pending.TryPop(out var current))
+                    if (seen.Add(current))
+                        foreach (var next in current.Successors) pending.Push(next);
+                return seen;
+            }
+            bool Escapes(Stmt statement, Expr destination)
+            {
+                bool Uses(Expr expression) => ExprMap.Walk(state.defs.Expand(expression)).Contains(destination);
+                return statement switch
                 {
                     Define definition when definition.Value == destination => false,
-                    Phi phi => phi.Sources.Where((_, edge) => !phis.Contains(phi) || edge != valueEdge)
-                        .Any(v => UsesDestination(new Use(v, v.Width))),
-                    _ => ExprMap.Operands(statement).Any(UsesDestination),
+                    Phi phi => phi.Sources.Where((_, edge) => !phis.Contains(phi) || edge != valueEdge).Any(v => Uses(new Use(v, v.Width))),
+                    _ => ExprMap.Operands(statement).Any(Uses),
                 };
-                if (state.function.Blocks.Where(b => b != value).SelectMany(b => b.Statements).Any(Escapes)) continue;
             }
             var same = phis.All(phi =>
             {
                 var handle = state.defs.Expand(new Use(phi.Sources[valueEdge], phi.Target.Width));
-                var held = state.defs.Expand(new Use(phi.Sources[referenceEdge], phi.Target.Width));
-                if (copyTarget is not null && handle == copyTarget)
-                    return held == new Load(copySource!, 64) && OnlyByValueArguments(state, phi.Target);
-                return handle == held || phi.Target.Width == 64 && held == new Load(handle, 64);
+                var loaded = state.defs.Expand(new Use(phi.Sources[referenceEdge], phi.Target.Width));
+                if (copies.TryGetValue(handle, out var copySource))
+                    return loaded == new Load(copySource, 64) && OnlyByValueArguments(state, phi.Target);
+                return handle == loaded || phi.Target.Width == 64 && loaded == new Load(handle, 64);
             });
             if (!same)
             {

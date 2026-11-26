@@ -188,6 +188,14 @@ public sealed partial class TypeOracle
     private List<Sym>? Covering(List<(Store Store, Sym Address, Sym Value, long Offset)> members, long start, int width, Func<long, bool>? padding = null)
     {
         const int Undefined = -1;
+        // 各字节由最后覆盖它的成员给出。
+        var owners = new int[width / 8];
+        Array.Fill(owners, -2);
+        for (var k = 0; k < members.Count; k++)
+        {
+            var to = Math.Min(members[k].Offset + members[k].Value.Width / 8 - start, owners.Length);
+            for (var at = Math.Max(members[k].Offset - start, 0); at < to; at++) owners[at] = k;
+        }
         var pieces = new List<Sym>();
         int? owner = null;
         var from = 0L;
@@ -196,8 +204,7 @@ public sealed partial class TypeOracle
             int? current = null;
             if (at < start + width / 8)
             {
-                for (var k = members.Count - 1; k >= 0 && current is null; k--)
-                    if (members[k].Offset <= at && at < members[k].Offset + members[k].Value.Width / 8) current = k;
+                if (owners[at - start] is >= 0 and var k) current = k;
                 if (current is null && padding?.Invoke(at) == true) current = Undefined;
                 if (current is null) return null;
             }
@@ -301,16 +308,18 @@ public sealed partial class TypeOracle
         }
         Sym? whole = null;
         if (address is null)
+        {
+            // 个别字段可以取自另一个同类型的值：保留字段最多的那个值才是被改写的快照。
+            var kept = new Dictionary<Sym, int>();
             foreach (var group in groups)
             {
                 Sym? candidate = null;
                 if (group.All(l => StorageBits(l.Type) is > 0 and var width && l.Offset * 8 + width <= bits.Width && FromValue(bits, l.Offset, width, total, ref candidate))
                     && candidate is not null && (structure.Equals(TypeOf(candidate)) || StructLoopSnapshot(candidate, structure)))
-                {
-                    whole = candidate;
-                    break;
-                }
+                    kept[candidate] = kept.GetValueOrDefault(candidate) + 1;
             }
+            whole = kept.Count == 0 ? null : kept.MaxBy(k => k.Value).Key;
+        }
         if (address is null && whole is null) return null;
         var reads = new HashSet<ReadSym>();
         var changed = new List<ProjectedSym>();

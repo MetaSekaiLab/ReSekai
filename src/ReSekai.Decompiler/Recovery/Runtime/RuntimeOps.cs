@@ -291,6 +291,20 @@ public static class RuntimeOps
                 return true;
             },
         };
+        yield return new(OpKind.StackBuffer)
+        {
+            Inputs = (call, a, t) => a.Count == 1 ? [new(a[0], t.Types.Int32, Width: 32)] : [],
+            Behavior = new(EffectKind.Allocate, ExceptionEffect.Any),
+            ResultType = (call, t) => new PointerRef(t.Types.Integer(8 << (int)call.Op!.Operand!, (int)call.Op.Operand != 0)),
+            Lower = (IRuntimeLowering c, out ManagedStatement? terminal) =>
+            {
+                terminal = null;
+                var shift = (int)c.Op.Operand!;
+                var element = c.Types.Integer(8 << shift, shift != 0);
+                c.Emit(new ManagedAssignment(c.Call.Address, c.Local(c.Result, new PointerRef(element)), new StackBytesValue(element, c.Input(0))));
+                return true;
+            },
+        };
         yield return new(OpKind.Box)
         {
             Inputs = (call, a, t) => a.Count == 2 ? [new(a[1], t.ClassOperand(call), RuntimeInputKind.Pointee, 1)] : [],

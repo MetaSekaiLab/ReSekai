@@ -150,8 +150,8 @@ internal sealed class BodyValidation(ManagedTypes types, EmissionPolicy policy, 
                 if (!array.ArrayType.IsVector) return new(EmissionProblemKind.Unsupported, "数组 分配需要一维向量类型");
                 break;
             case StackBytesValue allocation:
-                if (!allocation.Element.Equals(types.Corlib("System.Byte")) || !allocation.Length.Type.Equals(types.Int32))
-                    return new(EmissionProblemKind.Unsupported, "栈分配需要字节元素及 int 长度");
+                if (types.Kind(allocation.Element) != TypeKind.Int || !allocation.Length.Type.Equals(types.Int32))
+                    return new(EmissionProblemKind.Unsupported, "栈分配需要整数元素及 int 长度");
                 break;
             case BoxValue box:
                 if (!CanAccess(box.Boxed)) return new(EmissionProblemKind.AccessDenied, $"访问权限 类型 {box.Boxed}");
@@ -196,6 +196,11 @@ internal sealed class BodyValidation(ManagedTypes types, EmissionPolicy policy, 
             case PinnedArrayValue pinned:
                 if (!pinned.Array.Type.Equals(pinned.ArrayType) || !pinned.ArrayType.IsVector
                     || !types.Unmanaged(pinned.ArrayType.Element)) return new(EmissionProblemKind.Unsupported, "固定地址 需要非托管元素的一维数组");
+                break;
+            case PinnedReferenceValue pinned:
+                if (pinned.Reference.Type is not ByRefRef { Element: var pinnedElement } || !pinnedElement.Equals(pinned.Element)
+                    || !types.Unmanaged(pinned.Element) && pinned.Element is not GenericParameterRef { Binding.Kind: NativeBindingKind.Scalar or NativeBindingKind.Aggregate })
+                    return new(EmissionProblemKind.Unsupported, "固定地址 需要非托管元素的引用");
                 break;
             case PointerOffsetValue pointer:
                 if (pointer.Pointer.Type is not PointerRef || pointer.Offset.Width != 64 || types.Kind(pointer.Offset.Type) != TypeKind.Int) return new(EmissionProblemKind.Unsupported, "指针偏移 类型或位宽不符");

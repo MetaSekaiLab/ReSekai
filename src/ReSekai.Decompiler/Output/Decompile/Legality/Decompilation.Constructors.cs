@@ -76,7 +76,13 @@ public static partial class Decompilation
             var later = body.Statements.SkipWhile(s => s != call).Skip(1).ToArray();
             var reused = locals.Where(l => later.Any(s => s.DescendantsAndSelf.OfType<IdentifierExpression>().Any(i => i.Identifier == l))).ToArray();
             var values = new Dictionary<string, Expression?>();
-            var consumed = prologue.Where(s => s is VariableDeclarationStatement || Mentions(s)).ToArray();
+            // 类型不符就抛出的判断声明的变量（同一模式里先判断的检查一并代回）。
+            var tests = prologue.Select(s => (Statement: s, Test: TypeTest(s))).Where(t => t.Test is not null).ToDictionary(t => t.Statement, t => t.Test!.Value);
+            var declaring = tests.Where(t => t.Value.Variable is { } name && !later.Any(s => s.DescendantsAndSelf.OfType<IdentifierExpression>().Any(i => i.Identifier == name))).ToArray();
+            foreach (var (_, test) in declaring) locals.Add(test.Variable!);
+            bool Checked(Statement statement) => tests.TryGetValue(statement, out var test)
+                && declaring.Any(d => d.Key == statement || test.Variable is null && d.Value.Operand.ToString() == test.Operand.ToString() && d.Value.Type.ToString() == test.Type.ToString());
+            var consumed = prologue.Where(s => s is VariableDeclarationStatement || Mentions(s) || Checked(s)).ToArray();
             if (!consumed.All(s => Evaluate(s, values, locals))) return false;
             var parameters = body.GetParent<ConstructorDeclaration>()!.Parameters.Select(p => p.Name).ToHashSet();
             bool Stable(Expression value) => value is PrimitiveExpression or NullReferenceExpression
@@ -96,6 +102,35 @@ public static partial class Decompilation
             foreach (var identifier in later.SelectMany(s => s.DescendantsAndSelf.OfType<IdentifierExpression>()).Where(i => reused.Contains(i.Identifier)).ToArray())
                 identifier.ReplaceWith(values[identifier.Identifier]!.Clone());
             return true;
+        }
+
+        /// <summary>
+        /// if (!(x is T)) throw new InvalidCastException()：被判断的值、类型、模式声明的变量与取出的成员。x 前面的判空（x ?? throw）不计；
+        /// 模式取成员时 x 为空也不成立，只认同一个值已判过空的。
+        /// </summary>
+        private static (Expression Operand, AstType Type, string? Variable, string? Member)? TypeTest(Statement statement)
+        {
+            static Expression Bare(Expression? e) => e is ParenthesizedExpression p ? Bare(p.Expression)
+                : e is BinaryOperatorExpression { Operator: BinaryOperatorType.NullCoalescing, Right: ThrowExpression } checkedValue ? Bare(checkedValue.Left) : e!;
+            if (statement is not IfElseStatement { FalseStatement: null, TrueStatement: var thrown, Condition: UnaryOperatorExpression { Operator: UnaryOperatorType.Not } not }
+                || (thrown is BlockStatement { Statements: { Count: 1 } only } ? only.First() : thrown) is not ThrowStatement { Expression: ObjectCreateExpression { Type: var exception } }
+                || !exception.ToString().EndsWith("InvalidCastException", StringComparison.Ordinal)) return null;
+            switch (Bare(not.Expression))
+            {
+                case IsExpression test:
+                    return (Bare(test.Expression), test.Type, null, null);
+                case BinaryOperatorExpression { Operator: BinaryOperatorType.IsPattern, Left: var left, Right: DeclarationExpression { Type: var type, Designation: SingleVariableDesignation name } }:
+                    return (Bare(left), type, name.Identifier, null);
+                case BinaryOperatorExpression { Operator: BinaryOperatorType.IsPattern, Left: var left, Right: RecursivePatternExpression { Type: { } type, Designation: null, SubPatterns: { Count: 1 } parts } }
+                    when parts.Single() is NamedArgumentExpression { Expression: DeclarationExpression { Designation: SingleVariableDesignation name } } part && NullChecked(statement, Bare(left)):
+                    return (Bare(left), type, name.Identifier, part.Name);
+                default:
+                    return null;
+            }
+
+            static bool NullChecked(Statement statement, Expression value) => statement.Parent is BlockStatement block && block.Statements.TakeWhile(s => s != statement)
+                .SelectMany(s => s.Descendants.OfType<BinaryOperatorExpression>())
+                .Any(b => b is { Operator: BinaryOperatorType.NullCoalescing, Right: ThrowExpression } && b.Left?.ToString() == value.ToString());
         }
 
         /// <summary>局部或形参在节点内被赋值、自增减或按引用传出。</summary>
@@ -130,6 +165,12 @@ public static partial class Decompilation
                     return (values[array.Identifier] = Store(creation, element.Arguments.Single(), Substitute(right, values))) is not null;
                 case BlockStatement block:
                     return block.Statements.All(s => Evaluate(s, values, locals));
+                case IfElseStatement when TypeTest(statement) is { Variable: { } name } test && locals.Contains(name):
+                    // 类型不符由转换抛出同样的异常；空引用在前面的判空处抛出，代回后由成员访问抛出。
+                    if (Substitute(test.Operand, values) is not { } operand) return false;
+                    Expression cast = new CastExpression(test.Type.Clone(), operand);
+                    values[name] = test.Member is { } member ? new MemberReferenceExpression(new ParenthesizedExpression(cast), member) : cast;
+                    return true;
                 case IfElseStatement { TrueStatement: BlockStatement { Statements: { Count: 1 } only }, FalseStatement: null } conditional when only.First() is ThrowStatement:
                     // 条件里的模式声明的变量在后面还会用到，删掉判断就没有定义了。
                     return !conditional.Condition.DescendantsAndSelf.OfType<SingleVariableDesignation>().Any();

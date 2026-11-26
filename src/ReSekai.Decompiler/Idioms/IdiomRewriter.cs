@@ -100,7 +100,7 @@ public sealed class IdiomRewriter(ProgramFacts facts)
     private ReSekai.Decompiler.Recovery.Calls.CallShapes? shapes;
     internal ReSekai.Decompiler.Recovery.Calls.CallShapes Shapes => shapes ??= new(facts, abi, (_, _) => false);
     private ReSekai.Decompiler.Recovery.Calls.CallMemoryEffects? callEffects;
-    internal ReSekai.Decompiler.Recovery.Calls.CallMemoryEffects CallEffects => callEffects ??= new(Shapes.Of, abi);
+    internal ReSekai.Decompiler.Recovery.Calls.CallMemoryEffects CallEffects => callEffects ??= new(Shapes.Of, abi, helper: at => facts.Helpers.At(at)?.Kind);
     internal bool UnusedInput(ulong entry, Storage register) => NativeCallees.UnusedInput(entry, register);
     internal bool UnusedResultBuffer(ulong entry) => NativeCallees.UnusedResultBuffer(entry);
 
@@ -112,6 +112,8 @@ public sealed class IdiomRewriter(ProgramFacts facts)
     public bool AuditRawManagedThrows { get; init; }
     /// <summary>恢复托管调用时清理未用输入的残值；事实推断仍保留原始调用参数。</summary>
     public bool RecoverUnusedInputs { get; init; }
+    /// <summary>未登记的函数按这个签名归一栈上的实参；只用于检验“它是否为某个方法的副本”。</summary>
+    internal AbiSignature? AssumedSignature { get; init; }
 
     public IdiomResult Run(MachineFunction function)
     {

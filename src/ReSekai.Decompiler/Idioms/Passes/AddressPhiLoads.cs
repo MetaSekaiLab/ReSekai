@@ -1,3 +1,4 @@
+using ReSekai.Decompiler.Facts;
 using ReSekai.Decompiler.Machine.Flow;
 using ReSekai.Decompiler.Ir;
 
@@ -28,16 +29,39 @@ internal static class AddressPhiLoads
             Select selection => Pure(selection.Condition) && Pure(selection.True) && Pure(selection.False),
             _ => false,
         };
+        // 数组数据区起点上的读取，各边的地址是某个数组或它加比例下标（&a[0] 的下标已折叠），至少一边带下标。
+        bool ElementChoice(Block block, Load load) => load.Address is Binary { Op: BinOp.Add, Left: Use { Width: 64 } chosen, Right: Const { Value: RuntimeLayout.ArrayData } }
+            && block.Statements.OfType<Phi>().FirstOrDefault(p => p.Target == chosen.Variable) is { } selection && selection.Sources.Length == block.Predecessors.Count
+            && selection.Sources.Select(s => Expand(new Use(s, 64))).ToArray() is var edges
+            && edges.All(e => e is Use || Scaled(e)) && edges.Any(Scaled);
+        bool Scaled(Expr edge) => edge is Binary { Op: BinOp.Add, Left: Use, Right: Binary { Op: BinOp.Shl, Right: Const { Value: <= 3 } } };
+        // 这条入边上的地址是判空过的对象的字段：在这里读取不会抛出。
+        bool CheckedField(Block parent, Expr address)
+        {
+            if (Expand(address) is not Binary { Op: BinOp.Add, Left: Use { Width: 64 } owner, Right: Const { Value: < 0x10000 } }) return false;
+            for (var (block, depth) = (parent, 0); depth < 4; block = block.Predecessors[0], depth++)
+            {
+                if (block.Statements.OfType<Call>().Any(c => c is { Op.Kind: OpKind.NullCheck, Arguments: [Use used] } && used == owner)) return true;
+                if (block.Predecessors.Count != 1) return false;
+            }
+            return false;
+        }
+        bool CheckedAddresses(Block block, Variable variable) => block.Statements.OfType<Phi>().FirstOrDefault(p => p.Target == variable) is { } merge
+            && merge.Sources.Length == block.Predecessors.Count && block.Predecessors.Select((p, i) => CheckedField(p, new Use(merge.Sources[i], 64))).All(c => c);
+        if (SunkReads(function, fresh, CheckedAddresses)) return true;
         var changed = false;
         foreach (var block in function.Blocks)
         {
             if (block.IsLandingPad
-                || block.Predecessors.Count < 2 || block.Predecessors.Any(p => p == block || p.Handler != block.Handler
+                || block.Predecessors.Count < 2 || block.Predecessors.Any(p => p == block || p.Handler != block.Handler && p.Handler is not null
                     || p.NormalSuccessors.Count() != 1 || !p.NormalSuccessors.Contains(block))) continue;
+            // 合流块在异常区域内而前驱不在：只有不会抛出的字段读取可以移到前驱。
+            if (block.Predecessors.Any(p => p.Handler != block.Handler) && !(block.Statements.FirstOrDefault(s => s is not (Phi or Nop)) is Define { Value: var entered }
+                && ExprMap.Walk(entered).OfType<Load>().ToArray() is [{ Address: Use entry }] && CheckedAddresses(block, entry.Variable))) continue;
             var first = block.Statements.FirstOrDefault(s => s is not (Phi or Nop));
             if (first is Store store && function.Range.ExceptionRegions.Length == 0 && block.Handler is null
                 && Pure(store.Target) && Pure(store.Value)
-                && Expand(store.Target) is Binary { Op: BinOp.Add, Left: Use target, Right: Const }
+                && (Expand(store.Target) is Binary { Op: BinOp.Add, Left: Use offsetTarget, Right: Const } ? offsetTarget : Expand(store.Target) as Use) is { } target
                 && block.Statements.OfType<Phi>().Any(p => p.Target == target.Variable))
             {
                 var phis = block.Statements.OfType<Phi>().ToArray();
@@ -53,7 +77,16 @@ internal static class AddressPhiLoads
                 changed = true;
                 continue;
             }
-            if (block.Statements.FirstOrDefault(s => s is not (Phi or Nop) && !(s is Define d && Pure(d.Value))) is not Define read) continue;
+            var leading = block.Statements.FirstOrDefault(s => s is not (Phi or Nop) && !(s is Define d && Pure(d.Value)));
+            // 返回值直接读取合流的元素地址：先把读取单独取出。
+            if (leading is Return { Pieces: [{ Value: Load returned } piece] } ret && ElementChoice(block, returned))
+            {
+                var loaded = fresh(returned.Width);
+                var position = block.Statements.IndexOf(ret);
+                block.Statements[position] = ret with { Pieces = [piece with { Value = new Use(loaded, returned.Width) }] };
+                block.Statements.Insert(position, leading = new Define(ret.Address, loaded, returned));
+            }
+            if (leading is not Define read) continue;
             var value = read.Value;
             while (value is Ir.Convert { Kind: ConvKind.ZeroExtend or ConvKind.SignExtend or ConvKind.Truncate } conversion)
                 value = conversion.Operand;
@@ -81,7 +114,7 @@ internal static class AddressPhiLoads
                     ? (Expr)(new Binary(BinOp.Add, new Use(cast.Defines[0], owner.Width), offset, 64)) : null;
             }).ToArray();
             if (typed.All(e => e is not null)) addresses = typed.Select(e => e!).ToArray();
-            else if (!direct && addresses.Any(e => e is not Binary { Op: BinOp.Add, Right: Const, Left: Binary { Op: BinOp.Shl, Right: Const scale } }
+            else if (!direct && !ElementChoice(block, load) && addresses.Any(e => e is not Binary { Op: BinOp.Add, Right: Const, Left: Binary { Op: BinOp.Shl, Right: Const scale } }
                 || scale.Value > 3 || (1UL << (int)scale.Value) != (ulong)load.Width / 8)) continue;
             var sources = new Variable[addresses.Length];
             for (var i = 0; i < sources.Length; i++)
@@ -97,6 +130,59 @@ internal static class AddressPhiLoads
             changed = true;
         }
         return changed;
+    }
+
+    /// <summary>
+    /// 合流的地址各自是判空过的对象的字段，读取被下沉到合流之后的某个分支里，其间没有内存写入：提回合流处，与另一侧的读取并列。
+    /// </summary>
+    private static bool SunkReads(MachineFunction function, Func<int, Variable> fresh, Func<Block, Variable, bool> checkedAddresses)
+    {
+        // 各 φ 的使用：只有一条语句用到时是哪一条。
+        var targets = function.Blocks.Where(b => !b.IsLandingPad && b.Predecessors.Count >= 2).SelectMany(b => b.Statements.OfType<Phi>())
+            .Where(p => p.Target.Width == 64).Select(p => p.Target).ToHashSet();
+        if (targets.Count == 0) return false;
+        var users = new Dictionary<Variable, (Block Block, Stmt Statement, int Count)>();
+        foreach (var user in function.Blocks)
+            foreach (var statement in user.Statements)
+                foreach (var variable in ExprMap.Operands(statement).SelectMany(ExprMap.Walk).OfType<Use>().Select(u => u.Variable)
+                    .Concat(statement is Phi merged ? merged.Sources : []).Where(targets.Contains).Distinct())
+                    users[variable] = (user, statement, users.GetValueOrDefault(variable).Count + 1);
+        foreach (var join in function.Blocks)
+        {
+            if (join.IsLandingPad || join.Predecessors.Count < 2) continue;
+            foreach (var phi in join.Statements.OfType<Phi>().Where(p => p.Target.Width == 64).ToArray())
+            {
+                if (!users.TryGetValue(phi.Target, out var only) || only.Count != 1) continue;
+                var (block, statement, _) = only;
+                if (block == join || statement is not Define define
+                    || ExprMap.Walk(define.Value).OfType<Load>().ToArray() is not [{ Address: Use { Width: 64 } } load]
+                    || ExprMap.Walk(define.Value).OfType<Use>().Count(u => u.Variable == phi.Target) != 1 || !checkedAddresses(join, phi.Target)
+                    || !Undisturbed(join, block, statement)) continue;
+                var value = fresh(load.Width);
+                block.Statements[block.Statements.IndexOf(statement)] = define with { Value = ExprMap.Map(define.Value, e => ReferenceEquals(e, load) ? new Use(value, load.Width) : null) };
+                join.Statements.Insert(join.Statements.TakeWhile(s => s is Phi).Count(), new Define(define.Address, value, load));
+                return true;
+            }
+        }
+        return false;
+
+        // 从合流到读取的所有路径上没有内存写入，路径都经过合流。
+        static bool Undisturbed(Block join, Block block, Stmt read)
+        {
+            static bool Writes(Stmt statement) => statement is Store or Opaque || statement is Call call && call.Op?.Kind is not (OpKind.NullCheck or OpKind.BoundsCheck);
+            if (block.Statements.TakeWhile(s => s != read).Any(Writes)) return false;
+            var pending = new Stack<Block>(block.Predecessors);
+            var seen = new HashSet<Block> { block };
+            while (pending.TryPop(out var current))
+            {
+                if (!seen.Add(current)) continue;
+                if (current.Statements.Any(Writes) || seen.Count > 16) return false;
+                if (current == join) continue;
+                if (current.Predecessors.Count == 0) return false;
+                foreach (var parent in current.Predecessors) pending.Push(parent);
+            }
+            return true;
+        }
     }
 
     /// <summary>地址选择之后的判空、边界检查与读取一起移入原分支，不让读取越过检查。</summary>

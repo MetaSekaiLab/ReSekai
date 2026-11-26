@@ -16,9 +16,11 @@ internal static class InvokerCallsPass
     internal static bool InvokerCalls(this IdiomState state) => Run(state.function, state.defs, state.self, state.owner.abi, IsConstrainedCall(state.owner), Unnamed(state.owner), state.Reject);
 
     /// <summary>路径拆分之后 MethodInfo 才成为单一实体的调用；规则与 L2 相同，实体已代入当前实例。</summary>
-    internal static void AfterSplitting(MachineFunction function, MethodRef self, IdiomRewriter rewriter, Func<Expr, TypeRef?>? receiverType = null)
+    internal static bool AfterSplitting(MachineFunction function, MethodRef self, IdiomRewriter rewriter, Func<Expr, TypeRef?>? receiverType = null)
     {
-        while (Run(function, new IdiomRewriter.Defs(function), self, rewriter.abi, IsConstrainedCall(rewriter), Unnamed(rewriter), null, receiverType)) { }
+        var changed = false;
+        while (Run(function, new IdiomRewriter.Defs(function), self, rewriter.abi, IsConstrainedCall(rewriter), Unnamed(rewriter), null, receiverType)) changed = true;
+        return changed;
     }
 
     private static Func<Call, bool> IsConstrainedCall(IdiomRewriter owner) => call => owner.HelperOf(call)?.Kind == HelperKind.ConstrainedCall;
@@ -40,7 +42,9 @@ internal static class InvokerCallsPass
                 Expr? Input(int register) => Actual(register) is { } input ? defs.Expand(input) : null;
                 Call? replacement = null;
                 // 约束类型在生成代码时已确定：直接调用实现方法，MethodInfo 位上是约束解析项（目标没有登记，由这一项指名）。
-                if (unnamed(call) && Constrained(call, defs, self, abi) is { } constrainedDirect)
+                // 约束在类型形参上时，原生实例直接调用的是该实例的实现，登记与否都只是开放方法体里的这一次约束调用。
+                // 运行时的约束调用 helper 也带约束解析项，它的实参是打包的，由下面的规则拆开。
+                if (!isConstrained(call) && Constrained(call, defs, self, abi) is { } constrainedDirect && (constrainedDirect.Item1 is GenericParameterRef { SharedReference: false } || unnamed(call)))
                 {
                     block.Statements[i] = call with { Op = new(OpKind.CallConstrained, constrainedDirect) };
                     return true;
@@ -77,7 +81,7 @@ internal static class InvokerCallsPass
                         lookups ??= function.Blocks.SelectMany(b => b.Statements).OfType<Call>()
                             .Where(c => c.Op?.Kind is OpKind.InterfaceInvokeData or OpKind.ResolveGenericVirtual && c.Defines.Length > 0 && c.Defines[0] is not null)
                             .ToDictionary(c => c.Defines[0]);
-                        method = Dispatched(info, receiver, defs, lookups) ?? VtableInvoker(info, receiver, receiverType);
+                        method = Dispatched(info, receiver, defs, lookups) ?? VtableInvoker(info, receiver, Actual(2)!, receiverType);
                         dispatched = true;
                         if (method is null) continue;
                     }
@@ -100,13 +104,13 @@ internal static class InvokerCallsPass
     }
 
     /// <summary>从接收者的虚表读取 MethodInfo，且 invoker 使用该条目的虚方法指针。</summary>
-    private static MethodRef? VtableInvoker(Expr info, Expr receiver, Func<Expr, TypeRef?>? receiverType)
+    private static MethodRef? VtableInvoker(Expr info, Expr receiver, Expr value, Func<Expr, TypeRef?>? receiverType)
     {
         if (receiverType is null || info is not Load { Width: 64 } read
             || SplitPass.Split(read.Address) is not (Load { Width: 64, Address: var owner }, var offset) || owner != receiver
             || offset < RuntimeLayout.ClassVtable + RuntimeLayout.VirtualInvokeDataMethod
             || (offset - RuntimeLayout.ClassVtable - RuntimeLayout.VirtualInvokeDataMethod) % RuntimeLayout.VirtualInvokeDataSize != 0
-            || receiverType(receiver) is not DefinitionRef { Definition.IsInterface: false } type)
+            || (receiverType(receiver) ?? receiverType(value)) is not DefinitionRef { Definition.IsInterface: false } type)
             return null;
         var slot = (int)((offset - RuntimeLayout.ClassVtable - RuntimeLayout.VirtualInvokeDataMethod) / RuntimeLayout.VirtualInvokeDataSize);
         return DispatchResolution.Slot(type, slot, interfaceOnly: false);

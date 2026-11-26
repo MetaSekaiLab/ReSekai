@@ -14,7 +14,6 @@ sealed class Packages
     public Dictionary<string, (string Guid, long Id)> Scripts { get; } = [];
     public Dictionary<string, string> Shaders { get; } = [];
     public Dictionary<string, string> Versions { get; } = new(StringComparer.Ordinal);
-    public string? SpineSource { get; private set; }
     public CubismRuntime? Cubism { get; private set; }
     public CriWareSdk? CriWare { get; private set; }
     readonly Dictionary<string, JsonElement> catalog;
@@ -138,20 +137,6 @@ sealed class Packages
             catch (Exception error) when (automatic && error is HttpRequestException or TaskCanceledException or InvalidDataException)
             {
                 output.Note("UPM", cubism.Name, $"Cubism 上游 SDK 不可用：{error.Message}", true);
-            }
-        }
-        if (options.Full && automatic && input.Contains("spine-csharp"))
-        {
-            var spine = SourcePackages.Spine;
-            string directory = Path.Join(output.Root, ".resekai", "packages", spine.Name + "@" + spine.Version);
-            try
-            {
-                await spine.Fetch(client, directory);
-                SpineSource = directory;
-            }
-            catch (Exception error) when (error is HttpRequestException or TaskCanceledException or InvalidDataException)
-            {
-                output.Note("UPM", spine.Name, $"Spine 上游源码不可用：{error.Message}");
             }
         }
         Dictionary<string, string> available = [];

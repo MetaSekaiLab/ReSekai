@@ -63,6 +63,8 @@ public sealed record PendingAccess(ulong Address, string Reason, bool Write);
 public sealed record AddressValue(ManagedValue Target) : ManagedValue(new ByRefRef(Target.Type), 64);
 /// <summary>固定数组并取得首元素地址；null 或空数组返回空指针。</summary>
 public sealed record PinnedArrayValue(ManagedValue Array, ArrayRef ArrayType) : ManagedValue(new PointerRef(ArrayType.Element), 64);
+/// <summary>固定一个托管引用并取得它的地址（fixed (T* p = &amp;field)）。</summary>
+public sealed record PinnedReferenceValue(ManagedValue Reference, TypeRef Element) : ManagedValue(new PointerRef(Element), 64);
 /// <summary>在当前方法栈中分配并清零固定元素类型的缓冲区。</summary>
 public sealed record ZeroedStackBufferValue(ManagedValue Count, PointerRef PointerType, int ElementSize) : ManagedValue(PointerType, 64);
 /// <summary>非托管指针按字节偏移，不增加数组边界检查。</summary>

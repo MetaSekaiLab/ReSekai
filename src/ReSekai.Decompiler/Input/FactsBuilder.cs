@@ -58,6 +58,7 @@ namespace ReSekai.Decompiler.Input
                 Timings = timings,
                 Options = options ?? new(),
             };
+            Step("marshal", () => { ReSekai.Decompiler.Facts.Derived.MarshalLayouts.Apply(basis); return 0; });
             var registered = new ProgramFacts(basis, new());
             cacheDirectory ??= basis.Options.FactCacheDirectory ?? Path.Combine(".resekai", "cache", "unregistered");
             var inferred = inferUnregistered ? Step("unregistered", () => UnregisteredFactsCache.GetOrBuild(registered, metadataPath, cacheDirectory, log)) : UnregisteredMethods.Empty;

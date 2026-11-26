@@ -76,6 +76,7 @@ internal sealed class MemoryPromotion
         var promotion = new MemoryPromotion(function, signature, shapes, abi);
         promotion.TrimUnusedCallInputs();
         promotion.BindStackAddresses();
+        Machine.Storage.FrameCopies.Run(function, new CallMemoryEffects(shapes, abi, settled: true));
         if (Machine.Storage.FrameForwarding.Run(function, new CallMemoryEffects(shapes, abi, settled: true))) Propagate.Run(function, Dominators.Compute(function));
         promotion.FindTypedFrameCopies();
         promotion.SplitPairedLocalZeros();
@@ -84,6 +85,7 @@ internal sealed class MemoryPromotion
         if (signature.Return is { Transfer: Transfer.ResultBuffer, Size: > 0 } && layout.Cells.Any(c => c.Space == LocalSpace.Result && !c.Promoted))
             return RecoveryDiagnostics.Fail(function.Entry, "内存 结果缓冲区的地址逃逸：" + string.Join("；", layout.Cells
                 .Where(c => c.Space == LocalSpace.Result && !c.Promoted).Select(c => $"+{c.Start:x} {c.Escape}")), rule: "Memory");
+        layout = promotion.KeepIterators(layout);
         layout = promotion.KeepThrowObservedCells(layout, calls, stackPointer);
         promotion.Rewrite(layout);
         var dominators = Dominators.Compute(function);
@@ -200,15 +202,19 @@ internal sealed class MemoryPromotion
         var inserts = function.Blocks.SelectMany(b => b.Statements).OfType<Define>()
             .Where(d => d.Value is Insert { Low: 0, Value: Use or Const }).ToDictionary(d => d.Target, d => (Insert)d.Value);
         var changed = false;
+        var residual = new ResidualInputs(function, shapes);
         foreach (var block in function.Blocks)
             for (var i = 0; i < block.Statements.Count; i++)
-                if (block.Statements[i] is Call call && shapes(call).Signature is { } callee)
+                if (block.Statements[i] is Call call && shapes(call) is { Signature: { } callee } shape)
                 {
                     var updated = call;
                     if (call.StackPointer is not null && callee.MethodInfo?.Register.Bank != Bank.Stack
                         && callee.Arguments.Concat(callee.Indirections).SelectMany(a => a.Pieces).All(p => p.Register.Bank != Bank.Stack))
                         updated = updated with { StackPointer = null };
                     Expr[]? arguments = null;
+                    foreach (var value in shape.Unused.Count == 0 ? [] : callee.Arguments.Where(a => a.Transfer == Transfer.Value && a.Pieces is [{ Width: 64 } piece] && shape.Unused.Contains(piece.Register)))
+                        if (call.ArgumentIndex(value.Pieces[0].Register) is >= 0 and var at && residual.Is(call.Arguments[at], value.Type))
+                            (arguments ??= call.Arguments.ToArray())[at] = new Unknown("原生被调方未用的输入", call.Arguments[at].Width);
                     if (inserts.Count != 0)
                         foreach (var piece in callee.Arguments.Where(a => a.Transfer == Transfer.Value && abi.Kind(a.Type) == ValueKind.Struct)
                             .SelectMany(a => a.Pieces).Where(p => p.Register.Bank == Bank.Gpr && p.Width < 64))
@@ -334,7 +340,7 @@ internal sealed class MemoryPromotion
         new(id, space, start, checked((int)(end - start)), escape ?? (end - start > 4096 ? "单元超过 4096 字节" : null));
 
     private void Add(LocalSpace space, long offset, int size) => accesses.Add(new(space, offset, size, null));
-    private void Escape(LocalSpace space, long offset, string reason) => accesses.Add(new(space, offset, 1, reason));
+    private void Escape(LocalSpace space, long offset, string reason, int size = 1) => accesses.Add(new(space, offset, size, reason));
 
     private void Collect(Stmt statement)
     {
@@ -376,6 +382,11 @@ internal sealed class MemoryPromotion
                     if (shapes(call).Signature?.MethodInfo is { } hidden && call.ArgumentIndex(hidden.Register) is >= 0 and var slot) covered.Add(slot);
                     // 签名已知时，输入只有签名占用的寄存器；其余寄存器里是调用前残留的值，被调方不读取，不是实参。
                     var live = shapes(call).Signature is { } known ? InputRegisters(known) : null;
+                    // T* 实参至少指向一个完整的 T。
+                    foreach (var pointer in shapes(call).Signature?.Arguments ?? [])
+                        if (pointer is { Type: PointerRef { Element: var pointee }, Transfer: Transfer.Value, Pieces: [{ Register: var register }] } && abi.Size(pointee) is > 1 and var size
+                            && call.ArgumentIndex(register) is >= 0 and var at && Resolve(call.Arguments[at]) is var (pointed, start))
+                            Escape(pointed, start, "按指针传给调用", size);
                     for (var i = 0; i < call.Arguments.Length; i++)
                         if (!covered.Contains(i) && (live is null || i >= call.Sources.Length || live.Contains(call.Sources[i]))) Walk(call.Arguments[i], shapes(call) is { Signature: null, IsRuntime: false } ? "未知调用的实参" : "调用实参");
                     if (call.DelegateReceiver is { } receiver) Walk(receiver, "委托接收者");
@@ -444,6 +455,66 @@ internal sealed class MemoryPromotion
                 effects.Add(new(-1, MachineSignature.MethodInfoIndex, 64, 0, LocalSpace.Frame, spOffset + info.Register.Index, 8, MemoryAccess.Read));
         }
         return effects;
+    }
+
+    /// <summary>
+    /// 结构体枚举器：MoveNext 内联在循环里，逐轮改写它的状态字段，之后整体按引用交给它自己的方法（Dispose）。
+    /// 状态是同一个局部的内容，不拆成各字段的合流。
+    /// </summary>
+    private MemoryLayout KeepIterators(MemoryLayout layout)
+    {
+        var kept = new HashSet<int>();
+        foreach (var call in function.Blocks.SelectMany(b => b.Statements).OfType<Call>())
+        {
+            if (shapes(call) is not { Signature: not null, Candidates: [{ Method: { IsStatic: false } target }] } shape
+                || !target.Owner.IsValueType || !target.Owner.Methods.Any(m => m is { Name: "MoveNext", IsStatic: false, Parameters.Count: 0 })) continue;
+            foreach (var effect in Effects(call))
+                if (effect.Value == -1 && layout.Find(effect.Space, effect.Offset, effect.Size) is { Promoted: true } cell
+                    && cell.Start == effect.Offset && cell.Size == effect.Size) kept.Add(cell.Id);
+        }
+        kept.RemoveWhere(id => !Advanced(layout.Cells[id]));
+        return kept.Count == 0 ? layout
+            : new MemoryLayout(layout.Cells.Select(c => kept.Contains(c.Id) ? c with { Escape = "循环中推进的枚举器状态" } : c).ToList());
+
+        // 循环里只改写一部分字段，才是逐轮推进；每一轮都重新写满的是嵌套循环里新取的枚举器。
+        bool Advanced(Cell cell)
+        {
+            if (cell.Space.Kind != LocalKind.Frame) return false;
+            var seen = new HashSet<Block>();
+            foreach (var block in function.Blocks)
+            {
+                if (seen.Contains(block) || !Writes(block, cell).Any()) continue;
+                var loop = Loop(block);
+                if (loop.Count == 0) continue;
+                seen.UnionWith(loop);
+                var written = new bool[cell.Size];
+                foreach (var (start, size) in loop.SelectMany(b => Writes(b, cell)))
+                    for (var i = start; i < start + size; i++) written[i] = true;
+                if (written.Any(w => !w)) return true;
+            }
+            return false;
+        }
+
+        static IEnumerable<(int Start, int Size)> Writes(Block block, Cell cell) => block.Statements.OfType<Store>()
+            .Where(s => s.Target is FrameAddress slot && slot.Offset >= cell.Start && slot.Offset + s.Value.Width / 8 <= cell.End)
+            .Select(s => ((int)(((FrameAddress)s.Target).Offset - cell.Start), s.Value.Width / 8));
+
+        static HashSet<Block> Loop(Block block)
+        {
+            HashSet<Block> Reach(Func<Block, IEnumerable<Block>> next)
+            {
+                var seen = new HashSet<Block>();
+                var pending = new Stack<Block>(next(block));
+                while (pending.TryPop(out var current))
+                    if (seen.Add(current))
+                        foreach (var following in next(current)) pending.Push(following);
+                return seen;
+            }
+            var loop = Reach(b => b.Successors);
+            if (!loop.Contains(block)) return [];
+            loop.IntersectWith(Reach(b => b.Predecessors));
+            return loop;
+        }
     }
 
     /// <summary>

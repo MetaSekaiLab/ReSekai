@@ -310,6 +310,8 @@ internal sealed class Interpreter(ManagedTypes types, Solver solver, InlineEvide
         return (inside.Min(l => l.Offset), inside.Max(l => l.Offset + types.Size(l.Type)));
     }
 
+    private static TypeRef StorageType(FieldRef field) => field.DeclaringType is DefinitionRef owner ? field.Field.Type.Substitute(owner.Arguments, []) : field.Field.Type;
+
     /// <summary>两位置可能共享存储（必然相同的已先判定）。</summary>
     public bool MayOverlap(SideState side, Term x, Term y)
     {
@@ -327,8 +329,16 @@ internal sealed class Interpreter(ManagedTypes types, Solver solver, InlineEvide
             // 入口引用已指向既有存储，之后分配的对象即使已发布，其字段也不会与该引用重叠。
             if (reference.Args[0].IsAtom(AtomKind.Argument) && other.Root is RootKind.Field or RootKind.Element or RootKind.MultiElement
                 && solver.Allocations.Contains(other.Args[0])) return false;
+            // ref T（T 是引用类型）只能指向声明类型恰为 T 的存储：托管引用不变。
+            if (reference.Args[0] is { Hint: ByRefRef { Element: var pointed } } && (reference.Args[0].IsAtom(AtomKind.Argument) || reference.Args[0].IsAtom(AtomKind.Formal))
+                && TermTable.PathOf(reference).Count == 0 && TermTable.PathOf(other) is { Count: > 0 } path && other.Root != RootKind.Reference
+                && ManagedTypes.IsReferenceType(pointed) && !pointed.ContainsGenericParameter()
+                && StorageType(path.Fields[^1]) is var stored && !stored.ContainsGenericParameter() && !stored.Equals(pointed)) return false;
             if (x.Root == RootKind.Reference && y.Root == RootKind.Reference && ReferenceEquals(x.Args[0], y.Args[0]))
                 return FieldsOverlap(px, py);
+            // 接收者已绑定为没有交出地址的局部：内存里读出的指针不会指向它。
+            if (x.Root == RootKind.Reference && y.Root == RootKind.Reference && (BoundLocal(side, x) && !Derived(y.Args[0], x.Args[0]) || BoundLocal(side, y) && !Derived(x.Args[0], y.Args[0])))
+                return false;
             return x.Root == RootKind.Reference && Within(px, py) || y.Root == RootKind.Reference && Within(py, px);
         }
         if (x.Root != y.Root) return false;
@@ -350,6 +360,14 @@ internal sealed class Interpreter(ManagedTypes types, Solver solver, InlineEvide
                 return true;
         }
     }
+
+    private bool BoundLocal(SideState side, Term location) => location.Args[0].IsAtom(AtomKind.Formal)
+        && solver.Apply(location.Args[0]) is { Kind: TermKind.Address, Location.Root: RootKind.Cell } bound && !side.Exposed.Contains(CellOf(bound.Location));
+
+    /// <summary>指针由引用算出（经内存读出的值不算）。</summary>
+    private static bool Derived(Term pointer, Term reference) => ReferenceEquals(pointer, reference)
+        || pointer.Kind is not (TermKind.Read or TermKind.Location) && (pointer.Kind == TermKind.Atom ? pointer.IsAtom(AtomKind.Formal) || pointer.IsAtom(AtomKind.Argument) && pointer.Hint is ByRefRef
+            : pointer.Kind == TermKind.Address || pointer.Args.Any(a => Derived(a, reference)));
 
     /// <summary>
     /// 经引用、引用之后路径为 inner 的标量叶子可能落在路径为 outer 的标量叶子里：outer 的某一层接上 inner。
@@ -622,13 +640,17 @@ internal sealed class Interpreter(ManagedTypes types, Solver solver, InlineEvide
         while (true)
         {
             RecoveryCancellation.Check();
-            if (++side.Steps > StepBudget) return Fail("步数超过预算");
-            if (Meter?.Spend() == true) return Fail("尝试的总步数超过预算");
             var frame = side.Top;
             var program = frame.Program;
             var unit = program.Units[frame.Unit];
             if (frame.Op >= unit.Ops.Length) return Fail("块没有终结");
             var op = unit.Ops[frame.Op];
+            // 取局部与纯运算不计步：展开后的大表达式在一条语句里就有几千个结点，而它们不分叉也不改状态。
+            if (op is not (LocalOp or PureOp))
+            {
+                if (++side.Steps > StepBudget) return Fail("步数超过预算");
+                if (Meter?.Spend() == true) return Fail("尝试的总步数超过预算");
+            }
             side.NoteStatement(program, frame, op);
             var trace = side.Frames.Count == 1 ? side.Current : null;
             switch (op)
@@ -911,6 +933,8 @@ internal sealed class Interpreter(ManagedTypes types, Solver solver, InlineEvide
                 return o[0].IsConstant && o[0].Bits == 0 ? o[0] : Terms.Operation(OpCode.IsInst, 0, 64, isinst.Target, o[0]);
             case PinnedArrayValue:
                 return Terms.Operation(OpCode.Pin, 0, 64, null, o[0]);
+            case PinnedReferenceValue:
+                return o[0];
             case PointerOffsetValue:
                 return Terms.Binary(BinOp.Add, o[0], o[1].Width == 64 ? o[1] : Terms.Convert(ConvKind.SignExtend, o[1], 64), 64);
             case ComposedValue composed:

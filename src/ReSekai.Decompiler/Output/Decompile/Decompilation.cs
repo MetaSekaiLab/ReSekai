@@ -70,6 +70,7 @@ public static partial class Decompilation
         decompiler.AstTransforms.Add(new FieldLikeEvents());
         decompiler.AstTransforms.Add(new EventFieldNames());
         decompiler.AstTransforms.Add(new TerminalValues());
+        decompiler.AstTransforms.Add(new ScopedUsings());
         transforms?.Register(decompiler, DecompilePosition.AfterEvents);
         return decompiler;
     }

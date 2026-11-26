@@ -114,7 +114,9 @@ internal sealed partial class CilBodyWriter
             case NewArrayValue array:
                 Value(array.Length); il.Emit(OpCodes.Newarr, TypeReference(array.ArrayType.Element)); break;
             case StackBytesValue allocation:
-                Value(allocation.Length); il.Emit(OpCodes.Conv_U); il.Emit(OpCodes.Localloc); break;
+                Value(allocation.Length); il.Emit(OpCodes.Conv_U);
+                if (types.Size(allocation.Element) is > 1 and var elementBytes) { il.Emit(OpCodes.Ldc_I4, elementBytes); il.Emit(OpCodes.Mul_Ovf_Un); }
+                il.Emit(OpCodes.Localloc); break;
             case NewMultiArrayValue array:
                 foreach (var length in array.Lengths) Value(length);
                 il.Emit(OpCodes.Newobj, ArrayMethod(array.ArrayType, ".ctor")); break;
@@ -139,6 +141,13 @@ internal sealed partial class CilBodyWriter
             case AddressValue a: Address(a.Target); break;
             case PinnedArrayValue pinned:
                 PinArray(pinned); break;
+            case PinnedReferenceValue pinned:
+                Value(pinned.Reference); il.Emit(OpCodes.Stloc, pinnedReferences[pinned]);
+                il.Emit(OpCodes.Ldloc, pinnedReferences[pinned]); il.Emit(OpCodes.Conv_U); break;
+            // p[i]：按元素大小步进的偏移写成 C# 的指针下标形式。
+            case PointerOffsetValue { Pointer: PinnedReferenceValue start, Offset: BinaryValue { Op: BinOp.Mul, Left: var step, Right: ConversionValue { Operand: SizeOfValue size } } }:
+                Value(start); Value(step is ConversionValue { Kind: ConvKind.SignExtend, Operand: { Width: 32 } narrow } ? narrow : step);
+                il.Emit(OpCodes.Conv_I); Value(size); il.Emit(OpCodes.Mul); il.Emit(OpCodes.Add); break;
             case PointerOffsetValue pointer:
                 Value(pointer.Pointer); Value(pointer.Offset); il.Emit(OpCodes.Conv_I); il.Emit(OpCodes.Add); break;
             // 读取存储位置上的整个结构体：直接 ldloc/ldarg/ldfld/ldsfld（不对只读静态字段取址）
@@ -287,6 +296,7 @@ internal sealed partial class CilBodyWriter
     private void ClearPinnedArrays()
     {
         foreach (var local in pinnedArrays.Values) { il.Emit(OpCodes.Ldnull); il.Emit(OpCodes.Stloc, local); }
+        foreach (var local in pinnedReferences.Values) { il.Emit(OpCodes.Ldc_I4_0); il.Emit(OpCodes.Conv_U); il.Emit(OpCodes.Stloc, local); }
     }
 
     private void Comparison(ComparisonValue c)

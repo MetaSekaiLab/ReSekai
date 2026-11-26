@@ -8,7 +8,7 @@ namespace ReSekai.Decompiler.Recovery.Calls;
 
 /// <summary>按调用形状与运行时操作表回答调用对帧内存的影响；目标未确定时保守。</summary>
 /// <param name="settled">调用目标的解析已结束：仍未解析的调用只会成为洞，不再需要为它保留可能的栈实参。</param>
-internal sealed class CallMemoryEffects(Func<Call, CallShape> shapes, ManagedAbi abi, bool settled = false) : IFrameCallEffects
+internal sealed class CallMemoryEffects(Func<Call, CallShape> shapes, ManagedAbi abi, bool settled = false, Func<ulong, HelperKind?>? helper = null) : IFrameCallEffects
 {
     public ArgumentUse Argument(Call call, int index)
     {
@@ -39,6 +39,9 @@ internal sealed class CallMemoryEffects(Func<Call, CallShape> shapes, ManagedAbi
     {
         var shape = shapes(call);
         if (call.Op is { Kind: not (OpKind.Import or OpKind.Export) } && shape.IsRuntime) return 0;
+        // 运行时 helper 都是参数不超过八个寄存器的 C 函数，不读栈上的实参。
+        if (call is { Op: null, Kind: CallKind.Direct, Target: Const target } && helper?.Invoke(target.Value) is { } kind
+            && kind is not (HelperKind.Unknown or HelperKind.Import)) return 0;
         return shape.Signature?.StackSize ?? (settled ? 0 : null);
     }
 }

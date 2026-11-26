@@ -17,7 +17,8 @@ internal static class ChecksPass
                 continue;
             for (var side = 0; side < 2; side++)
             {
-                if (state.ThrowBlock(normal[side]) is not { } helper || state.ThrowBlock(normal[1 - side]) is not null)
+                var thrower = Forward(normal[side]);
+                if (state.ThrowBlock(thrower) is not { } helper || state.ThrowBlock(normal[1 - side]) is not null)
                     continue;
                 if (!FoldedCheckEdges.Preserve(state.function, head, normal[side], side, state.Fresh))
                     continue;
@@ -28,14 +29,14 @@ internal static class ChecksPass
                     ("System.IndexOutOfRangeException", Compare { Cond: Cond.Uge or Cond.Ugt or Cond.Ule or Cond.Ult } compare) => (OpKind.BoundsCheck, Template.BoundsCheck, BoundsPass.Bounds(compare)),
                     _ => (OpKind.ThrowIf, Template.ThrowIf, new[] { condition }),
                 };
-                var op = new Call(branch.Address, CallKind.Direct, ((Call)normal[side].Statements[^1]).Target)
+                var op = new Call(branch.Address, CallKind.Direct, ((Call)thrower.Statements[^1]).Target)
                 {
                     Op = new RuntimeOp(kind, kind == OpKind.ThrowIf ? helper.Detail : null),
                     Arguments = arguments,
-                    NativeExceptionSite = normal[side].Statements[^1].Address,
+                    NativeExceptionSite = thrower.Statements[^1].Address,
                 };
                 var at = state.recording ? state.Start(head) : default;
-                var throwHelper = ((Const)((Call)normal[side].Statements[^1]).Target).Value;
+                var throwHelper = ((Const)((Call)thrower.Statements[^1]).Target).Value;
                 var exits = new Dictionary<string, ulong>
                 {
                     ["throw"] = normal[side].Start,
@@ -56,5 +57,13 @@ internal static class ChecksPass
         }
 
         return changed;
+    }
+
+    /// <summary>抛出块之前只剩跳转的空块：里面原有的传值已随未用的输入删去。</summary>
+    private static Block Forward(Block block)
+    {
+        for (var hops = 0; hops < 4 && block is { Handler: null, IsLandingPad: false } && block.Statements.All(s => s is Nop or Jump)
+            && block.NormalSuccessors.ToArray() is [var next] && !next.Statements.Any(s => s is Phi); hops++) block = next;
+        return block;
     }
 }

@@ -659,8 +659,12 @@ internal sealed class Joint(Interpreter interpreter, Func<MethodRef, Program?> t
     {
         if (path.A.Frames.Count != 1 || path.B.Frames.Count != 1) return "仍在展开的调用中";
         var program = path.A.Frames[0].Program;
-        if (SameHeap(path, true, program.LiveIn(block)) is { } heap) return heap;
-        foreach (var variable in program.LiveIn(block))
+        // 两侧的块不同（绕回区域的起点）时，替换后读到的局部也要相同。
+        var other = path.B.Frames[0].Program;
+        IReadOnlySet<Variable> live = program.LiveIn(block);
+        if (other.Blocks.TryGetValue(block, out var replaced) && !ReferenceEquals(replaced, program.Blocks[block])) live = live.Union(other.LiveIn(block)).ToHashSet();
+        if (SameHeap(path, true, live) is { } heap) return heap;
+        foreach (var variable in live)
         {
             if (program.Cells.Contains(variable)) continue;
             var x = path.A.Frames[0].Env.GetValueOrDefault(variable);

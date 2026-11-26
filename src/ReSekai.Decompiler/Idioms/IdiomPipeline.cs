@@ -34,6 +34,7 @@ internal static class IdiomPipeline
         new("lazy.metadata", LazyMetadata),
         Do("operands", s => s.RefreshOperands()),
         new("thread.statics", s => s.ThreadStaticBlocks()),
+        new("stack.buffers", StackBuffersPass.StackBuffers),
         new("memory.constant", s => ConstantMemoryNormalizer.Run(s.function, s.Fresh)),
         new("math.imports", MathImports),
         new("array.fresh-elements", s => s.FreshArrayElementClasses()),
@@ -52,6 +53,7 @@ internal static class IdiomPipeline
         new("branches.empty-arms", s => EmptyArmBranches.Run(s.function, expression => s.defs.Expand(expression))),
         new("branches.initializer-tails", s => InitializerBranchTails.Run(s.function, expression => s.defs.Expand(expression))),
         new("checked.depth", s => s.RepeatedTypeDepthChecks()),
+        new("checked.repeated", RepeatedTypeChecks.Run),
         new("checked.references", s => s.CheckedReferenceValues(), Once: true),
         new("checked.types", s => s.SuccessfulTypeCheckValues(), Once: true),
         new("checked.classes", s => CheckedClassValues.Run(s.function, s.RawDefinition, s.Fresh), Once: true),
@@ -64,8 +66,10 @@ internal static class IdiomPipeline
         new("loops.fixed-frame-index", s => s.FixedFrameIndexLoops()),
         new("loops.affine", s => AffineInduction.Run(s.function, s.RawDefinition)),
         new("loops.array-pointers", s => s.ArrayPointerLoops()),
+        new("loops.frame-guards", s => RotatedFrameGuards.Run(s.function, s.Fresh)),
         new("exception.stack", s => ExceptionStackValues.Run(s.function) | ExceptionStackValues.SelectedSlots(s.function, s.owner.CallEffects, s.Fresh)),
         Do("readonly.data", s => s.ReadOnlyData()),
+        new("phi.reloads", s => ReloadedAddresses.Run(s.function, s.Fresh)),
         new("phi.address-loads", s => AddressPhiLoads.Run(s.function, s.Fresh)),
         new("phi.class-allocations", s => ClassPhiAllocations.Run(s.function,
             address => s.facts.EntriesAt(address).Any(e => e.Method is { Method: { Name: ".ctor", IsStatic: false, Parameters.Count: 0 } }), s.Fresh)),
@@ -125,6 +129,8 @@ internal static class IdiomPipeline
         var signatures = state.facts.EntriesAt(state.function.Entry).Select(e => e.Method).OfType<MethodRef>().Distinct().Select(m => state.owner.abi.Classify(m, out _)).ToArray();
         if (signatures.Length == 0 && state.facts.Unregistered.At(state.function.Entry) is { } stackIdentity)
             signatures = [stackIdentity.Abi];
+        else if (signatures.Length == 0 && state.owner.AssumedSignature is { } assumed)
+            signatures = [assumed];
         if (signatures.All(s => s is not null) && StackInputNormalizer.Run(state.function, state.owner.abi, signatures.Select(s => s!).ToArray(), out var hiddenStack)
             && hiddenStack is { } offset)
             state.selfMethodInfo = Storage.Slot(offset);

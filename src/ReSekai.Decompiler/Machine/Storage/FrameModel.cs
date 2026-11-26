@@ -92,18 +92,49 @@ internal sealed class FrameModel
     /// 区间不再被读取，地址未逃逸，调用也不经指针观察它。没有被直接读取过的槽可能是未解析调用的栈实参，因此要求调用不读这段栈；
     /// 被读取过的槽是私有保存，不在实参区。
     /// </summary>
-    public bool Unobserved(long offset, int bytes)
+    public bool Unobserved(long offset, int bytes, CallSite? except = null)
     {
         if (Escaped(offset, bytes)) return false;
         var spilled = loaded.Any(l => l >= offset && l < offset + bytes);
         foreach (var call in function.Blocks.SelectMany(b => b.Statements).OfType<Call>())
         {
+            if (call.Site == except) continue;
             if (ranges.TryGetValue(call.Site, out var used) && used.Any(r => Overlaps(r.Offset, r.Size < 0 ? null : r.Size, offset, bytes))) return false;
             if (!spilled && ReadsOnStack(call, offset, bytes)) return false;
         }
         return function.Blocks.SelectMany(b => b.Statements).SelectMany(ExprMap.Operands).SelectMany(ExprMap.Walk).OfType<Load>()
             .All(load => !Points(load.Address).Any(at => at < offset + bytes && offset < at + load.Width / 8)
                 && !IndexedRoots(load.Address).Any(root => root < offset + bytes));
+    }
+
+    /// <summary>函数不再改动时，对许多区间判断 <see cref="Unobserved"/>：读取与调用只扫描一遍。</summary>
+    public Func<long, int, bool> Observers()
+    {
+        var read = new HashSet<long>();
+        var lowest = long.MaxValue;
+        var touched = new HashSet<(long Offset, int? Size)>();
+        var stacks = new HashSet<(long Pointer, int? Read)>();
+        foreach (var statement in function.Blocks.SelectMany(b => b.Statements))
+        {
+            foreach (var load in ExprMap.Operands(statement).SelectMany(ExprMap.Walk).OfType<Load>())
+            {
+                foreach (var at in Points(load.Address))
+                    for (var k = at; k < at + load.Width / 8; k++) read.Add(k);
+                foreach (var root in IndexedRoots(load.Address)) lowest = Math.Min(lowest, root);
+            }
+            if (statement is not Call call) continue;
+            if (ranges.TryGetValue(call.Site, out var used))
+                foreach (var range in used) touched.Add((range.Offset, range.Size < 0 ? null : range.Size));
+            if (call.StackPointer is { } pointer && Slot(pointer) is { } sp) stacks.Add((sp, calls.StackRead(call)));
+        }
+        return (offset, bytes) =>
+        {
+            if (Escaped(offset, bytes) || lowest < offset + bytes) return false;
+            for (var at = offset; at < offset + bytes; at++)
+                if (read.Contains(at)) return false;
+            if (touched.Any(t => Overlaps(t.Offset, t.Size, offset, bytes))) return false;
+            return loaded.Any(l => l >= offset && l < offset + bytes) || !stacks.Any(s => ReadsOnStack(s.Pointer, s.Read, offset, bytes));
+        };
     }
 
     public bool UnobservedAfter(Block block, Store store, Func<Call, bool>? boundStackInput = null)
@@ -136,14 +167,19 @@ internal sealed class FrameModel
     }
 
     /// <summary>帧指针的保存值在所有后续路径上都未被观察，或在读取前已被覆盖。</summary>
-    public bool DeadPointerStore(Block block, Store store)
+    public bool DeadPointerStore(Block block, Store store) => store.Value is FrameAddress && store.Target is FrameAddress { Offset: < 0 and var offset }
+        && Dead(block, block.Statements.IndexOf(store) + 1, offset, 8);
+
+    /// <summary>从第 index 条语句起，[offset, offset+bytes) 的现有内容在所有路径上都不被观察，或在读取前已被覆盖。</summary>
+    public bool Dead(Block block, int index, long offset, int bytes)
     {
-        if (store.Value is not FrameAddress || store.Target is not FrameAddress { Offset: < 0 and var offset }) return false;
-        if (offset + 8 > 0 || Escaped(offset, 8)) return false;
+        if (bytes is <= 0 or > 16 || offset + bytes > 0 || Escaped(offset, bytes)) return false;
+        // 被直接读取过的槽是私有保存，不在传给调用的栈实参区。
+        var spilled = loaded.Any(l => l >= offset && l < offset + bytes);
         var pending = new Stack<(Block Block, int Index, int Bytes)>();
         var seen = new Dictionary<Block, int>();
         var budget = ReachBudget;
-        pending.Push((block, block.Statements.IndexOf(store) + 1, 0xff));
+        pending.Push((block, index, (1 << bytes) - 1));
         while (pending.TryPop(out var path))
         {
             var live = path.Bytes;
@@ -154,11 +190,11 @@ internal sealed class FrameModel
                 if (live == 0) continue;
                 seen[path.Block] = visited | live;
             }
-            bool Reads(long start, int? size) => Enumerable.Range(0, 8)
+            bool Reads(long start, int? size) => Enumerable.Range(0, bytes)
                 .Any(b => (live & (1 << b)) != 0 && Overlaps(start, size, offset + b, 1));
             void Overwrite(long start, int size)
             {
-                for (var b = 0; b < 8; b++)
+                for (var b = 0; b < bytes; b++)
                     if (Overlaps(start, size, offset + b, 1)) live &= ~(1 << b);
             }
             foreach (var statement in path.Block.Statements.Skip(path.Index))
@@ -169,7 +205,7 @@ internal sealed class FrameModel
                     Points(load.Address).Any(at => Reads(at, load.Width / 8)) || IndexedRoots(load.Address).Any(at => Reads(at, null)))) return false;
                 if (statement is Store { Target: FrameAddress target } write) Overwrite(target.Offset, write.Value.Width / 8);
                 if (statement is not Call call) continue;
-                if (ReadsOnStack(call, offset, 8)) return false;
+                if (!spilled && ReadsOnStack(call, offset, bytes)) return false;
                 if (path.Block.Handler is { } handler) pending.Push((handler, 0, live));
                 if (!ranges.TryGetValue(call.Site, out var used)) continue;
                 if (used.Any(r => (r.Access & MemoryAccess.Read) != 0 && Reads(r.Offset, r.Size < 0 ? null : r.Size))) return false;
@@ -513,7 +549,28 @@ internal sealed class FrameModel
     private bool ReadsOnStack(Call call, long offset, int bytes)
     {
         if (call.StackPointer is not { } pointer || Slot(pointer) is not { } sp || offset + bytes <= sp) return false;
-        return calls.StackRead(call) is not { } read || offset < sp + read;
+        return ReadsOnStack(sp, calls.StackRead(call), offset, bytes);
+    }
+
+    private bool ReadsOnStack(long sp, int? reads, long offset, int bytes)
+    {
+        if (offset + bytes <= sp) return false;
+        if (reads is { } read) return offset < sp + read;
+        // 栈实参从 SP 起逐槽相连，每一槽都由调用者写过：中间有一槽从未写过时，更高的槽不是实参。
+        for (var slot = sp; slot < offset && slot + 8 <= offset + bytes; slot += 8)
+            if (!Written(slot)) return false;
+        return true;
+    }
+
+    private readonly Dictionary<long, bool> writtenSlots = [];
+
+    /// <summary>函数里有写入可能落在这一槽。</summary>
+    private bool Written(long slot)
+    {
+        if (writtenSlots.TryGetValue(slot, out var known)) return known;
+        return writtenSlots[slot] = function.Blocks.SelectMany(b => b.Statements).OfType<Store>().Any(store =>
+                Points(store.Target).Any(at => Overlaps(at, store.Value.Width / 8, slot, 8)) || IndexedRoots(store.Target).Any(at => Overlaps(at, null, slot, 8)))
+            || ranges.Values.Any(used => used.Any(r => r.Access != MemoryAccess.Read && Overlaps(r.Offset, r.Size < 0 ? null : r.Size, slot, 8)));
     }
 
     /// <summary>栈槽中的地址：槽本身可被观察，或可能作为未读取的栈实参传出时，其中的地址也逃逸。</summary>
@@ -569,9 +626,10 @@ internal static class FrameForwarding
                     block.Statements[i] = rewritten;
                     changed = true;
                 }
+            var unobserved = model.Observers();
             var dead = function.Blocks.SelectMany(block => block.Statements.OfType<Store>()
                 .Where(store => store.Value.Width > 0 && model.Slot(store.Target) is < 0 and var slot
-                    && (model.Unobserved(slot, store.Value.Width / 8) || model.DeadPointerStore(block, store)))
+                    && (unobserved(slot, store.Value.Width / 8) || model.DeadPointerStore(block, store)))
                 .Select(store => (Block: block, Store: store))).ToArray();
             foreach (var (block, store) in dead) block.Statements.Remove(store);
             changed |= dead.Length > 0;

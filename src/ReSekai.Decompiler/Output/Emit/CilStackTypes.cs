@@ -324,7 +324,7 @@ internal static class CilStackTypes
                 case Code.Ceq or Code.Cgt_Un: Compare(true); Push(I4); break;
                 case Code.Cgt or Code.Clt or Code.Clt_Un: Compare(false); Push(I4); break;
                 case Code.Add or Code.Sub: Numeric(false, true); break;
-                case Code.Mul or Code.Div or Code.Rem: Numeric(false, false); break;
+                case Code.Mul or Code.Mul_Ovf_Un or Code.Div or Code.Rem: Numeric(false, false); break;
                 case Code.Div_Un or Code.Rem_Un or Code.And or Code.Or or Code.Xor: Numeric(true, false); break;
                 case Code.Shl or Code.Shr or Code.Shr_Un:
                     {

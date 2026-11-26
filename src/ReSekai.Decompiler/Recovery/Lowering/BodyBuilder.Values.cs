@@ -25,7 +25,7 @@ internal sealed partial class BodyBuilder
             return Operation(selection, expected, address);
         if (expected is DefinitionRef structure && types.Kind(expected) == TypeKind.Struct && sym is not ConcatSym && oracle.BitRepresentation(sym))
             return StructBits(sym, structure, address);
-        if (sym is not LocalSym && locals.TryGetValue(sym, out var known)) return Coerce(known, expected, address);
+        if (sym is not LocalSym && locals.TryGetValue(sym, out var known) && SharedVisible(sym)) return Coerce(known, expected, address);
         switch (sym)
         {
             case ArgSym arg:

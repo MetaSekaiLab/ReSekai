@@ -43,7 +43,7 @@ internal sealed partial class BodyBuilder
             // 相邻字段合并的读取逐字段落成局部，以该段的切片为键。
             if (oracle.Parts(read) is { } leaves)
             {
-                foreach (var part in leaves)
+                foreach (var part in leaves.Where(oracle.Complete))
                     output.Add(new ManagedAssignment(statement.Address, Local(values.Syms.Slice(read, part.Bit, part.Width), part.Leaf.Type), LocationValue(part.Leaf, statement.Address)));
                 continue;
             }
@@ -59,6 +59,9 @@ internal sealed partial class BodyBuilder
         }
         switch (statement)
         {
+            case Define define when operands is [var defined]:
+                DefineShared(block, define, defined, output);
+                return null;
             case Define or Phi or Nop or Assign:
                 return null;
             case Store store:
@@ -144,6 +147,8 @@ internal sealed partial class BodyBuilder
                 return new Branch(branch.Address, View(operands[0], types.Boolean, branch.Address), branch.Target, branch.Fallthrough);
             case Ir.Jump jump:
                 return new Jump(jump.Address, jump.Target);
+            case Return ret when EndlessRecursion(block, ret, operands, output) is { } recursive:
+                return new Statement(new ManagedReturn(ret.Address, recursive));
             case Return ret:
                 return new Statement(new ManagedReturn(ret.Address, ReturnValue(ret, operands)));
             case Trap trap:
@@ -319,6 +324,26 @@ internal sealed partial class BodyBuilder
         oracle.TypeOf(value) is { } source && oracle.Inside(location.Type, source) is var (path, inner)
         && path.Take(types.Kind(inner) == TypeKind.Struct ? path.Count : path.Count - 1).All(f => fields.Accessible(f, f.DeclaringType))
         ? location with { Path = [.. location.Path, .. path], Type = inner } : location;
+
+    /// <summary>
+    /// codegen 的返回值总来自某个表达式。整个方法只剩一条返回、返回寄存器里仍是入口的 this，而返回类型不可能是它时，返回值没有定义：
+    /// 能被 clang 整个删掉的只有没有副作用的无条件自递归（return 自身(...)），按自递归写出。
+    /// </summary>
+    private ManagedValue? EndlessRecursion(Block block, Return ret, IReadOnlyList<Sym> operands, List<ManagedStatement> output)
+    {
+        var method = analysis.Method.Method;
+        var type = oracle.ReturnType;
+        if (method.IsStatic || method.Name is ".ctor" or ".cctor" || ManagedTypes.IsVoid(type) || types.Kind(type) is not (TypeKind.Int or TypeKind.Bool)
+            || analysis.Signature.Return is not { Transfer: Transfer.Value, Pieces: [_] } || ret.Pieces.Length != 1
+            || values.Function.Blocks.Count != 1 || block.Statements.Any(s => s is not (Return or Nop))
+            || SymTable.Resolve(values.ReturnContent(ret, operands, Width(type))) is not SliceSym { Low: 0, Base: ArgSym { Index: -1 } self }) return null;
+        var owner = analysis.Method.DeclaringType;
+        var receiver = View(self, ManagedTypes.IsReferenceType(owner) ? owner : new ByRefRef(owner), ret.Address);
+        var arguments = method.Parameters.Select((p, i) => (ManagedValue)new ArgumentValue(i, analysis.Method.Concrete(p.Type), types.ValueWidth(analysis.Method.Concrete(p.Type)))).ToArray();
+        var result = NewLocal(type);
+        output.Add(new ManagedCall(ret.Address, new ManagedInvocation(analysis.Method, receiver, arguments, false), result));
+        return result;
+    }
 
     private ManagedValue? ReturnValue(Return ret, IReadOnlyList<Sym> operands)
     {

@@ -26,6 +26,9 @@ public static partial class SourceReferences
     private static void AddUnmanagedConstraints(IReadOnlyList<ModuleDefinition> modules, HashSet<ModuleDefinition> changed)
     {
         var types = modules.SelectMany(m => m.GetTypes()).ToArray();
+        // fixed 取得的类型参数地址同样要求 unmanaged。
+        var pinned = types.SelectMany(t => t.Methods).Where(m => m.HasBody).SelectMany(m => m.Body.Variables.Select(v => v.VariableType))
+            .OfType<PinnedType>().Select(p => p.ElementType).OfType<ByReferenceType>().Select(r => new PointerType(r.ElementType));
         var signatures = types.SelectMany(t => t.Fields.Select(f => f.FieldType)
             .Concat(t.Methods.SelectMany(m => m.Parameters.Select(p => p.ParameterType).Append(m.ReturnType)))
             .Concat(t.Interfaces.Select(i => i.InterfaceType)).Concat(t.BaseType is null ? [] : new[] { t.BaseType })).ToArray();
@@ -41,7 +44,7 @@ public static partial class SourceReferences
             }
             else if (type is TypeSpecification specification) Visit(specification.ElementType);
         }
-        foreach (var signature in signatures) Visit(signature);
+        foreach (var signature in signatures.Concat(pinned)) Visit(signature);
         bool added;
         do
         {

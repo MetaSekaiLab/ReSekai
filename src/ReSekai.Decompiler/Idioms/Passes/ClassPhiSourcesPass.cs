@@ -25,8 +25,8 @@ internal static class ClassPhiSourcesPass
         foreach (var block in state.function.Blocks)
             for (var index = 0; index < block.Statements.Count && block.Statements[index] is Phi phi; index++)
             {
-                if (!OnlyCompared(state.function, phi.Target)) continue;
                 var sources = phi.Sources.ToArray();
+                var replaced = false;
                 for (var i = 0; i < sources.Length; i++)
                 {
                     if (sources[i] is not { Width: 64 } source || state.RawDefinition(new Use(source, 64)) is not Symbol { Kind: SymbolKind.Class } constant) continue;
@@ -36,9 +36,11 @@ internal static class ClassPhiSourcesPass
                             || e.To.Predecessors.Count == 1 && dominators.Dominates(e.To.Index, parent.Index)));
                     if (known.Klass is null) continue;
                     sources[i] = known.Klass;
-                    changed = true;
+                    replaced = true;
                 }
+                if (!replaced || !OnlyCompared(state.function, phi.Target)) continue;
                 block.Statements[index] = phi with { Sources = sources };
+                changed = true;
             }
         return changed;
     }

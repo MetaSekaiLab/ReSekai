@@ -17,7 +17,7 @@ internal sealed record TemplateResult(ManagedBody Body, IReadOnlyList<RecoveryHo
 /// 每个候选替换都经复核（原方法体与展开新调用后的方法体共同执行）才采用。访问器与值类型构造按模板的语义摘要判定。
 /// 证明不成立的访问在收尾时按原生代码写出（同程序集）或记为洞。
 /// </summary>
-internal sealed class InlineProof
+internal sealed partial class InlineProof
 {
     internal const string UnfoldedRule = "inline.unfolded";
     internal const string ProofRule = "inline.proof";
@@ -131,6 +131,7 @@ internal sealed class InlineProof
         budget = Math.Max(MethodSteps, ItemSteps * (Pending(body).Count() + constructions.Count));
         nextLocal = firstLocal;
         body = SeparateIndirectStores(body);
+        body = SinkCommonStores(body);
         body = MoveCommonListAppendPrefix(body);
         if (InlineTrace.For(caller.Method)) InlineTrace.Before?.Invoke(body);
         body = ResolveAccessors(body);
@@ -142,6 +143,49 @@ internal sealed class InlineProof
         body = Seal(body);
         body = SealConstructions(body, constructions, constructionFailures);
         return new(body, holes.ToArray(), rules.ToArray());
+    }
+
+    /// <summary>
+    /// 合流块的每个前驱都以同一个待证字段的同值写入结尾、对象经合流的局部传入：把这次写入移到合流块首。
+    /// 编译器把一段内联的前半留在各前驱、后半合并到合流块（循环头、尾递归的入口），移到一处后才是完整的一段。
+    /// </summary>
+    private static ManagedBody SinkCommonStores(ManagedBody body)
+    {
+        while (true)
+        {
+            var blocks = body.Blocks.ToDictionary(b => b.Address);
+            var entries = body.Regions.SelectMany(r => new[] { r.HandlerEntry }).Append(body.Blocks[0].Address).ToHashSet();
+            var incoming = body.Blocks.SelectMany(b => b.Statements.TakeLast(1).SelectMany(s => ManagedValues.Edges(s).Select(e => (Block: b, Statement: s, Edge: e)))).ToLookup(e => e.Edge.Target);
+            ManagedBody? moved = null;
+            foreach (var group in incoming)
+            {
+                if (entries.Contains(group.Key) || group.Count() < 2 || group.Any(e => e.Statement is not ManagedJump || e.Block.Address == group.Key)) continue;
+                (Variable Target, FieldValue Field, ManagedStore Store, LocalValue Local)? common = null;
+                var matched = true;
+                foreach (var (block, _, edge) in group)
+                {
+                    if (block.Statements is not [.., ManagedStore { Target: FieldValue { Receiver: LocalValue receiver, Pending: not null } field, Value: ConstantValue constant } store, ManagedJump]
+                        || edge.Copies.Where(c => c.Value.Equals(receiver)).ToArray() is not [{ Target: var target }]
+                        || common is { } first && (!first.Target.Equals(target.Variable) || !first.Field.Field.Equals(field.Field) || !first.Store.Value.Equals(constant)))
+                    {
+                        matched = false;
+                        break;
+                    }
+                    common ??= (target.Variable, field, store, target);
+                }
+                // 异常区域不同的写入不能移动：它可能抛出。
+                if (!matched || common is not { } sink || body.Regions.Any(r => group.Select(e => r.Try.Contains(e.Block.Address)).Append(r.Try.Contains(group.Key)).Distinct().Count() > 1)) continue;
+                var sources = group.Select(e => e.Block.Address).ToHashSet();
+                moved = body with
+                {
+                    Blocks = body.Blocks.Select(b => sources.Contains(b.Address) ? b with { Statements = [.. b.Statements.Take(b.Statements.Count - 2), b.Statements[^1]] }
+                        : b.Address == group.Key ? b with { Statements = [sink.Store with { Target = sink.Field with { Receiver = sink.Local } }, .. b.Statements] } : b).ToArray(),
+                };
+                break;
+            }
+            if (moved is null) return body;
+            body = moved;
+        }
     }
 
     /// <summary>列表追加的共同前缀跨无副作用的分支合并时，把前缀分回各单入边，使每个追加能单独证明。</summary>
@@ -162,16 +206,16 @@ internal sealed class InlineProof
                 || yes.Target == entry || no.Target == entry
                 || incoming.GetValueOrDefault(yes.Target) != 1 || incoming.GetValueOrDefault(no.Target) != 1) continue;
             var tested = ManagedValues.Walk(branch.Condition).OfType<LocalValue>().Select(v => v.Variable).ToHashSet();
-            var start = block.Statements.ToList().FindLastIndex(s => s is ManagedAssignment
-                { Value: FieldValue { Receiver: LocalValue, Field.Field.Name: "_version" } });
+            // 块尾对同一对象的字段读写：其中有一次待证的字段自增，其余是读取。
+            if (block.Statements.LastOrDefault(s => s is ManagedStore) is not ManagedStore { Target: FieldValue { Receiver: LocalValue list, Pending: not null } updated,
+                    Value: BinaryValue { Op: BinOp.Add, Left: LocalValue previous, Right: ConstantValue { Bits: 1 } } } increment) continue;
+            var start = block.Statements.Count - 1;
+            while (start > 0 && (ReferenceEquals(block.Statements[start - 1], increment)
+                || block.Statements[start - 1] is ManagedAssignment { Value: FieldValue { Receiver: LocalValue receiver } } && receiver.Equals(list))) start--;
             var prefix = block.Statements.Skip(start).SkipLast(1).ToArray();
-            if (start < 0 || prefix is not [ManagedAssignment { Target: var saved, Value: FieldValue { Receiver: LocalValue list, Field.Field.Name: "_version" } version },
-                    ManagedStore { Target: FieldValue updated, Value: BinaryValue { Op: BinOp.Add, Left: LocalValue previous, Right: ConstantValue { Bits: 1 } } }, ..]
-                || !previous.Equals(saved) || !updated.Field.Equals(version.Field) || !updated.Receiver.Equals(list)
-                || list.Type is not DefinitionRef { Definition.FullName: "System.Collections.Generic.List" }
-                || prefix.OfType<ManagedAssignment>().Any(a => tested.Contains(a.Target.Variable) || a.Target.Variable.Equals(list.Variable))
-                || prefix.Skip(2).Any(s => s is not ManagedAssignment { Value: FieldValue { Receiver: LocalValue receiver } }
-                    || !receiver.Equals(list))) continue;
+            if (!prefix.Contains(increment) || !prefix.TakeWhile(s => s != increment).OfType<ManagedAssignment>().Any(a => a.Target.Equals(previous)
+                    && a.Value is FieldValue version && version.Field.Equals(updated.Field))
+                || prefix.OfType<ManagedAssignment>().Any(a => tested.Contains(a.Target.Variable) || a.Target.Variable.Equals(list.Variable))) continue;
             foreach (var edge in new[] { yes, no })
                 blocks[edge.Target] = new(edge.Target, [.. prefix, .. blocks[edge.Target].Statements]);
             blocks[block.Address] = new(block.Address, [.. block.Statements.Take(start), branch]);
@@ -184,6 +228,7 @@ internal sealed class InlineProof
     {
         LocalValue or ConstantValue => true,
         ComparisonValue { Left: var left, Right: var right } => PureAppendBranch(left) && PureAppendBranch(right),
+        NegatedValue { Operand: var operand } => PureAppendBranch(operand),
         BinaryValue { Op: BinOp.And, Left: var left, Right: ConstantValue } => PureAppendBranch(left),
         FieldValue { Receiver: ArgumentValue { Index: >= 0, Type: DefinitionRef { Definition.IsValueType: true } }, Pending: null } => true,
         _ => false,
@@ -416,7 +461,7 @@ internal sealed class InlineProof
     {
         if (analysis is { } known && ReferenceEquals(known.Body, body)) return (known.Program, known.Facts);
         var program = Program.Compile(body, types);
-        var facts = new EntryFacts(program, call => Template(call.Invocation.Method) is { } template && semantic.IsReadOnly(template),
+        var facts = new EntryFacts(program, call => Template(call.Invocation.Method) is { } template && semantic.IsReadOnly(template), leaves: structure => types.Projections(structure), constantWrites:
             call => Template(call.Invocation.Method) is { } template ? semantic.ConstantWrites(template) : []);
         analysis = (body, program, facts);
         return (program, facts);
@@ -451,8 +496,12 @@ internal sealed class InlineProof
         (ManagedBody Body, (int, int, int) Key, string Form, MethodRef Method, ulong At)? best = null;
         var callerCalls = body.Blocks.SelectMany(b => b.Statements).OfType<ManagedCall>().Select(c => c.Invocation.Method.Method).ToHashSet();
         var choices = Candidates(field, receiver).Select(c => (c.Method, c.Template, Calls: c.Template.Reach(Template)))
-            .Select(c => (c.Method, c.Template, c.Calls, Witnesses: c.Calls.Count(m => callerCalls.Contains(m.Method))));
-        foreach (var (method, template, calls, witnesses) in choices.OrderByDescending(c => c.Witnesses))
+            .Select(c => (c.Method, c.Template, c.Calls, Witnesses: c.Calls.Count(m => callerCalls.Contains(m.Method)))).OrderByDescending(c => c.Witnesses).ToList();
+        // 合并了几次内联的写入：单个方法对不上，直接取合成的调用序列。
+        if (MergedSteps(body, anchor) is > 0 and var steps)
+            choices = Sequences(field, receiver, steps).Select(m => (Method: m, Template: programs[m]!)).Select(c => (c.Method, c.Template, Calls: c.Template.Reach(Template)))
+                .Select(c => (c.Method, c.Template, c.Calls, Witnesses: c.Calls.Count(m => callerCalls.Contains(m.Method)))).OrderByDescending(c => c.Witnesses).Concat(choices).ToList();
+        foreach (var (method, template, calls, witnesses) in choices)
         {
             // 已有调用见证支持的替换覆盖了待证访问时，优先推进方法体，再为新方法体寻找候选。
             if (witnesses == 0 && best is { } matched && matched.Key.Item1 < before.Pending) break;
@@ -480,7 +529,7 @@ internal sealed class InlineProof
                 (ManagedBody Body, (int, int, int) Key)? gained = null;
                 if (outcome.Body is { } replaced)
                 {
-                    var next = DeadPendingReads(replaced);
+                    var next = DeadPendingReads(ExpandSequences(replaced));
                     var after = Progress(next);
                     // 取覆盖最多的区域：剩下的待证访问最少，其次读入的使用最少，再次区域最长。较小的区域会把同一个调用切成片段。
                     if (after.Pending < before.Pending || after.Pending == before.Pending && after.Uses < before.Uses)
@@ -805,6 +854,7 @@ internal sealed class InlineProof
     /// <summary>结果不再使用的待证读取只剩接收者为空时的异常：写成原位置的判空（或保留接收者的求值）。</summary>
     private ManagedBody DeadPendingReads(ManagedBody body)
     {
+        body = DeadCarried(body);
         var used = body.Blocks.SelectMany(b => b.Statements).SelectMany(Program.Uses).ToHashSet();
         var nullConstructor = new MethodRef(types.Corlib("System.NullReferenceException").Definition.Methods
             .Single(m => m.Name == ".ctor" && m.Parameters.Count == 0), [], []);
@@ -818,6 +868,42 @@ internal sealed class InlineProof
             return new ManagedAssignment(statement.Address, NewLocal(receiver.Type), receiver);
         }
         return body with { Blocks = body.Blocks.Select(b => b with { Statements = b.Statements.Select(Rewrite).ToArray() }).ToArray() };
+    }
+
+    /// <summary>只为算出自己的下一轮值而沿边传递的局部（循环状态已由认回的调用推进）：读到待证访问的去掉，值须没有事件也不会抛出。</summary>
+    private static ManagedBody DeadCarried(ManagedBody body)
+    {
+        var statements = body.Blocks.SelectMany(b => b.Statements).ToArray();
+        var copies = statements.SelectMany(ManagedValues.Edges).SelectMany(e => e.Copies).ToArray();
+        static IEnumerable<Variable> Read(ManagedValue value) => ManagedValues.Walk(value).OfType<LocalValue>().Select(l => l.Variable);
+        static bool Silent(ManagedValue value) => EntryFacts.Evaluable(value) && ManagedValues.Walk(value).All(v => v switch
+        {
+            FieldValue f => !ManagedTypes.IsReferenceType(f.Receiver.Type) && f.Receiver.Type is not (ByRefRef or PointerRef),
+            ArrayElementValue or ArrayLengthValue or StringLengthValue or IndirectValue or StaticFieldValue => false,
+            _ => true,
+        });
+        var pending = copies.Where(c => ManagedValues.Walk(c.Value).Any(v => PendingOf(v) is not null)).Select(c => c.Target.Variable).ToHashSet();
+        if (pending.Count == 0) return body;
+        var live = statements.SelectMany(s => s is ManagedAssignment a ? [a.Value] : ManagedValues.Of(s)).SelectMany(Read)
+            .Concat(statements.SelectMany(Program.Definitions)).Concat(copies.Where(c => !Silent(c.Value)).Select(c => c.Target.Variable))
+            .Concat(body.Regions.Select(r => r.Exception?.Variable).OfType<Variable>()).ToHashSet();
+        for (var grown = true; grown;)
+        {
+            grown = false;
+            foreach (var copy in copies)
+                if (live.Contains(copy.Target.Variable))
+                    foreach (var variable in Read(copy.Value)) grown |= live.Add(variable);
+        }
+        pending.ExceptWith(live);
+        if (pending.Count == 0) return body;
+        // 去掉的局部不能再被读到：读到它的也只能是同样不再使用的局部。
+        var dead = copies.Select(c => c.Target.Variable).Where(v => !live.Contains(v)).ToHashSet();
+        ManagedEdge Drop(ManagedEdge edge) => edge.Copies.Any(c => dead.Contains(c.Target.Variable)) ? edge with { Copies = edge.Copies.Where(c => !dead.Contains(c.Target.Variable)).ToArray() } : edge;
+        return body with
+        {
+            Blocks = body.Blocks.Select(b => b.Statements.Any(s => ManagedValues.Edges(s).Any(e => e.Copies.Any(c => dead.Contains(c.Target.Variable))))
+                ? b with { Statements = b.Statements.Select(s => ManagedValues.MapEdges(s, Drop)).ToArray() } : b).ToArray(),
+        };
     }
 
     /// <summary>显式布局中不可访问字段的一段位片恰是另一个可访问字段时，读的是同一块存储，写成那个字段。</summary>

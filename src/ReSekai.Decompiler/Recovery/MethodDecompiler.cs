@@ -5,6 +5,7 @@ using ReSekai.Decompiler.Facts;
 using ReSekai.Decompiler.Facts.Derived;
 using ReSekai.Decompiler.Idioms;
 using ReSekai.Decompiler.Ir;
+using ReSekai.Decompiler.Machine.Ssa;
 using ReSekai.Decompiler.Machine.Flow;
 using ReSekai.Decompiler.Machine.Lifting;
 using ReSekai.Decompiler.Recovery.Calls;
@@ -79,9 +80,7 @@ public sealed partial class MethodDecompiler
         if (finished.TryGetValue(request, out var known)) return known;
         var before = cuts;
         var result = Declaration(method, entry) ?? PlatformInvoke(method, entry)
-            ?? RestorePackedFlag(method, entry)
-            ?? RestoreHammersley(method, entry) ?? RestoreUrpInsertionSort(method, entry)
-            ?? RestoreUrpPackageMethod(method, entry) ?? Run(method, entry);
+            ?? RestorePackedFlag(method, entry) ?? Run(method, entry);
         if (cuts == before) finished.TryAdd(request, result);
         return result;
     }
@@ -159,18 +158,14 @@ public sealed partial class MethodDecompiler
     public MethodRecoveryResult SourceForm(MethodRecoveryResult result)
     {
         RecoveryCancellation.Check();
-        if (result.Body is null && (RestoreReferenceSource(result) ?? RestoreVolumeParameterInterp(result)
-            ?? RestoreRenderGraphRegisterFrameAllocation(result) ?? RestoreProbeSourceLocations(result) ?? RestoreHaveDuplicates(result)
-            ?? RestoreProbeScenario(result) ?? RestorePerSceneSerialization(result) ?? RestoreSceneSerialization(result)) is { } restored) return restored;
-        if (RestoreArrayCopyTo(result) is { } arrayCopy) return arrayCopy;
-        if (RestoreCombineHashes(result) is { } hashes) return hashes;
-        if (RestoreCompareHashes(result) is { } comparison) return comparison;
-        if (RestoreGenericSort(result) is { } sort) return sort;
         var formed = ControlForm(result);
         if (formed.Body is not { } body) return formed;
         var shared = SharedValues.Run(body, types, out var extracted);
-        return extracted == 0 ? formed
-            : formed with { Body = shared, Rules = [.. formed.Rules, new RuleTrace("shared.values", formed.Entry, RewriteStatus.Applied, "extracted", null, null)] };
+        var pointed = SharedElements.Run(shared, types, out var elements);
+        var rules = new List<RuleTrace>(formed.Rules);
+        if (extracted > 0) rules.Add(new("shared.values", formed.Entry, RewriteStatus.Applied, "extracted", null, null));
+        if (elements > 0) rules.Add(new("shared.elements", formed.Entry, RewriteStatus.Applied, "extracted", null, null));
+        return extracted + elements == 0 ? formed : formed with { Body = pointed, Rules = rules };
     }
 
     private MethodRecoveryResult ControlForm(MethodRecoveryResult result)
@@ -280,6 +275,10 @@ public sealed partial class MethodDecompiler
         if (idioms.Errors.Count > 0)
             return RecoveryDiagnostics.Fail(entry, $"L2 {idioms.Errors[0]}", rule: "Prepare");
         RecoveryCancellation.Check();
+        var temporaries = FreshTemporaries(function);
+        if (LeadingZeroLoops.Run(function, width => new Variable(temporaries().Storage with { StackWidth = width }, 1))
+            && ReSekai.Decompiler.Machine.Ssa.Lowering.Cleanup(function) is [var countError, ..])
+            return RecoveryDiagnostics.Fail(entry, $"L2 {countError}", rule: "LeadingZeros");
         GenericContext.Instantiate(function, method);
         CleanupCalls.Run(function, address => facts.Helpers.At(address)?.Kind == HelperKind.Unknown
             ? native.CleanupThunk(address, method.Method.Owner) : null);
@@ -300,6 +299,14 @@ public sealed partial class MethodDecompiler
         if (StackBoxingPass.Run(function, new CallMemoryEffects(environment.Shape, abi), environment.Shape, abi.Size, FreshTemporaries(function)))
             preliminary = ValueModel.Build(function, environment);
         DispatchResolution.Run(function, preliminary, new TypeOracle(types, facts, method, environment.Shape, preliminary), environment.Shape, abi);
+        // 接收者来自刚解析的虚调用时，经虚表的 invoker 此时才有类型。
+        for (var round = 0; round < 4 && function.Blocks.SelectMany(b => b.Statements).Any(s => s is Call { Op: null, Kind: CallKind.Indirect, Resolved: null }); round++)
+        {
+            var resolvedValues = ValueModel.Build(function, environment);
+            if (!InvokerCallsPass.AfterSplitting(function, method, rewriter, RootType(new TypeOracle(types, facts, method, environment.Shape, resolvedValues), resolvedValues))) break;
+            preliminary = ValueModel.Build(function, environment);
+            DispatchResolution.Run(function, preliminary, new TypeOracle(types, facts, method, environment.Shape, preliminary), environment.Shape, abi);
+        }
         // 每轮从稳定输入构建分析图，只累积已证明的调用目标，不回滚生产语句和 SSA。
         var prepared = function;
         var targets = new Dictionary<CallSite, MethodRef>();

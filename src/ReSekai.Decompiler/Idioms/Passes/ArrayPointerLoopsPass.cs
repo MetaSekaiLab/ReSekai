@@ -60,6 +60,8 @@ internal static class ArrayPointerLoopsPass
                 ? Fold.Simplify(binary with { Left = Expand(binary.Left, depth + 1), Right = Expand(binary.Right, depth + 1) }) : value;
         }
 
+        // 指针从某个元素开始；访问 a[i - 1] 的循环从数据区之前的一个元素开始，首轮不读。
+        static bool Starts(long offset, long data, int stride) => offset >= data || data > 0 && offset == data - stride;
         var changed = false;
         foreach (var block in function.Blocks)
             foreach (var pointer in block.Statements.OfType<Phi>().Where(p => p.Sources.Length == 2 && block.Predecessors.Count == 2).ToArray())
@@ -72,7 +74,7 @@ internal static class ArrayPointerLoopsPass
                     var roots = terms.OfType<Use>().Where(u => Stride(u) > 0).ToArray();
                     var stride = roots is [var array] ? Stride(array) : initial is Const ? OffsetStride(pointer.Target) : 0;
                     if (stride <= 0
-                        || terms.OfType<Const>().Aggregate(0L, (sum, c) => sum + c.Signed) < (roots.Length == 1 ? RuntimeLayout.ArrayData : 0)
+                        || !Starts(terms.OfType<Const>().Aggregate(0L, (sum, c) => sum + c.Signed), roots.Length == 1 ? RuntimeLayout.ArrayData : 0, stride)
                         || ExprMap.Walk(initial).OfType<Use>().Any(u => u.Variable.Version != 0
                             && (!owners.TryGetValue(u.Variable, out var owner) || owner == block || !dominators.Dominates(owner.Index, block.Index)))
                         || induction.Step != (ulong)stride

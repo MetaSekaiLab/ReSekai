@@ -16,9 +16,10 @@ public static partial class UnregisteredInference
         public List<MethodRef> Positive { get; } = [];
     }
 
-    public static UnregisteredMethods Build(BaseFacts facts, Action<string>? log = null)
+    /// <summary>only 只用于对少数目标重做推断（检查规则改动）；正式构建覆盖全部未注册函数。</summary>
+    public static UnregisteredMethods Build(BaseFacts facts, Action<string>? log = null, Func<ulong, bool>? only = null)
     {
-        return new Builder(facts, log).Run();
+        return new Builder(facts, log).Run(only);
     }
 
     private sealed partial class Builder(BaseFacts facts, Action<string>? log)
@@ -37,10 +38,15 @@ public static partial class UnregisteredInference
             return result;
         }
 
-        public UnregisteredMethods Run()
+        public UnregisteredMethods Run(Func<ulong, bool>? only)
         {
             var result = new UnregisteredMethods();
-            var functions = facts.Code.Functions.Where(f => f.Region == CodeRegion.Managed && facts.EntriesAt(f.Start).Length == 0).ToDictionary(f => f.Start);
+            // 标了 inline 的泛型方法没有 il2cpp 段属性，外提副本落在 .text，与运行时同段；只看托管代码调用、又不是已知 helper 的。
+            var outlined = facts.Scan.All.Where(r => r.Kind is RefKind.Call or RefKind.TailCall && facts.Code.RegionOf(r.Target) == CodeRegion.Runtime
+                    && facts.Code.RegionOf(r.Site) == CodeRegion.Managed && facts.Helpers.At(r.Target)?.Kind == HelperKind.Unknown)
+                .Select(r => r.Target).ToHashSet();
+            var functions = facts.Code.Functions.Where(f => (f.Region == CodeRegion.Managed || outlined.Contains(f.Start)) && facts.EntriesAt(f.Start).Length == 0
+                && only?.Invoke(f.Start) != false).ToDictionary(f => f.Start);
             var sites = facts.Scan.All.Where(r => r.Kind is RefKind.Call or RefKind.TailCall && functions.ContainsKey(r.Target))
                 .Select(r => new Observation(facts.Code.At(r.Site)!.Start, r)).ToArray();
             Observe(sites);
@@ -77,17 +83,21 @@ public static partial class UnregisteredInference
                 else if (definition is not null)
                 {
                     signature = Signature(complete[0])!;
-                    var register = signature.MethodInfo!.Register;
-                    reason = observations.Any(s => s.Symbols.TryGetValue(register, out var symbols) && symbols.Any(m => m.Method != definition)) ? "A/不同定义冲突"
+                    // 参数占满寄存器的方法，MethodInfo 在栈上：没有寄存器位置可核对符号，身份由方法体决定。
+                    var hidden = signature.MethodInfo?.Register;
+                    MethodRef[] Symbols(Observation s) => hidden is { } register ? s.Symbols.GetValueOrDefault(register) ?? [] : [];
+                    reason = observations.Any(s => Symbols(s).Any(m => m.Method != definition)) ? "A/不同定义冲突"
                         : copied is null && observations.Any(s => s.Failed) ? "A/分析不完整"
                         : complete.Any(m => Signature(m) is not { } sig || Shape(sig) != Shape(signature)) ? "ABI/正见证不吻合"
                         : "A/通过";
                     // 非单值符号也不能掩盖 ABI 冲突；它不给正见证，但有否决权。
-                    if (reason == "A/通过" && observations.SelectMany(s => s.Symbols.GetValueOrDefault(register) ?? [])
+                    if (reason == "A/通过" && observations.SelectMany(Symbols)
                         .Where(IsComplete).Any(m => Signature(m) is { } sig && Shape(sig) != Shape(signature))) reason = "ABI/候选槽位不吻合";
                     if (reason == "A/通过")
                     {
                         reason = scheduled is not null ? "接受" : Compare(functions[group.Key], definition, signature, shapes, out matches);
+                        // 机器码唯一同形，只是线性扫描没配上某个地址的基址：改由完整的 SSA 体证明。
+                        if (reason == "B/地址用途未证明" && copied is not null && SameCopy(functions[group.Key], copied, shapes, out matches)) reason = "接受";
                         // ABI 由本调用的完整实例分类；开放参数不替换成任意封闭见证。
                     }
                 }
@@ -114,7 +124,7 @@ public static partial class UnregisteredInference
 
         private MethodRef? UniqueCopy(CodeFunction function, Dictionary<string, List<RegisteredShape>> shapes) =>
             shapes.TryGetValue(Fingerprint(function).Hash, out var bucket) && bucket.Select(m => m.Method).Distinct().ToArray() is [var only]
-            && only.TypeArguments.Count + only.MethodArguments.Count == 0 && IsComplete(only) && Signature(only) is { MethodInfo: not null } ? only : null;
+            && only.TypeArguments.Count + only.MethodArguments.Count == 0 && IsComplete(only) && Signature(only) is not null ? only : null;
 
         private CodeEntry[] Adjustors(ulong target, Observation[] sites) => sites.Select(s => s.Caller).Distinct()
             .Where(entry => facts.Code.At(entry) is { Size: 8 } && facts.Code.Word(entry) == 0x91004000
@@ -144,16 +154,19 @@ public static partial class UnregisteredInference
                 var calls = statements.OfType<Call>().ToLookup(c => c.Address);
                 foreach (var site in group)
                 {
-                    var call = calls[site.Reference.Site].SingleOrDefault(c => c.Target is Const target && target.Value == site.Reference.Target);
-                    if (call is null) continue;
-                    for (var i = 0; i < call.Arguments.Length; i++)
+                    // 公共尾部被复制到几条路径上时，同一个调用点有几份。
+                    foreach (var call in calls[site.Reference.Site].Where(c => c.Target is Const target && target.Value == site.Reference.Target))
                     {
-                        var storage = call.Sources[i];
-                        var symbols = Methods(call.Arguments[i], definitions, phis, []);
-                        if (symbols.Length == 0) continue;
-                        site.Symbols[storage] = symbols;
-                        if (Expand(call.Arguments[i], definitions, []) is Symbol { Kind: SymbolKind.Method, Value: MethodRef method }
-                            && Signature(method)?.MethodInfo?.Register == storage) site.Positive.Add(method);
+                        var sources = call.Arguments.Length - call.Sources.Length;
+                        for (var i = sources; i < call.Arguments.Length; i++)
+                        {
+                            var storage = call.Sources[i - sources];
+                            var symbols = Methods(call.Arguments[i], definitions, phis, []);
+                            if (symbols.Length == 0) continue;
+                            site.Symbols[storage] = [.. site.Symbols.GetValueOrDefault(storage, []).Union(symbols)];
+                            if (Expand(call.Arguments[i], definitions, []) is Symbol { Kind: SymbolKind.Method, Value: MethodRef method }
+                                && Signature(method)?.MethodInfo?.Register == storage) site.Positive.Add(method);
+                        }
                     }
                 }
             }

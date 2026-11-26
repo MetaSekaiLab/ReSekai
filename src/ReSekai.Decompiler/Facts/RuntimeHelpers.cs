@@ -401,6 +401,8 @@ public sealed partial class RuntimeHelpers
                 if (index < 0) continue;
                 result.Add(f);
                 if (map.Functions[index].Size > ClosureFunctionLimit * 4) continue;
+                // helper 的实现都在 libil2cpp 里；经托管方法才到达的函数不说明它是哪个 helper。
+                if (f != address && map.Functions[index].Region == CodeRegion.Managed) continue;
                 foreach (var r in scan.Of(index))
                     if (r.Kind is RefKind.Call or RefKind.TailCall && seen.Add(r.Target)) next.Add(r.Target);
             }

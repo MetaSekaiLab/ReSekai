@@ -15,7 +15,7 @@ namespace ReSekai.Decompiler.Idioms;
 internal static class OnceGuardsPass
 {
     private enum Kind { Metadata, ClassConstructor, ClassLayout }
-    private sealed record Guard(Kind Kind, Block Initialize, Block Skip, TypeRef? Type, ulong Flag);
+    private sealed record Guard(Kind Kind, Block Initialize, Block Skip, TypeRef? Type, ulong Flag, HashSet<Variable> FlagPhis);
 
     /// <summary>折叠一个守卫；调用方在清理后继续寻找下一个。</summary>
     internal static bool OnceGuards(this IdiomState state)
@@ -40,7 +40,7 @@ internal static class OnceGuardsPass
     private static Guard? Recognize(IdiomState state, Block head, Branch branch)
     {
         if (head.NormalSuccessors.ToArray() is not [var first, var second]) return null;
-        var condition = state.defs.Expand(branch.Condition);
+        var condition = FlagPhis(state, state.defs.Expand(branch.Condition), out var flags);
         if (TopLoadsPass.TopLoads(condition).Distinct().ToArray() is not [var flag]) return null;
         var side = DirectionPass.Direction(condition, ReplacePass.Replace(flag, 0));
         if (side is not (0 or 1) || DirectionPass.Direction(condition, ReplacePass.Replace(flag, 1)) != 1 - side) return null;
@@ -48,17 +48,48 @@ internal static class OnceGuardsPass
         switch (flag)
         {
             case { Width: 8, Address: Const address } when state.owner.guardSections.Any(s => s.Contains(address.Value)):
-                return new(Kind.Metadata, initialize, skip, null, address.Value);
+                return new(Kind.Metadata, initialize, skip, null, address.Value, flags);
             case { Width: 32, Address: Binary { Op: BinOp.Add, Left: Symbol { Kind: SymbolKind.Class, Value: TypeRef type }, Right: Const { Value: RuntimeLayout.ClassCctorFinishedOrNoCctor } } }:
                 // 类自身的静态构造中，标志位的含义不同。
                 return state.self?.Method.Name == ".cctor" && type is DefinitionRef definition
-                    && state.self.Method.Owner == definition.Definition ? null : new(Kind.ClassConstructor, initialize, skip, type, 0);
+                    && state.self.Method.Owner == definition.Definition ? null : new(Kind.ClassConstructor, initialize, skip, type, 0, []);
             case { Width: 8 or 16, Address: Binary { Op: BinOp.Add, Left: Symbol { Kind: SymbolKind.Class, Value: TypeRef type }, Right: Const { Value: RuntimeLayout.ClassBitflags1 } } }
                 when ClassInitializationFlags.IsBitTest(condition, flag):
-                return new(Kind.ClassLayout, initialize, skip, type, 0);
+                return new(Kind.ClassLayout, initialize, skip, type, 0, []);
             default:
                 return null;
         }
+    }
+
+    /// <summary>
+    /// 循环里的守卫只读一次标志，此后的迭代用常量 1：标志读取与 1 的汇合仍是“是否已初始化”。
+    /// 常量一侧初始化已经完成，再做一次幂等的初始化不改变行为，按标志的读取识别。
+    /// </summary>
+    private static Expr FlagPhis(IdiomState state, Expr condition, out HashSet<Variable> seen)
+    {
+        seen = [];
+        if (TopLoadsPass.TopLoads(condition).Any()) return condition;
+        var phis = ExprMap.Walk(condition).OfType<Use>().Select(u => u.Variable).Distinct().ToArray();
+        if (phis is not [var variable]) return condition;
+        var pending = new Stack<Variable>([variable]);
+        Load? flag = null;
+        while (pending.TryPop(out var current))
+        {
+            if (!seen.Add(current)) continue;
+            if (state.function.Blocks.SelectMany(b => b.Statements).OfType<Phi>().FirstOrDefault(p => p.Target == current) is { } phi)
+            {
+                foreach (var source in phi.Sources) pending.Push(source);
+                continue;
+            }
+            var value = state.defs.Expand(new Use(current, current.Width));
+            while (value is Ir.Convert { Kind: ConvKind.ZeroExtend } extended) value = extended.Operand;
+            if (value is Const { Value: 1 }) continue;
+            if (value is not Load { Width: 8, Address: Const } load || flag is not null && flag != load) return condition;
+            flag = load;
+        }
+        if (flag is not { Address: Const at } || !state.owner.guardSections.Any(s => s.Contains(at.Value))) return condition;
+        return Fold.Simplify(ExprMap.Map(condition, e => e is Use use && use.Variable == variable
+            ? use.Width == 8 ? flag : Fold.Convert(use.Width < 8 ? ConvKind.Truncate : ConvKind.ZeroExtend, flag, use.Width) : null));
     }
 
     /// <summary>一臂的走法：环境、写入与终点。</summary>
@@ -68,6 +99,8 @@ internal static class OnceGuardsPass
         /// <summary>守卫之前的定义归一后的结果。</summary>
         public Dictionary<Variable, Expr> Expanded { get; } = [];
         public List<(Expr Target, Expr Value)> Stores { get; } = [];
+        /// <summary>初始化调用前后的寄存器暂存：帧槽偏移、位数与值。</summary>
+        public List<(long Offset, int Width, Expr Value)> Spills { get; } = [];
         public Block Previous { get; set; } = null!;
         public Block? Merge { get; set; }
         public Branch? Exit { get; set; }
@@ -117,6 +150,16 @@ internal static class OnceGuardsPass
             // 同一标志的前一个守卫已经初始化时，这一臂的调用被清理掉，只剩写标志。
             if (!taken.Initialized && taken.FlagStore is null) { reason = "慢路径没有初始化"; return false; }
             if (loadAfterStore) { reason = "写入之后还有读取"; return false; }
+            // 两臂各写一次同一个局部、内容相同：是守卫之后的写入被复制到两臂，不是暂存。
+            foreach (var spill in taken.Spills.ToArray())
+                if (fast.Stores.Where(s => s.Target is FrameAddress at && at.Offset < spill.Offset + spill.Width / 8 && spill.Offset < at.Offset + s.Value.Width / 8).ToArray()
+                        is [{ Target: FrameAddress same } store] && same.Offset == spill.Offset && store.Value == spill.Value
+                    && taken.Spills.Count(s => s.Offset < spill.Offset + spill.Width / 8 && spill.Offset < s.Offset + s.Width / 8) == 1)
+                {
+                    fast.Stores.Remove(store);
+                    taken.Spills.Remove(spill);
+                }
+            if (Remaining(taken, merge) is { } observed) { reason = $"慢路径的暂存之后仍被读取 {observed}"; return false; }
             if (fast.Stores.Count != taken.Stores.Count || !fast.Stores.SequenceEqual(taken.Stores)) { reason = "两臂的写入不同"; return false; }
             if (merge is not null)
             {
@@ -125,6 +168,8 @@ internal static class OnceGuardsPass
                 if (a < 0 || b < 0) { reason = "两臂的汇合边不明"; return false; }
                 foreach (var phi in merge.Statements.OfType<Phi>())
                 {
+                    // 标志只会是 0 或 1，跳过初始化的一臂上它就是 1。
+                    if (guard.FlagPhis.Contains(phi.Target)) continue;
                     var width = Observed(phi.Target, []);
                     if (width == 0 || phi.Sources.Length != merge.Predecessors.Count) continue;
                     var (skipped, initialized) = (Normal(new Use(phi.Sources[a], width), fast, 0), Normal(new Use(phi.Sources[b], width), taken, 0));
@@ -132,7 +177,8 @@ internal static class OnceGuardsPass
                     // 快路径复用已有的值（不是读取），初始化可能改写内存的一臂重新读取。保留的正是重新读取的一臂。
                     // 两臂都是读取而位置不同时不成立。初始化调用破坏的寄存器不会再被真正读取，这一臂的值没有意义。
                     static bool Reads(Expr value) => ExprMap.Walk(value).Any(e => e is Load);
-                    if (Plain(skipped) != Plain(initialized) && (Reads(skipped) || !Reads(initialized)) && initialized is not Use { Variable.Version: -1 })
+                    if (Plain(skipped) != Plain(initialized) && (Reads(skipped) || !Reads(initialized)) && initialized is not Use { Variable.Version: -1 }
+                        && !SameInLoop(phi.Sources[a], phi.Sources[b], width))
                     { reason = "两臂的合流值不同"; return false; }
                 }
                 reason = "";
@@ -160,6 +206,139 @@ internal static class OnceGuardsPass
             }
             reason = "两臂的出口分支不同";
             return false;
+        }
+
+        /// <summary>离开慢路径之后还能被观察、且内容与守卫之前不同的暂存。</summary>
+        private string? Remaining(Line line, Block? merge)
+        {
+            if (line.Spills.Count == 0 || line.Returned is not null) return null;
+            var ends = merge is not null ? [merge] : line.Previous.NormalSuccessors.ToArray();
+            foreach (var (offset, width, value) in line.Spills)
+            {
+                if (ends.All(b => frame!.Dead(b, 0, offset, width / 8))) continue;
+                var last = line.Spills.Last(s => s.Offset < offset + width / 8 && offset < s.Offset + s.Width / 8);
+                if (last == (offset, width, value) && Content(new Load(new FrameAddress(offset), width), new Line(), 0) == value) continue;
+                return new FrameAddress(offset).ToString();
+            }
+            return null;
+        }
+
+        /// <summary>
+        /// 循环里不变的值：调用破坏寄存器之后重新取出（常量重新物化、从帧槽重载），与没有调用的一路在循环头合流。
+        /// 一组 φ 的所有外部来源都是同一个表达式，表达式的变量又都在这组 φ 之前定义好时，整组就是这个值。
+        /// </summary>
+        private bool SameInLoop(Variable left, Variable right, int width)
+        {
+            var phis = state.function.Blocks.SelectMany(b => b.Statements.OfType<Phi>().Select(p => (Phi: p, Block: b))).ToDictionary(p => p.Phi.Target);
+            var web = new HashSet<Variable>();
+            var pending = new Stack<Variable>([left, right]);
+            Expr? agreed = null;
+            while (pending.TryPop(out var variable))
+            {
+                if (phis.TryGetValue(variable, out var phi))
+                {
+                    if (!web.Add(variable) || web.Count > 64) { if (web.Count > 64) return false; continue; }
+                    foreach (var source in phi.Phi.Sources) pending.Push(source);
+                    continue;
+                }
+                if (Stable(new Use(variable, width), 0) is not { } value) return false;
+                value = Plain(value);
+                if (agreed is not null && agreed != value) return false;
+                agreed = value;
+            }
+            if (agreed is null) return false;
+            var used = ExprMap.Walk(agreed).OfType<Use>().Select(u => u.Variable).Distinct().ToArray();
+            if (used.Length == 0) return true;
+            var blocks = web.Select(w => phis[w].Block).ToHashSet();
+            return used.All(u => u.Version == 0 || Defined(u) is { } at && Precedes(at, blocks));
+        }
+
+        /// <summary>从入口到这些块的每条路径都先经过 block。</summary>
+        private bool Precedes(Block block, HashSet<Block> blocks)
+        {
+            var visited = new HashSet<Block> { block };
+            var pending = new Stack<Block>([state.function.EntryBlock]);
+            if (blocks.Contains(block)) return false;
+            while (pending.TryPop(out var current))
+            {
+                if (!visited.Add(current)) continue;
+                if (blocks.Contains(current)) return false;
+                foreach (var next in current.Successors) pending.Push(next);
+            }
+            return true;
+        }
+
+        private Block? Defined(Variable variable) => state.function.Blocks.FirstOrDefault(b => b.Statements.Any(s => s switch
+        {
+            Define d => d.Target == variable,
+            Phi p => p.Target == variable,
+            Call c => c.Defines.Contains(variable),
+            _ => false,
+        }));
+
+        /// <summary>只由 SSA 值与常量组成的写法；帧槽的读取换成到达它的唯一写入，其他读取随程序点变化，不算。</summary>
+        private Expr? Stable(Expr expression, int depth)
+        {
+            if (depth > 8) return null;
+            var failed = false;
+            var result = Fold.Simplify(ExprMap.Map(expression, part =>
+            {
+                switch (part)
+                {
+                    case Use use when definitions.TryGetValue(use.Variable, out var source):
+                        if (source is Ir.Convert { Kind: ConvKind.ZeroExtend, Operand: Load } or Load)
+                            source = Reloaded(use.Variable, source);
+                        // 取不出稳定写法的定义仍是一个确定的 SSA 值。
+                        if (source is null || Stable(source, depth + 1) is not { } value) return use;
+                        return value.Width == use.Width ? value : Fold.Convert(ConvKind.Truncate, value, use.Width);
+                    case Load or Unknown or Intrinsic:
+                        failed = true;
+                        return part;
+                    default:
+                        return null;
+                }
+            }));
+            return failed ? null : result;
+        }
+
+        /// <summary>从读取处往回走到写入之前，写入的变量是否又被定义：那样槽里是上一轮的值。</summary>
+        private static bool Redefined(Block block, int index, IReadOnlyList<Store> stores, HashSet<Variable> variables)
+        {
+            var visited = new HashSet<Block>();
+            var pending = new Stack<(Block Block, int End)>([(block, index)]);
+            while (pending.TryPop(out var current))
+            {
+                var stopped = false;
+                for (var i = current.End - 1; i >= 0 && !stopped; i--)
+                {
+                    var statement = current.Block.Statements[i];
+                    stopped = statement is Store store && stores.Contains(store);
+                    if (!stopped && statement switch
+                    {
+                        Define d => variables.Contains(d.Target),
+                        Phi p => variables.Contains(p.Target),
+                        Call c => c.Defines.Any(variables.Contains),
+                        _ => false,
+                    }) return true;
+                }
+                if (stopped) continue;
+                foreach (var predecessor in current.Block.Predecessors)
+                    if (visited.Add(predecessor)) pending.Push((predecessor, predecessor.Statements.Count));
+            }
+            return false;
+        }
+
+        private Expr? Reloaded(Variable variable, Expr source)
+        {
+            var load = source as Load ?? (Load)((Ir.Convert)source).Operand;
+            if (load.Address is not FrameAddress { Offset: < 0 and var offset } || !owners.TryGetValue(variable, out var block)) return null;
+            var index = block.Statements.FindIndex(s => s is Define define && define.Target == variable);
+            var reach = (frame ??= new FrameModel(state.function, state.owner.CallEffects)).Reach(block, index, offset, load.Width / 8);
+            if (!reach.Complete || reach.Stores.Select(s => (s.Target, s.Value)).Distinct().ToArray() is not [(FrameAddress target, var stored)]) return null;
+            if (target.Offset > offset || target.Offset + stored.Width / 8 < offset + load.Width / 8) return null;
+            if (Redefined(block, index, reach.Stores, ExprMap.Walk(stored).OfType<Use>().Select(u => u.Variable).ToHashSet())) return null;
+            var value = Fold.Extract(stored, checked((int)(offset - target.Offset) * 8), load.Width);
+            return value.Width == source.Width ? value : Fold.Convert(ConvKind.ZeroExtend, value, source.Width);
         }
 
         public void CommitMetadata(Branch branch)
@@ -236,6 +415,12 @@ internal static class OnceGuardsPass
                         // 守卫内的暂存若没有后续观察者，不参与两臂的内存效果比较。
                         case Store { Target: FrameAddress, Value: Use or Const } spill when !shared && guard.Kind == Kind.Metadata
                             && (frame ??= new FrameModel(state.function, state.owner.CallEffects)).UnobservedAfter(current, spill):
+                            break;
+                        // 初始化调用前把寄存器存到帧槽、之后取回：只在这一臂里可见，终点处再核对没有别的观察者。
+                        case Store { Target: FrameAddress { Offset: < 0 } slot } spill when initializing && !shared && line.Stores.Count == 0
+                            && !ExprMap.Walk(spill.Value).Any(e => e is Load or Intrinsic or Unknown)
+                            && !(frame ??= new FrameModel(state.function, state.owner.CallEffects)).Escaped(slot.Offset, spill.Value.Width / 8):
+                            line.Spills.Add((slot.Offset, spill.Value.Width, Normal(spill.Value, line, 0)));
                             break;
                         case Store store when !shared && !ExprMap.Walk(store.Value).Concat(ExprMap.Walk(store.Target)).Any(e => e is Intrinsic or Unknown):
                             line.Stores.Add((Normal(store.Target, line, 0), Normal(store.Value, line, 0)));
@@ -316,7 +501,18 @@ internal static class OnceGuardsPass
                         }
                     case Load load:
                         if (line.Stores.Count > 0) loadAfterStore = true;
-                        return Content(new Load(Normal(load.Address, line, depth + 1), load.Width), line, depth + 1);
+                        var read = new Load(Normal(load.Address, line, depth + 1), load.Width);
+                        if (read.Address is FrameAddress { Offset: var at })
+                            for (var i = line.Spills.Count - 1; i >= 0; i--)
+                            {
+                                var spill = line.Spills[i];
+                                if (at + read.Width / 8 <= spill.Offset || spill.Offset + spill.Width / 8 <= at) continue;
+                                if (at >= spill.Offset && at + read.Width / 8 <= spill.Offset + spill.Width / 8)
+                                    return Fold.Extract(spill.Value, checked((int)(at - spill.Offset) * 8), read.Width);
+                                loadAfterStore = true;
+                                return read;
+                            }
+                        return Content(read, line, depth + 1);
                     default:
                         return null;
                 }
